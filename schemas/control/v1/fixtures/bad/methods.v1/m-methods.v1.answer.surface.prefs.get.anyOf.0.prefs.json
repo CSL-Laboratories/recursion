@@ -1,0 +1,9 @@
+{
+  "method": "surface.prefs.get",
+  "params": {
+    "surface": "page"
+  },
+  "answer": {
+    "code": "ok"
+  }
+}

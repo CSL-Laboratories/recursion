@@ -1,0 +1,10 @@
+{
+  "method": "budget.show",
+  "params": {
+    "connection_id": "subscription:personal-max"
+  },
+  "answer": {
+    "code": "method_unknown",
+    "detail": "not_implemented"
+  }
+}

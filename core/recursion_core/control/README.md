@@ -109,7 +109,7 @@ recorded on F60, CSL-762).
   has the same command, and no control API method was added. `list` and `conditions` read every
   `run.list` page (`list_all_runs`) and print one joined answer; a list that fits one page prints as
   before.
-- `mcp_tools.py`: Control MCP tool descriptors with every annotation set explicitly, and `call_tool`,
+- `mcp_tools.py`: Control MCP tool descriptors with every annotation set explicitly; `is_error`, the one place that says which answer codes are not errors per method (a Stop's `pending` and `ended`, an interrupt's `pending`); and `call_tool`,
   which forwards to the control API:
 
   | Tool | readOnlyHint | destructiveHint | idempotentHint | openWorldHint |

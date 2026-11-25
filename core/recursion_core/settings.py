@@ -33,6 +33,11 @@ The rules this module keeps:
   from this environment would take, with their defaults, sources, any advice and any notes. It takes no argument
   and writes nothing. The daemon that holds the one-daemon lock records the path and its values in its
   log at start, with the process id and a time on each line.
+* ONE CAP ON A SHOWN VALUE. Every value status, the start log or a note shows passes ``_shown``, whose one
+  return goes through the cap of the row ``status.value_max_chars`` (80 characters as shipped; ``"none"``
+  shows every value whole): a text past it is cut and the characters not shown are counted, a list keeps
+  the names that fit whole and counts the rest, and a text that looks like a key or a password is never
+  shown, not even in part, under any cap.
 
 Read at daemon start in this build; a later reload may call ``load`` again. ``load`` keeps no state between
 calls. ``SETTINGS`` is append-only: a row is added, never renamed or given another meaning.
@@ -43,6 +48,7 @@ from __future__ import annotations
 import difflib
 import math
 import os
+import re
 import stat
 import sys
 import tomllib
@@ -76,6 +82,18 @@ class _NoLimit:
 
 NO_LIMIT = _NoLimit()
 _NO_LIMIT_TEXT = "none"
+VALUE_MAX_CHARS = "status.value_max_chars"  # the row of the one cap on a shown value
+# A text is never shown when it holds a run of this many letters and digits of two kinds or more, a known
+# key prefix or a password label followed by this many more characters, or a PEM block. Each figure is to
+# become a row of the settings file.
+_KEY_RUN = 20
+_KEY_TAIL = 8
+_KEY_PREFIXES = ("sk-", "sk_", "pk_", "rk_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+                 "glpat-", "xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-", "AKIA", "ASIA", "AIza", "ya29.",
+                 "hf_", "npm_", "pypi-")
+_KEY_RUN_TEXT = re.compile("[A-Za-z0-9]{%d,}" % _KEY_RUN)
+_KEY_LABEL = re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|bearer|token)\b\s*[:=]?\s*\S{%d,}" % _KEY_TAIL)
+_KEY_WORD_SPLIT = re.compile(r"[^A-Za-z0-9_.+/=-]+")
 _Advice = tuple[int | float | None, int | float | None]  # (at least, at most)
 
 
@@ -99,9 +117,15 @@ class Setting:
 # Append-only. The type is bool, int, float, str or list. A row that loosens safety has the safe value as
 # its default, so a file that cannot be read as a whole, which leaves every default in force, can never
 # loosen anything.
+_VALUE_MAX_CHARS_ROW = Setting(
+    VALUE_MAX_CHARS, int, 80,
+    "The most characters of one value that status, the start log and a note show; what is past it is cut "
+    'and counted, a list shows the names that fit and how many more, and "none" shows every value whole.',
+    floor=0, allow_no_limit=True)
 SETTINGS: tuple[Setting, ...] = (
     Setting("plugin_host.gil_check", bool, True,
             "Whether each plugin host makes its GIL check; on by default, and a person may turn it off."),
+    _VALUE_MAX_CHARS_ROW,
 )
 DECLARED = MappingProxyType({row.name: row for row in SETTINGS})
 
@@ -154,23 +178,71 @@ def owner_only_file(info: os.stat_result) -> bool:
     return stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022
 
 
-def _shown(value: object) -> str:
+def _looks_like_a_key(text: str) -> bool:
+    if "-----BEGIN" in text or _KEY_LABEL.search(text):
+        return True
+    for word in _KEY_WORD_SPLIT.split(text):
+        if any(word.startswith(prefix) and len(word) >= len(prefix) + _KEY_TAIL for prefix in _KEY_PREFIXES):
+            return True
+    return any(sum((any(c.islower() for c in run), any(c.isupper() for c in run), any(c.isdigit() for c in run))) >= 2
+               for run in _KEY_RUN_TEXT.findall(text))
+
+
+def _piece(value: object) -> str:
+    """The whole text of one value before the cap. Only ``_shown`` calls it (and it calls itself for a list in
+    a list); a value of a kind added later gets its text here and meets the cap in ``_shown``."""
+
     if value is NO_LIMIT:
         return "no limit"
-    if isinstance(value, tuple):  # a validated list of names
-        return "[" + ", ".join(repr(name) for name in value) + "]"
+    if isinstance(value, tuple):  # a validated list of names; a list inside one is shown the same way
+        return "[" + ", ".join(_piece(name) for name in value) + "]"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
-        text = repr(value)
-    elif isinstance(value, (int, float)):
+        if _looks_like_a_key(value):  # never shown, not even in part, whatever the cap
+            return f"a text of {len(value)} characters that looks like a key or a password, not shown"
+        return repr(value)
+    if isinstance(value, (int, float)):
         try:
-            text = repr(value)
+            return repr(value)
         except ValueError:  # a whole number past the interpreter's digit limit cannot be printed
-            text = "a whole number too long to show"
-    else:
-        text = f"a {type(value).__name__}"
-    return text if len(text) <= 80 else text[:77] + "..."
+            return "a whole number too long to show"
+    return f"a {type(value).__name__}"
+
+
+def _cut(text: str, cap: object, rest: int, names: bool) -> str:
+    if rest:  # the names that fit were chosen with room for this count
+        return f"{text}, and {rest} more" if names else f"a list of {rest}, too long to show"
+    if cap is NO_LIMIT or len(text) <= cap:
+        return text
+    keep = max(0, cap - len(f"... ({len(text)} more characters not shown)"))  # the count fits inside the cap
+    more = len(text) - keep
+    return f"{text[:keep]}... ({more} more character{'' if more == 1 else 's'} not shown)"
+
+
+def _shown(value: object, cap: object = None) -> str:
+    """The one way a value becomes text for a person in this module: status, the start log and every note.
+
+    Each branch computes text; the one return passes it through the cap, ``cap`` characters (the row
+    ``status.value_max_chars``, its shipped value when None; NO_LIMIT shows it whole). A text past the cap is
+    cut and the characters not shown are counted, the count inside the cap; a list keeps the names that fit
+    whole, never cut inside a name, and counts the rest. A text that looks like a key or a password is never
+    shown (``_piece``)."""
+
+    cap = _VALUE_MAX_CHARS_ROW.default if cap is None else cap
+    text, names, rest = _piece(value), [], 0
+    if isinstance(value, tuple) and value and cap is not NO_LIMIT and len(text) > cap:
+        room = cap - len(f", and {len(value)} more")
+        width = 2  # the two brackets
+        for name in value:
+            piece = _piece(name)
+            width += len(piece) + (2 if names else 0)
+            if width > room:
+                break
+            names.append(piece)
+        rest = len(value) - len(names)
+        text = "[" + ", ".join(names) + "]"
+    return _cut(text, cap, rest, bool(names))
 
 
 def _allows_no_limit(row: Setting) -> bool:
@@ -178,11 +250,25 @@ def _allows_no_limit(row: Setting) -> bool:
 
 
 def _allowed(row: Setting) -> str:
-    kind = {bool: "true or false", int: "a whole number", float: "a number",
+    kind = {bool: "true or false", int: "a whole number", float: "a finite number",
             str: "a text", list: "a list of strings"}[row.type]
+    floor = row.floor is not None and row.type in (int, float)
+    if floor:
+        kind += f" of {_shown(row.floor)} or more"
     if _allows_no_limit(row):
-        return f'{kind} or "{_NO_LIMIT_TEXT}" for no limit'
+        return f'{kind}{"," if floor else ""} or "{_NO_LIMIT_TEXT}" for no limit'
     return kind
+
+
+def _taken(row: Setting, found: object) -> tuple[object | None, str | None]:
+    """The value in force for ``found``, or None and the reason it is refused."""
+
+    value = _accepted(row, found)
+    if value is None:
+        return None, f"allowed: {_allowed(row)}"
+    if row.floor is not None and type(value) in (int, float) and value < row.floor:
+        return None, f"a value below {_shown(row.floor)} has no meaning; allowed: {_allowed(row)}"
+    return value, None
 
 
 def _accepted(row: Setting, value: object) -> object | None:
@@ -264,6 +350,18 @@ def _read(path: Path) -> tuple[dict | None, str | None]:
     return doc, None
 
 
+def _cap_in(flat: list) -> object:
+    """The cap on a shown value this file sets, read before any note is written; else the row's default."""
+
+    row = DECLARED.get(VALUE_MAX_CHARS)
+    cap = _VALUE_MAX_CHARS_ROW.default if row is None else row.default
+    for name, found in flat:
+        if row is not None and name == VALUE_MAX_CHARS:
+            value, why = _taken(row, found)
+            cap = cap if why is not None else value
+    return cap
+
+
 def _defaults() -> dict:
     return {row.name: Value(row.name, row.default, row.default, SOURCE_DEFAULT, row.advice) for row in SETTINGS}
 
@@ -287,40 +385,38 @@ def load(environ) -> Loaded:
         note = Note(UNREADABLE, f"{path} {why}; every default is in force", warns=True)
         return Loaded(str(path), MappingProxyType(values), (note,))
     notes: list[Note] = []
-    for name, found in _flatten({k: v for k, v in (doc or {}).items() if k != "version"}):
+    flat = list(_flatten({k: v for k, v in (doc or {}).items() if k != "version"}))
+    cap = _cap_in(flat)
+    for name, found in flat:
         row = DECLARED.get(name)
         if found is _QUOTED:
-            notes.append(Note(UNKNOWN_KEY, f"{_shown(name)} is a quoted key that holds a dot, not a setting; it is "
-                                           "skipped; write it without the quotes", warns=True))
+            notes.append(Note(UNKNOWN_KEY, f"{_shown(name, cap)} is a quoted key that holds a dot, not a setting; "
+                                           "it is skipped; write it without the quotes", warns=True))
         elif row is None:
             known = sorted({*DECLARED, *(n.rsplit(".", 1)[0] for n in DECLARED)})  # its keys and its tables
             close = difflib.get_close_matches(name, known, n=1, cutoff=0.8)  # text only; never applied
             hint = f"; did you mean {close[0]}?" if close else ""
-            notes.append(Note(UNKNOWN_KEY, f"{_shown(name)} is not a setting this version knows; it is skipped{hint}",
-                              warns=True))
+            notes.append(Note(UNKNOWN_KEY, f"{_shown(name, cap)} is not a setting this version knows; it is "
+                                           f"skipped{hint}", warns=True))
         else:
-            value = _accepted(row, found)
-            if value is None:
-                reason = f"allowed: {_allowed(row)}"
-            elif row.floor is not None and type(value) in (int, float) and value < row.floor:
-                reason = f"a value below {_shown(row.floor)} has no meaning"
-            else:
+            value, reason = _taken(row, found)
+            if reason is None:
                 values[name] = Value(name, value, row.default, SOURCE_FILE, row.advice)
                 continue
-            notes.append(Note(OUT_OF_RANGE, f"{name}: found {_shown(found)}; {reason}; "
-                                            f"the default {_shown(row.default)} stays in force"))
+            notes.append(Note(OUT_OF_RANGE, f"{name}: found {_shown(found, cap)}; {reason}; "
+                                            f"the default {_shown(row.default, cap)} stays in force"))
     return Loaded(str(path), MappingProxyType(values), tuple(notes))
 
 
-def _shown_advice(v: Value) -> str:
+def _shown_advice(v: Value, cap: object) -> str:
     if v.advice is None:
         return ""
     lower, upper = v.advice
     bounds = []
     if lower is not None:
-        bounds.append(f"at least {_shown(lower)}")
+        bounds.append(f"at least {_shown(lower, cap)}")
     if upper is not None:
-        bounds.append(f"at most {_shown(upper)}")
+        bounds.append(f"at most {_shown(upper, cap)}")
     if not bounds:
         return ""
     text = f"; advised: {', '.join(bounds)}"
@@ -336,8 +432,10 @@ def lines(loaded: Loaded) -> list[str]:
     """What status and the daemon's start log show: each setting, its value, default, source and advice, then the notes."""
 
     # A future secret row must show set or not set here and keep raw values out of notes.
-    out = [f"{v.name} = {_shown(v.value)} (default {_shown(v.default)}; source: {v.source}{_shown_advice(v)})"
-           for v in loaded.values.values()]
+    held = loaded.values.get(VALUE_MAX_CHARS)
+    cap = _VALUE_MAX_CHARS_ROW.default if held is None else held.value
+    out = [f"{v.name} = {_shown(v.value, cap)} (default {_shown(v.default, cap)}; source: {v.source}"
+           f"{_shown_advice(v, cap)})" for v in loaded.values.values()]
     return out + [f"{WARNED if note.warns else ''}note {note}" for note in loaded.notes]
 
 

@@ -22,6 +22,18 @@
         }
       },
       "additionalProperties": true
+    },
+    "status": {
+      "type": "object",
+      "properties": {
+        "value_max_chars": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 80,
+          "description": "The most characters of one value that status, the start log and a note show; what is past it is cut and counted, a list shows the names that fit and how many more, and \"none\" shows every value whole."
+        }
+      },
+      "additionalProperties": true
     }
   },
   "additionalProperties": true

@@ -112,7 +112,8 @@ class TheFileAndItsDefaults(_Folder):
         self.assertIs(loaded["plugin_host.gil_check"], False)
         self.assertEqual(settings.SOURCE_FILE, loaded.values["plugin_host.gil_check"].source)
         self.assertEqual([], self.codes(loaded))
-        self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)"],
+        self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)",
+                          "status.value_max_chars = 80 (default 80; source: default)"],
                          settings.lines(loaded))
 
     def test_a_dotted_key_is_the_same_setting(self) -> None:
@@ -349,7 +350,7 @@ class OwnerOnlyAndWrongFiles(_Folder):
                 self.put(text)
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNKNOWN_KEY)  # one note, for a whole table too
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[len(loaded.values):])
 
     def test_the_command_ends_non_zero_when_a_key_or_table_was_skipped(self) -> None:
         for case, (text, _) in UNKNOWN.items():
@@ -372,7 +373,7 @@ class OwnerOnlyAndWrongFiles(_Folder):
             with self.subTest(case=self.put_broken(case)):
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNREADABLE)
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[len(loaded.values):])
 
     def test_the_command_ends_non_zero_for_a_file_that_cannot_be_read_as_a_whole(self) -> None:
         for case in BROKEN:
@@ -440,7 +441,8 @@ class OwnerOnlyAndWrongFiles(_Folder):
                     self.assertEqual(expect, loaded["test.limit"])
                     self.assertEqual(codes, self.codes(loaded))
                     if codes:
-                        reason = "a value below 1 has no meaning" if found == "0" else "allowed: a whole number"
+                        reason = ("a value below 1 has no meaning; " if found == "0" else "") + \
+                            "allowed: a whole number of 1 or more"
                         self.assertEqual(f"test.limit: found {found}; {reason}; the default 5 stays in force",
                                          loaded.notes[0].detail)
 
@@ -474,7 +476,7 @@ class LimitsNamesAndAdvice(_Folder):
                 self.assertEqual([], self.codes(loaded))
 
     def test_a_row_must_opt_in_to_no_limit(self) -> None:
-        for kind, default, allowed in ((int, 5, "a whole number"), (float, 5.0, "a number"),
+        for kind, default, allowed in ((int, 5, "a whole number"), (float, 5.0, "a finite number"),
                                        (bool, True, "true or false")):
             with self.subTest(kind=kind):
                 row = settings.Setting("test.limit", kind, default, "A test row.")
@@ -503,7 +505,7 @@ class LimitsNamesAndAdvice(_Folder):
                 loaded = self.read(row, text)
                 self.assertEqual(5.0, loaded[row.name])
                 self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
-                self.assertIn('allowed: a number or "none" for no limit;', loaded.notes[0].detail)
+                self.assertIn('allowed: a finite number or "none" for no limit;', loaded.notes[0].detail)
 
     def test_a_string_array_is_in_force(self) -> None:
         row = settings.Setting("test.names", list, ("fallback",), "Names.")
@@ -575,7 +577,8 @@ class LimitsNamesAndAdvice(_Folder):
         self.assertEqual(5, loaded[row.name])
         self.assertEqual(settings.SOURCE_DEFAULT, loaded.values[row.name].source)
         self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
-        self.assertEqual("test.length: found -1; a value below 0 has no meaning; the default 5 stays in force",
+        self.assertEqual("test.length: found -1; a value below 0 has no meaning; allowed: a whole number of 0 or more; "
+                         "the default 5 stays in force",
                          loaded.notes[0].detail)
         loaded = self.read(row, "0")
         self.assertEqual(0, loaded[row.name])
@@ -607,7 +610,8 @@ class LimitsNamesAndAdvice(_Folder):
         self.assertEqual(1.5, loaded[row.name])
         self.assertEqual(settings.SOURCE_DEFAULT, loaded.values[row.name].source)
         self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
-        self.assertEqual("test.span: found -0.5; a value below 0 has no meaning; the default 1.5 stays in force",
+        self.assertEqual("test.span: found -0.5; a value below 0 has no meaning; allowed: a finite number of 0 or "
+                         "more; the default 1.5 stays in force",
                          loaded.notes[0].detail)
         loaded = self.read(row, "0.0")
         self.assertEqual(0.0, loaded[row.name])
@@ -1153,6 +1157,183 @@ class PublishedShape(_Folder):
         self.assertEqual({settings.SOURCE_FILE}, {v.source for v in loaded.values.values()})
         self.put(bad[0].read_text(encoding="utf-8"))
         self.assert_default(settings.load(self.environ), settings.OUT_OF_RANGE)
+
+
+CAP_KEY = "status.value_max_chars"
+# Stand-ins built at run time, so that no text of this file has the shape of a key. (the text, its part that
+# must never be shown)
+KEY_LIKE = (
+    ("s" + "k-proj-" + "Zq7Lm2Xc9Vb4Nn8Kk1Jj6Hh3", "Zq7Lm2Xc9Vb4Nn8Kk1Jj6Hh3"),
+    ("gh" + "p_" + "a1b2c3d4e5f6g7h8", "a1b2c3d4e5f6g7h8"),
+    ("AK" + "IA" + "QWERTYUIOP123456", "QWERTYUIOP123456"),
+    ("-----" + "BEGIN OPENSSH PRIVATE KEY----- " + "b3BlbnNzaC1rZXktdjE", "b3BlbnNzaC1rZXktdjE"),
+    ("pass" + "word = " + "hunter2hunter2", "hunter2hunter2"),
+    ("Bear" + "er " + "eyJhbGciOiJIUzI1NiJ9", "eyJhbGciOiJIUzI1NiJ9"),
+    ("Q2hhbmdl" + "IHRoaXMgYmVmb3JlIHVzZQ", "Q2hhbmdlIHRoaXMgYmVmb3JlIHVzZQ"),
+)
+ORDINARY = ("Ada", "plugin_host.gil_check", "csl-238-settings-no-limit-list-20261121", "/home/user2/projects/foo",
+            "123e4567-e89b-12d3-a456-426614174000", "internationalization", "a token budget of 5", "")
+class OneCapOnEveryShownValue(_Folder):
+    """No value status, the start log or a note shows escapes the one cap, and no key-like text is shown."""
+
+    def declared(self, *rows: settings.Setting):
+        return mock.patch.multiple(settings, SETTINGS=rows,
+                                   DECLARED=MappingProxyType({row.name: row for row in rows}))
+
+    def test_the_two_lists_of_the_reproduction_stay_within_the_cap(self) -> None:
+        three = settings._shown(("x" * 30,) * 3)
+        name = "'" + "x" * 30 + "'"
+        self.assertEqual(f"[{name}, {name}], and 1 more", three)
+        sixty = settings._shown(tuple("y" * 30 for _ in range(60)))
+        name = "'" + "y" * 30 + "'"
+        self.assertEqual(f"[{name}], and 59 more", sixty)
+        self.assertEqual((80, 47), (len(three), len(sixty)))
+
+    def test_a_text_a_number_and_a_list_at_the_cap_and_one_past(self) -> None:
+        self.assertEqual(repr("a" * 78), settings._shown("a" * 78))  # 80 characters with its quotes
+        cut = settings._shown("a" * 79)
+        self.assertEqual(repr("a" * 79)[:46] + "... (35 more characters not shown)", cut)
+        self.assertEqual(80, len(cut))
+        self.assertEqual(repr("a" * 500)[:45] + "... (457 more characters not shown)", settings._shown("a" * 500))
+        self.assertEqual("9" * 80, settings._shown(int("9" * 80)))
+        self.assertEqual("9" * 46 + "... (35 more characters not shown)", settings._shown(int("9" * 81)))
+        b, c = "'" + "b" * 36 + "'", "'" + "c" * 36 + "'"
+        self.assertEqual(f"[{b}, {c}]", settings._shown(("b" * 36, "c" * 36)))  # 2 + 38 + 2 + 38 = 80
+        self.assertEqual(f"[{b}], and 1 more", settings._shown(("b" * 36, "c" * 37)))
+        self.assertEqual("['" + "d" * 76 + "']", settings._shown(("d" * 76,)))
+        self.assertEqual("a list of 1, too long to show", settings._shown(("d" * 77,)))
+        self.assertEqual("... (1 more character not shown)", settings._shown(7, 0))
+
+    def test_no_limit_shows_every_value_whole(self) -> None:
+        for value in ("a" * 500, int("9" * 300), tuple("y" * 30 for _ in range(60))):
+            with self.subTest(value=type(value).__name__):
+                self.assertNotIn(" more", settings._shown(value, settings.NO_LIMIT))
+        self.assertEqual(repr("a" * 500), settings._shown("a" * 500, settings.NO_LIMIT))
+        self.assertEqual(2040, len(settings._shown(tuple("y" * 30 for _ in range(60)), settings.NO_LIMIT)))
+
+    def test_every_kind_and_every_branch_passes_the_one_cap(self) -> None:
+        import datetime
+        values = (settings.NO_LIMIT, True, False, 7, -2.5, float("inf"), 10 ** 200, int("f" * 4000, 16),
+                  "z" * 500, KEY_LIKE[0][0], (), ("Ada",) * 40, tuple("y" * 30 for _ in range(60)),
+                  (("a" * 40, "b" * 40), ("c" * 40,)), ["x"] * 50, {"k": "v" * 100}, datetime.date(2026, 11, 24),
+                  object())
+        for cap in (0, 1, 5, 40, 80, 200):
+            for value in values:
+                with self.subTest(cap=cap, value=type(value).__name__):
+                    shown = settings._shown(value, cap)
+                    whole = settings._shown(value, settings.NO_LIMIT)
+                    # within the cap; under a cap shorter than the count itself, only the count is shown
+                    self.assertLessEqual(len(shown), max(cap, 40), shown)
+                    self.assertEqual(len(whole) > cap, shown != whole)
+                    if shown != whole:
+                        self.assertRegex(shown, r"\(\d+ more characters? not shown\)$|, and \d+ more$|"
+                                                r"^a list of \d+, too long to show$")
+
+    def test_every_row_type_meets_the_cap_in_status(self) -> None:
+        rows = (settings.DECLARED[CAP_KEY],
+                settings.Setting("test.flag", bool, True, "A flag."),
+                settings.Setting("test.limit", int, 10 ** 100, "A limit.", allow_no_limit=True),
+                settings.Setting("test.span", float, 1.5, "A span."),
+                settings.Setting("test.word", str, "w" * 300, "A word."),
+                settings.Setting("test.names", list, tuple("n" * 30 for _ in range(60)), "Names."))
+        for cap, cut in (("40", True), ("80", True), ('"none"', False)):
+            with self.subTest(cap=cap):
+                self.put(f"version = 1\n[status]\nvalue_max_chars = {cap}\n")
+                with self.declared(*rows):
+                    shown = settings.lines(settings.load(self.environ))
+                self.assertEqual(len(rows), len(shown))
+                for line in shown[2:3] + shown[4:]:  # the long whole number, text and list
+                    self.assertEqual(cut, " more" in line or "too long to show" in line, line)
+                if cut:
+                    self.assertTrue(all(len(line) < 2 * 80 + 80 for line in shown), shown)
+                else:
+                    self.assertIn("w" * 300, shown[4])
+
+    def test_the_one_cap_is_the_only_way_out_of_shown(self) -> None:
+        tree = ast.parse(inspect.getsource(settings))
+        funcs = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+        returns = [node for node in ast.walk(funcs["_shown"]) if isinstance(node, ast.Return)]
+        self.assertEqual(1, len(returns))
+        self.assertEqual("_cut", returns[0].value.func.id)
+        users = {name for name, func in funcs.items() for node in ast.walk(func)
+                 if isinstance(node, ast.Name) and node.id in ("_piece", "_cut")}
+        self.assertEqual({"_shown", "_piece"}, users)  # _piece calls itself for a list inside a list
+        outside = [sub.id for node in tree.body if not isinstance(node, ast.FunctionDef)
+                   for sub in ast.walk(node) if isinstance(sub, ast.Name) and sub.id in ("_piece", "_cut", "repr")]
+        self.assertEqual([], outside)
+        texts = {name for name, func in funcs.items() for node in ast.walk(func)
+                 if isinstance(node, ast.Name) and node.id == "repr"}
+        self.assertEqual({"_piece"}, texts)  # no other function turns a value into text of its own
+
+    def test_the_cap_is_a_row_of_the_one_file_with_80_and_no_limit(self) -> None:
+        row = settings.DECLARED[CAP_KEY]
+        self.assertIn(row, settings.SETTINGS)
+        self.assertEqual((int, 80, 0, True), (row.type, row.default, row.floor, row.allow_no_limit))
+        self.assertIn("none", row.says)
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_the_file_sets_the_cap_of_every_line_and_note(self) -> None:
+        rows = (settings.DECLARED[CAP_KEY], settings.Setting("test.word", str, "w" * 50, "A word."),
+                settings.Setting("test.limit", int, 5, "A limit."))
+        word = "'wwwww... (46 more characters not shown)"
+        self.put('version = 1\n[status]\nvalue_max_chars = 40\n[test]\nlimit = "' + "y" * 50 + '"\n')
+        with self.declared(*rows):
+            shown = settings.lines(settings.load(self.environ))
+        self.assertEqual([f"{CAP_KEY} = 40 (default 80; source: settings file)",
+                          f"test.word = {word} (default {word}; source: default)",
+                          "test.limit = 5 (default 5; source: default)",
+                          "note settings_value_out_of_range: test.limit: found 'yyyyy... (46 more characters not "
+                          "shown); allowed: a whole number; the default 5 stays in force"], shown)
+        self.put('version = 1\n[status]\nvalue_max_chars = "none"\n[test]\nlimit = "' + "y" * 50 + '"\n')
+        with self.declared(*rows):
+            shown = settings.lines(settings.load(self.environ))
+        self.assertIn(repr("w" * 50), shown[1])
+        self.assertIn(repr("y" * 50), shown[3])
+        self.assertNotIn("not shown", "\n".join(shown))
+
+    def test_a_text_that_looks_like_a_key_is_never_shown_even_in_part(self) -> None:
+        for text, secret in KEY_LIKE:
+            for value in (text, ("Ada", text), (("Ada", text),), "a note: " + text):
+                for cap in (80, 10, settings.NO_LIMIT):
+                    with self.subTest(text=text[:6], value=type(value).__name__, cap=cap):
+                        shown = settings._shown(value, cap)
+                        if cap is settings.NO_LIMIT:
+                            self.assertIn("looks like a key or a password, not shown", shown)
+                        for i in range(len(secret) - 5):
+                            self.assertNotIn(secret[i:i + 6], shown)
+
+    def test_an_ordinary_text_is_shown(self) -> None:
+        for text in ORDINARY:
+            with self.subTest(text=text):
+                self.assertEqual(repr(text), settings._shown(text, settings.NO_LIMIT))
+                self.assertEqual(repr(text), settings._shown((text,), settings.NO_LIMIT)[1:-1])
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_a_key_in_the_file_is_in_no_line_of_status_or_a_note(self) -> None:
+        text, secret = KEY_LIKE[0]
+        rows = (settings.DECLARED[CAP_KEY], settings.Setting("test.word", str, "usual", "A word."),
+                settings.Setting("test.limit", int, 5, "A limit."), settings.Setting("test.names", list, (), "Names."))
+        self.put(f'version = 1\n[status]\nvalue_max_chars = "none"\n[test]\nword = "{text}"\nlimit = "{text}"\n'
+                 f'names = ["Ada", "{text}"]\n')
+        out = io.StringIO()
+        with self.declared(*rows):
+            self.assertEqual(0, settings.main([], self.environ, out, io.StringIO()))
+        printed = out.getvalue()
+        for i in range(len(secret) - 5):
+            self.assertNotIn(secret[i:i + 6], printed)
+        self.assertIn("test.names = ['Ada', a text of ", printed)
+        self.assertEqual(3, printed.count("looks like a key or a password, not shown"))
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_a_note_says_the_floor_and_no_limit_in_what_is_allowed(self) -> None:
+        row = settings.Setting("test.limit", int, 5, "A limit.", floor=1, allow_no_limit=True)
+        for found, reason in (("0", "a value below 1 has no meaning; "), ("2.5", ""), ("true", "")):
+            with self.subTest(found=found):
+                self.put(f"version = 1\n[test]\nlimit = {found}\n")
+                with self.declared(row):
+                    loaded = settings.load(self.environ)
+                self.assertEqual(f'test.limit: found {found}; {reason}allowed: a whole number of 1 or more, or "none" '
+                                 "for no limit; the default 5 stays in force", loaded.notes[0].detail)
 
 
 class WindowsNoOwnerCheck(_Folder):

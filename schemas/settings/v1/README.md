@@ -8,6 +8,7 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
 | Setting | Type | Default | What it does |
 |---|---|---|---|
 | `plugin_host.gil_check` | boolean | `true` | Whether each plugin host makes its GIL check; on by default, and a person may turn it off. Read by no host yet. |
+| `status.value_max_chars` | integer, or the string `"none"` | `80` | The most characters of one value that status, the start log and a note show; what is past it is cut and counted, a list shows the names that fit and how many more, and "none" shows every value whole. |
 
 ## What holds for the file
 
@@ -30,6 +31,10 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
 - On a system without an owner check (Windows) no file is read (`settings_not_read_on_this_system`).
 - `python -m recursion_core.settings` shows each setting, its value in force, its default, its source and
   any advice, and every note; it takes no argument and writes nothing. The daemon logs the same lines at start.
+- Every value those lines and the notes show passes one cap, `status.value_max_chars`: a text past it is
+  cut, with the count of characters not shown; a list shows the names that fit whole and how many more;
+  `"none"` shows every value whole. A text that looks like a key or a password is never shown, not even
+  in part.
 - The daemon reads the file at start in this build; a later reload may read it again.
 - The list of settings is append-only: a row is added, never renamed or given another meaning.
 

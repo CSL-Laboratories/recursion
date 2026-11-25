@@ -4,3 +4,7 @@ version = 1
 [plugin_host]
 # The person turned the check off; the reason can stay beside it.
 gil_check = false
+
+[status]
+# Show each value to 120 characters.
+value_max_chars = 120

@@ -1,0 +1,13 @@
+{
+  "schema": "csl-revoked-keys/1",
+  "list_version": 7,
+  "issued_at": "2026-11-13T08:00:00.000Z",
+  "expires_at": "2026-11-20T08:00:00.000Z",
+  "keys": [
+    {
+      "key_id": "ed25519:5f1d3e2a9b8c7d6e5f4a3b2c1d0e9f8a",
+      "revoked_at": "2026-11-12T21:15:00.000Z",
+      "reason": "compromised"
+    }
+  ]
+}

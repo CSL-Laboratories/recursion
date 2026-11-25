@@ -1,0 +1,8 @@
+{
+  "answer": {
+    "code": "registry_unavailable",
+    "detail": "run_id"
+  },
+  "method": "run.status",
+  "params": {}
+}

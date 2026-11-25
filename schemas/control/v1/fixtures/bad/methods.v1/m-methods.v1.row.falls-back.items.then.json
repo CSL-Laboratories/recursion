@@ -1,0 +1,39 @@
+{
+  "name": "session.interrupt",
+  "scope": "run",
+  "mutating": true,
+  "idempotency": "command_id",
+  "precondition": "expected_turn_id",
+  "requires": [],
+  "falls_back": [
+    {
+      "flag": "interrupt"
+    }
+  ],
+  "service": null,
+  "page_allowed": true,
+  "mcp": {
+    "exposed": true,
+    "tool": "recursion_session_interrupt",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  "beta": true,
+  "codes": [
+    "ok",
+    "pending",
+    "request_invalid",
+    "scope_refused",
+    "unavailable",
+    "unsupported",
+    "conflict",
+    "session_unknown"
+  ],
+  "lane": "SESSIONS",
+  "params": "#/$defs/params.session.interrupt",
+  "result": "#/$defs/answer.session.interrupt"
+}

@@ -1,0 +1,102 @@
+{
+  "item": {
+    "item_id": "qi-0002",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "order": 2,
+    "text": "Stop refactoring; only fix the failing test.",
+    "revision": 1,
+    "delivery": "steer",
+    "state": "queued",
+    "delivery_id": null,
+    "turn_id": null,
+    "created_at": "2026-11-13T07:34:20.000Z"
+  },
+  "steps": [
+    {
+      "what": "Delivering and the binding are committed: the target is the turn in progress.",
+      "happening": "begin",
+      "facts": {
+        "delivery_id": "dlv-0008",
+        "item_id": "qi-0002",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "worker_incarnation": "wrk-5b1f0c2d.1",
+        "target_turn_id": "turn-000c",
+        "how": "mid_turn"
+      },
+      "item": {
+        "item_id": "qi-0002",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 2,
+        "text": "Stop refactoring; only fix the failing test.",
+        "revision": 1,
+        "delivery": "steer",
+        "state": "delivering",
+        "delivery_id": "dlv-0008",
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "The write returns, and the core logs steer.sent under that turn.",
+      "happening": "written",
+      "event": {
+        "seq": 51,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "time": "2026-11-13T07:34:30.010Z",
+        "type": "steer.sent",
+        "source": "core",
+        "trust": "trusted",
+        "payload": {
+          "item_id": "qi-0002",
+          "delivery_id": "dlv-0008"
+        }
+      },
+      "item": {
+        "item_id": "qi-0002",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 2,
+        "text": "Stop refactoring; only fix the failing test.",
+        "revision": 1,
+        "delivery": "steer",
+        "state": "delivering",
+        "delivery_id": "dlv-0008",
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "The engine takes it inside the turn in progress.",
+      "happening": "accepted",
+      "event": {
+        "seq": 52,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "time": "2026-11-13T07:34:30.480Z",
+        "type": "input.accepted",
+        "source": "engine",
+        "trust": "untrusted",
+        "payload": {
+          "delivery_id": "dlv-0008",
+          "turn_id": "turn-000c",
+          "how": "mid_turn"
+        }
+      },
+      "item": {
+        "item_id": "qi-0002",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 2,
+        "text": "Stop refactoring; only fix the failing test.",
+        "revision": 1,
+        "delivery": "steer",
+        "state": "delivered",
+        "delivery_id": "dlv-0008",
+        "turn_id": "turn-000c",
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    }
+  ]
+}

@@ -1,0 +1,93 @@
+Dev task 05: Semantic Versioning 2.0.0 parsing and precedence.
+-- task.json --
+{"id": "dev-05-semver", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+Implement `parse(text)` and `compare(a, b)` in `versions/semver.py`, following Semantic Versioning 2.0.0.
+
+- A version is `MAJOR.MINOR.PATCH`, optionally followed by `-PRERELEASE` and then `+BUILD`. Numeric parts have no leading zeros (a lone `0` is fine), and neither do numeric pre-release identifiers. `parse` raises `ValueError` for anything else and otherwise returns whatever you find useful.
+- `compare(a, b)` takes two version strings and returns -1, 0 or 1.
+- Precedence: compare MAJOR, MINOR, PATCH numerically. Build metadata is ignored. A pre-release version is lower than the same version without one. Pre-release identifiers are compared one by one from the left: numeric ones numerically, others in ASCII order, a numeric identifier is lower than a non-numeric one, and if all compared identifiers are equal the version with fewer identifiers is lower.
+-- start/versions/__init__.py --
+"""Version strings."""
+-- start/versions/semver.py --
+def parse(text):
+    raise NotImplementedError
+
+
+def compare(a, b):
+    raise NotImplementedError
+-- hidden/test_semver.py --
+import unittest
+
+from versions.semver import compare, parse
+
+
+class SemverTests(unittest.TestCase):
+    def test_specification_order(self):
+        chain = ["1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta", "1.0.0-beta.2",
+                 "1.0.0-beta.11", "1.0.0-rc.1", "1.0.0"]
+        for lower, higher in zip(chain, chain[1:]):
+            self.assertEqual(compare(lower, higher), -1, (lower, higher))
+            self.assertEqual(compare(higher, lower), 1, (higher, lower))
+
+    def test_numeric_parts(self):
+        self.assertEqual(compare("2.10.0", "2.9.0"), 1)
+        self.assertEqual(compare("1.0.0", "1.0.0"), 0)
+
+    def test_build_ignored(self):
+        self.assertEqual(compare("1.0.0+build.5", "1.0.0"), 0)
+
+    def test_invalid(self):
+        for text in ("1.2", "01.2.3", "1.2.3-01", "1.2.3-", "a.b.c"):
+            with self.assertRaises(ValueError):
+                parse(text)
+-- solution/versions/semver.py --
+import re
+
+_VERSION = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$")
+
+
+def parse(text):
+    match = _VERSION.match(text) if isinstance(text, str) else None
+    if not match:
+        raise ValueError(f"not a semantic version: {text!r}")
+    identifiers = []
+    if match.group(4):
+        for part in match.group(4).split("."):
+            if part.isdigit():
+                if len(part) > 1 and part[0] == "0":
+                    raise ValueError(f"leading zero in {part!r}")
+                identifiers.append(int(part))
+            else:
+                identifiers.append(part)
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3))), tuple(identifiers)
+
+
+def compare(a, b):
+    (core_a, pre_a), (core_b, pre_b) = parse(a), parse(b)
+    if core_a != core_b:
+        return -1 if core_a < core_b else 1
+    if pre_a == pre_b:
+        return 0
+    if not pre_a:
+        return 1
+    if not pre_b:
+        return -1
+    for x, y in zip(pre_a, pre_b):
+        if x == y:
+            continue
+        if isinstance(x, int) and isinstance(y, int):
+            return -1 if x < y else 1
+        if isinstance(x, int):
+            return -1
+        if isinstance(y, int):
+            return 1
+        return -1 if x < y else 1
+    return -1 if len(pre_a) < len(pre_b) else 1
+-- standin.json --
+{"outcomes": ["solve", "crash", "solve", "solve", "solve"]}

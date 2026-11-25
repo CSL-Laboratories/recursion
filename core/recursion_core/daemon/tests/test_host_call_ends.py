@@ -3,7 +3,9 @@ and a start inside a call that fails. Every host is a thread of the test; no uni
 from __future__ import annotations
 
 import socket
+import subprocess
 import threading
+import time
 import unittest
 
 from recursion_core.control_transport.framing import HEADER
@@ -13,6 +15,29 @@ from recursion_core.daemon.tests import test_host_unit_calls as tc
 from recursion_core.plugin_security import host_channel as hc
 
 JOIN_S = hs.JOIN_S
+CALL_S = 0.5     # the call deadline of the stalled-read test (a test figure)
+STOP_S = 0.2     # its Stop bound (a test figure)
+STALL_S = 3.0    # how long the stalled stand-in's read of a unit takes when nothing bounds it (a test figure)
+SLACK_S = 1.0    # how far past the call's deadline that call may end (a test figure)
+
+
+class StalledIdentity(tc.Hosts):
+    """Hosts whose user manager stalls on every read of a unit's identity but the first host's: a read with a bound
+    takes the whole bound and then times out, as subprocess does; a read with none takes STALL_S."""
+
+    def __init__(self, test, modes):
+        super().__init__(test, modes)
+        self.bounds = []
+
+    def unit_identity(self, unit, timeout_s=None):
+        if unit == self.started[0]:
+            return super().unit_identity(unit)
+        self.bounds.append(timeout_s)
+        if timeout_s is None:
+            time.sleep(STALL_S)
+            return super().unit_identity(unit)
+        time.sleep(min(max(timeout_s, 0.0), STALL_S))
+        raise subprocess.TimeoutExpired(['systemctl'], timeout_s)
 
 
 class ScriptedHosts(tc.Hosts):
@@ -127,6 +152,27 @@ class AStartInsideACallThatFails(tc._Units):
             units.call('stand.in', 'operator', {'command': 'x'})
         self.assertEqual(second.exception.reason, 'not_started')
         self.assertEqual(units.degraded, {'stand.in': 2})
+
+    def test_a_stalled_read_of_the_units_identity_ends_within_the_calls_deadline(self):
+        hosts = StalledIdentity(self, ['answers', 'answers'])
+        units = self.units(hosts, call_deadline_s=CALL_S, start_deadline_s=None, stop_confirm_s=STOP_S)
+        first = units.start('stand.in', *hs.package(hs.POLITE))
+        hosts.kill_cgroup('', first.unit)  # the host ends by itself
+        with self.assertLogs(host_units.log, 'ERROR'):
+            with self.assertRaises(host_units.HostUnavailable):
+                units.call('stand.in', 'operator', {'command': 'x'})
+        began = time.monotonic()
+        with self.assertRaises(host_units.HostUnavailable) as caught:
+            units.call('stand.in', 'operator', {'command': 'x'})  # starts a host; its identity read stalls
+        took = time.monotonic() - began
+        self.assertLess(took, CALL_S + SLACK_S)
+        self.assertEqual(caught.exception.reason, 'not_started')
+        self.assertIn("the system did not show the unit's control group", caught.exception.detail)
+        self.assertIn('plugin_host.call_deadline_s', caught.exception.detail)
+        self.assertGreater(hosts.bounds[0], 0)
+        self.assertLessEqual(hosts.bounds[0], CALL_S)  # what was left of the call's deadline, no figure of its own
+        self.assertEqual(units.degraded, {'stand.in': 2})
+        self.assertIsNone(units.unit_of('stand.in'))
 
 
 if __name__ == '__main__':

@@ -128,7 +128,7 @@ class ProcessManager:
         self.children.append((unit, child, guard))
         return child
 
-    def unit_identity(self, unit):
+    def unit_identity(self, unit, timeout_s=None):
         return '/stand-in.slice/' + unit, 0
 
     def kill_cgroup(self, group, unit):
@@ -189,7 +189,7 @@ class ThreadManager:
         threading.Thread(target=host, daemon=True).start()
         return StandInProcess()
 
-    def unit_identity(self, unit):
+    def unit_identity(self, unit, timeout_s=None):
         return '/stand-in.slice/' + unit, 0
 
     def kill_cgroup(self, group, unit):
@@ -383,6 +383,49 @@ class TheHostsOwnRestart(_Folder):
                 self.assertTrue(frames[1]['detail'].startswith('core_folder_not_usable: '), frames)
                 self.assertTrue(frames[1]['detail'].endswith(repr(folder)), frames)
                 self.assertEqual(len(frames), 2)
+
+    def core_tree(self, name, source):
+        """A folder whose recursion_core holds only a plugin_host of ``source`` (None: no plugin_host at all)."""
+        folder = self.tmp / name
+        (folder / 'recursion_core').mkdir(parents=True)
+        (folder / 'recursion_core' / '__init__.py').write_text('')
+        if source is not None:
+            (folder / 'recursion_core' / 'plugin_host').mkdir()
+            (folder / 'recursion_core' / 'plugin_host' / '__init__.py').write_text(source)
+        return folder
+
+    def start_in(self, folder):
+        return self.child([sys.executable, '-I', '-B', '-c', plugin_host.START_CODE, str(folder)], env={},
+                          stdin=hc.encode(HELLO) + hc.encode(BYE))
+
+    def test_recursions_code_that_fails_to_import_is_refused_on_the_channel_with_its_cause(self):
+        cases = (('import_error', 'from os import no_such_name_here\n',
+                  "ImportError: cannot import name 'no_such_name_here'"),
+                 ('syntax_error', 'def broken(:\n', 'SyntaxError: '),
+                 ('missing_part', 'import recursion_core.no_such_part\n',
+                  "ModuleNotFoundError: No module named 'recursion_core.no_such_part'"),
+                 ('runtime_error', 'raise RuntimeError("the core broke here")\n', 'RuntimeError: the core broke here'))
+        for name, source, cause in cases:
+            with self.subTest(case=name):
+                folder = self.core_tree(name, source)
+                status, frames, errors = self.start_in(folder)
+                self.assertEqual(status, plugin_host.EXIT_FOLDER_REFUSED, errors)
+                self.assertEqual(len(frames), 2, (frames, errors))
+                self.assertEqual(frames[0], HELLO)
+                self.assertEqual((frames[1]['code'], frames[1]['id']), ('host_start_refused', None))
+                detail = frames[1]['detail']
+                self.assertTrue(detail.startswith('core_code_failed: the plugin host could not start'), detail)
+                self.assertIn(cause, detail)
+                self.assertIn('no plugin code ran', detail)
+                self.assertIn('Reinstall Recursion by its recipe', detail)
+                self.assertTrue(detail.endswith(repr(str(folder))), detail)
+
+    def test_a_folder_whose_recursion_core_has_no_plugin_host_is_still_not_a_folder_that_holds_the_code(self):
+        folder = self.core_tree('no_host', None)
+        status, frames, errors = self.start_in(folder)
+        self.assertEqual(status, plugin_host.EXIT_FOLDER_REFUSED, errors)
+        self.assertTrue(frames[1]['detail'].startswith('core_folder_not_usable: '), frames)
+        self.assertTrue(frames[1]['detail'].endswith(repr(str(folder))), frames)
 
     def test_a_channel_left_close_on_exec_survives_the_restart(self):
         # The starter leaves descriptors 0 and 1 close-on-exec; the environment is not clean, so the host restarts.

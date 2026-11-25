@@ -645,9 +645,9 @@ class HostUnitsInTheUserManagerTest(unittest.TestCase):
         units = self.units()
         real, asked = self.manager.unit_identity, []
 
-        def blank_first(unit):
+        def blank_first(unit, timeout_s=None):
             asked.append(unit)
-            return ('', 0) if len(asked) == 1 else real(unit)
+            return ('', 0) if len(asked) == 1 else real(unit, timeout_s)
 
         self.manager.unit_identity = blank_first
         with self.assertRaises(self.host_units.HostUnavailable) as caught:

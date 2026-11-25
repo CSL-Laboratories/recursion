@@ -376,9 +376,16 @@ class EngineUnitManager(SystemdUserManager):
             raise refused('systemd_run_cannot_pass_argv_verbatim')
         self._verbatim_argv = True
 
-    def unit_identity(self, unit):
-        """(cgroup path, main pid) as systemd reports them now; blank or 0 when it reports none."""
-        text = self._call(['systemctl', '--user', 'show', '--property=ControlGroup,MainPID', '--', unit])
+    def unit_identity(self, unit, timeout_s=None):
+        """(cgroup path, main pid) as systemd reports them now; blank or 0 when it reports none.
+
+        ``timeout_s``: how long the read may take (the time its caller has left); past it subprocess.TimeoutExpired.
+        None: the manager's own wait."""
+        argv = ['systemctl', '--user', 'show', '--property=ControlGroup,MainPID', '--', unit]
+        if timeout_s is None:
+            text = self._call(argv)
+        else:
+            text = subprocess.run(argv, check=True, text=True, capture_output=True, timeout=timeout_s).stdout
         props = dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
         group = props.get('ControlGroup', '')
         if not group.startswith('/') or '..' in Path(group).parts:

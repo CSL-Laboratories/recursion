@@ -40,7 +40,11 @@ argument: by default the folder this daemon's own code was imported from.
 * ``stop`` and ``close`` (the daemon's own Stop) end every host the same way, a host that is still starting
   included (its start ends with ``stopped``), and wait on no host, only on the system's proof. The proof of every
   host shares one bound; the hosts it did not confirm get ONE system stop together, within a second bound, and one
-  more read each, within a third. So the daemon's Stop takes at most three bounds, whatever the count of hosts.
+  more read each, within a third. So the daemon's Stop takes at most three bounds, whatever the count of hosts, and
+  one bound more for each host still starting whose control group the system had not yet shown (its kill reads it).
+* A start inside a call is held to what is left of the call's deadline in the read of the unit's control group and
+  in the wait for the host's hello, or to the start deadline where the call has none (the launcher's one read of
+  systemd-run's version, made once per manager, keeps the manager's own wait).
 * ``sweep_strays``, for the daemon's own start: a plugin host unit that this daemon did not start (left by an earlier
   life) and that the system shows active, starting again or queued is stopped by the system's stop and reported, so
   a host never outlives the daemon's Stop unseen.
@@ -61,6 +65,7 @@ import reprlib
 import secrets
 import select
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -640,15 +645,22 @@ class PluginHostUnits:
         if late:
             self._end_start(host)
         deadline = None if self._start_deadline_s is None else time.monotonic() + self._start_deadline_s
-        if limit is not None:
-            deadline = limit if deadline is None else min(deadline, limit)
+        row = ROWS['start_deadline_s']  # the row of the bound this start is held to
+        if limit is not None and (deadline is None or limit < deadline):
+            deadline, row = limit, ROWS['call_deadline_s']
         try:
             hello = host.receive(deadline)
             if type(hello) is not dict or hello.get('type') != 'hello' or hello.get('channel') != hc.CHANNEL:
                 raise HostUnavailable(plugin_id, NOT_STARTED, 'the host did not say hello')
             if host.start_refusal() is not None:  # a hello that came with the host's refusal to start
                 raise HostUnavailable(plugin_id, NOT_STARTED, START_REFUSED)
-            group, _ = self._manager.unit_identity(unit)
+            try:  # within what is left of the start (or of the call it runs in), never a figure of its own; a
+                # wait longer than the platform's longest is waited as that longest (the platform's figure)
+                group, _ = self._manager.unit_identity(unit, timeout_s=None if deadline is None else min(
+                    max(deadline - time.monotonic(), 0.0), _LONGEST_WAIT_S, _LONGEST_POLL_S))
+            except subprocess.TimeoutExpired:
+                raise HostUnavailable(plugin_id, NOT_STARTED, "the system did not show the unit's control group "
+                                      f'before the deadline ({row}), so no plugin code ran') from None
             if not group or Path(group).name != unit:
                 raise HostUnavailable(plugin_id, NOT_STARTED, 'the unit has no control group')
             host.group = group
@@ -859,7 +871,7 @@ class PluginHostUnits:
         group = host.group
         if not group:
             try:
-                group, _ = self._manager.unit_identity(host.unit)
+                group, _ = self._manager.unit_identity(host.unit, timeout_s=self._stop_confirm_s)
             except Exception:  # noqa: BLE001 - no cgroup known: the unit never ran
                 group = ''
         if not (group and Path(group).name == host.unit and self._manager.kill_cgroup(group, host.unit)):

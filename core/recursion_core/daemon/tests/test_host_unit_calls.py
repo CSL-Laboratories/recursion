@@ -100,7 +100,7 @@ class Hosts:
         threading.Thread(target=host, daemon=True).start()
         return hs.StandInProcess()
 
-    def unit_identity(self, unit):
+    def unit_identity(self, unit, timeout_s=None):
         return '/stand-in.slice/' + unit, 0
 
     def kill_cgroup(self, group, unit):

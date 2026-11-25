@@ -62,7 +62,8 @@ RESTARTED = "--restarted-once"
 # ends with one of these statuses. They are named parts of this program's interface, not settings:
 # 71 (sysexits EX_OSERR) the restart could not be made; 78 (EX_CONFIG) the environment was not clean
 # after the restart. 0 is a clean end and 1 an internal failure of the host.
-# 66 (EX_NOINPUT) the folder handed for Recursion's own code is not one that holds it (see START_CODE).
+# 66 (EX_NOINPUT) the folder handed for Recursion's own code is not one that holds it, or Recursion's code
+# there fails to import (see START_CODE).
 START_REFUSED = "host_start_refused"
 EXIT_RESTART_FAILED = 71
 EXIT_ENVIRONMENT_NOT_CLEAN = 78
@@ -80,6 +81,14 @@ _FOLDER_TEXT = (
     ": the plugin host could not start because the folder it was given for Recursion's own code is not "
     "an absolute folder that holds that code, so no plugin code ran. Reinstall Recursion by its recipe, or "
     "give the daemon's plugin hosts the folder that holds recursion_core. The folder given: ")
+# What the daemon reads when the folder holds Recursion's code but that code fails to import: the exception's type and
+# the first line of its words stand between the two parts.
+CORE_CODE_FAILED = "core_code_failed"
+_FAILED_TEXT = (
+    ": the plugin host could not start because Recursion's own code in the folder it was given failed to import (")
+_FAILED_TAIL = (
+    "), so no plugin code ran. Reinstall Recursion by its recipe, or give the daemon's plugin hosts a folder whose "
+    "recursion_core imports whole. The folder given: ")
 # The channel's own limit on a refusal's detail (host_channel), not a setting.
 _DETAIL_MAX = 1000
 
@@ -91,21 +100,33 @@ _DETAIL_MAX = 1000
 # the argv). A folder that is not absolute, is not a folder or holds no recursion_core is refused on the
 # channel (START_REFUSED, detail FOLDER_REFUSED and the words above) and the host ends with
 # EXIT_FOLDER_REFUSED; it writes those two frames itself, because the channel's codec is part of the code it
-# could not find. The code holds no dollar sign and no percent sign, so no launcher reads a variable or a
-# specifier into it.
+# could not find. A folder that holds that code but whose code fails to import (an import error inside the tree,
+# a syntax error, any exception) is refused the same way and with the same status, with the detail
+# CORE_CODE_FAILED and words that name the exception's type and the first line of its words; the words above stay
+# for a folder where recursion_core or its plugin_host is not found. The code holds no dollar sign and no percent
+# sign, so no launcher reads a variable or a specifier into it.
 START_CODE = "\n".join((
     "import os, sys",
     "folder = sys.argv[1] if len(sys.argv) > 1 else ''",
     "start = None",
+    "failed = ''",
     "if os.path.isabs(folder) and os.path.isdir(os.path.join(folder, 'recursion_core')):",
     "    sys.path.insert(0, folder)",
     "    try:",
     "        from recursion_core.plugin_host import start",
-    "    except ImportError:",
+    "    except BaseException as exc:",
     "        start = None",
+    "        if not (isinstance(exc, ModuleNotFoundError) and exc.name in %r):"
+    % (('recursion_core', 'recursion_core.plugin_host'),),
+    "            lines = str(exc).splitlines()",
+    "            failed = type(exc).__name__ + ': ' + (lines[0] if lines else '')",
     "if start is None:",
     "    import json, struct",
-    "    detail = (%r + repr(folder))[:%d]" % (FOLDER_REFUSED + _FOLDER_TEXT, _DETAIL_MAX),
+    "    if failed:",
+    "        detail = (%r + failed + %r + repr(folder))[:%d]" % (CORE_CODE_FAILED + _FAILED_TEXT, _FAILED_TAIL,
+                                                               _DETAIL_MAX),
+    "    else:",
+    "        detail = (%r + repr(folder))[:%d]" % (FOLDER_REFUSED + _FOLDER_TEXT, _DETAIL_MAX),
     "    frames = b''",
     "    for message in ({'type': 'hello', 'channel': %r}," % hc.CHANNEL,
     "                    {'type': 'refusal', 'id': None, 'code': %r, 'detail': detail}):" % START_REFUSED,

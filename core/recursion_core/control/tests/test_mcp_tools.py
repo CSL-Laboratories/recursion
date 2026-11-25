@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import tomllib
 import unittest
 
 from recursion_core.control import codex_config, mcp_tools
 from recursion_core.control.codex_config import codex_operator_snippet
-from recursion_core.control.registry import EMPTY
+from recursion_core.control.registry import EMPTY, POPULATED
 from recursion_core.control.tests.fakes import FakeKillTree, make_api, started
 
 HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
@@ -48,6 +49,156 @@ class DescriptorTest(unittest.TestCase):
         self.assertTrue(mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": "nope"})["isError"])
         self.assertTrue(mcp_tools.call_tool(api, "recursion_run_kill", {})["isError"])
         self.assertFalse(mcp_tools.call_tool(api, "recursion_run_list", {})["isError"])
+
+
+class IsErrorTest(unittest.TestCase):
+    """The Liaison's ruling on lane MCP's Q2 (Nov 15, 4:22 PM; DeepSeek F4 of #416): a Stop that truthfully answers
+    pending or ended, and an interrupt that answers pending, read isError true. One mapping, per method, a test per
+    stop and interrupt tool."""
+
+    class Answering:
+        """A control API that answers every call with one code."""
+
+        def __init__(self, code):
+            self.code, self.calls = code, []
+
+        def call(self, method, params):
+            self.calls.append(method)
+            return {"code": self.code, "run_id": params.get("run_id")}
+
+    def test_the_run_stop_tool_reads_pending_and_ended_as_answers_not_errors(self) -> None:
+        for code, error in (("stopped", False), ("pending", False), ("ended", False), ("run_unknown", True),
+                            ("request_invalid", True), ("registry_unavailable", True), ("unavailable", True),
+                            ("scope_refused", True)):
+            with self.subTest(code=code):
+                api = self.Answering(code)
+                res = mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": "r1"})
+                self.assertEqual((res["structuredContent"]["code"], res["isError"]), (code, error))
+                self.assertEqual(api.calls, ["run.stop"])
+
+    def test_a_pending_stop_through_the_real_api_is_not_an_error(self) -> None:
+        api, _, _, _ = make_api(FakeKillTree([POPULATED] * 20))
+        rid = started(api)
+        res = mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": rid})
+        self.assertEqual((res["structuredContent"]["code"], res["isError"]), ("pending", False))
+
+    def test_the_session_stop_and_interrupt_tools(self) -> None:
+        # Lane MCP's tools recursion_session_stop and recursion_session_interrupt answer through is_error.
+        cases = {"session.stop": (("stopped", False), ("pending", False), ("ended", False), ("ok", True),
+                                  ("session_unknown", True), ("conflict", True), ("unsupported", True)),
+                 "session.interrupt": (("ok", False), ("pending", False), ("ended", True), ("stopped", True),
+                                       ("session_unknown", True), ("conflict", True), ("unsupported", True))}
+        for method, answers in cases.items():
+            for code, error in answers:
+                with self.subTest(method=method, code=code):
+                    self.assertIs(mcp_tools.is_error(method, {"code": code}), error)
+
+    def test_every_other_method_keeps_the_api_success_codes(self) -> None:
+        for method in ("run.start", "run.status", "run.list", "session.turn", "approval.answer"):
+            for code in ("started", "ok", "stopped"):
+                self.assertIs(mcp_tools.is_error(method, {"code": code}), False, (method, code))
+            for code in ("pending", "ended", "run_unknown", None):
+                self.assertIs(mcp_tools.is_error(method, {"code": code}), True, (method, code))
+        for answer in (None, [], "pending", {"detail": "no code"}):
+            for method in ("run.stop", "run.status", "session.interrupt"):
+                self.assertIs(mcp_tools.is_error(method, answer), True, (method, repr(answer)))
+
+    def test_the_mapping_names_only_codes_the_published_table_gives_each_method(self) -> None:
+        # Skipped where the published table is not in the tree (it arrives with SPINE's #368).
+        path = os.path.join(os.path.dirname(mcp_tools.__file__), *[os.pardir] * 3, "schemas", "control", "v1",
+                            "methods.table.v1.json")
+        if not os.path.exists(path):
+            self.skipTest("schemas/control/v1/methods.table.v1.json is not in this checkout yet")
+        with open(path, encoding="utf-8") as handle:
+            rows = {row["name"]: row for row in json.load(handle)["methods"]}
+        for method, codes in mcp_tools.NOT_ERRORS.items():
+            self.assertLessEqual(codes, set(rows[method]["codes"]), method)
+
+    # Round 1 of #430, Codex GPT-6 Astra and GPT-6.1 Sol. R1: a code that is not a string is an error, never a
+    # raise. R2: the refusals stay errors for every Stop and interrupt method, the lookup is exact, and is_error
+    # reads NOT_ERRORS, which call_tool reads through is_error. These run with or without the published table.
+
+    WRONG_TYPE_CODES = ([], {}, ["pending"], {"code": "pending"}, 1, 1.5, True, None)
+    MAPPED = ("run.stop", "session.stop", "session.interrupt")
+
+    def test_a_code_that_is_not_a_string_is_an_error(self) -> None:
+        for method in (*self.MAPPED, "run.status", "run.unknown"):
+            for code in self.WRONG_TYPE_CODES:
+                with self.subTest(method=method, code=repr(code)):
+                    self.assertIs(mcp_tools.is_error(method, {"code": code}), True)
+
+    def test_the_stop_tool_keeps_a_wrong_type_code_as_an_error_answer(self) -> None:
+        for code in self.WRONG_TYPE_CODES:
+            with self.subTest(code=repr(code)):
+                api = self.Answering(code)
+                res = mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": "r1"})
+                self.assertIs(res["isError"], True)
+                self.assertEqual(res["structuredContent"], {"code": code, "run_id": "r1"})
+                self.assertEqual(json.loads(res["content"][0]["text"]), {"code": code, "run_id": "r1"})
+
+    def test_the_refusals_stay_errors_for_every_stop_and_interrupt_method(self) -> None:
+        refusals = ("scope_refused", "request_invalid", "unavailable", "run_unknown", "registry_unavailable",
+                    "session_unknown", "method_unknown", "conflict", "unsupported", "credentials_unavailable")
+        for method in self.MAPPED:
+            for code in refusals:
+                with self.subTest(method=method, code=code):
+                    self.assertIs(mcp_tools.is_error(method, {"code": code}), True)
+        for code in ("ok", "started"):   # run.stop answers stopped, pending or ended, never these
+            self.assertIs(mcp_tools.is_error("run.stop", {"code": code}), True, code)
+
+    def test_the_method_is_looked_up_exactly(self) -> None:
+        for method in ("RUN.STOP", "Run.Stop", " run.stop", "run.stop ", "run.stop\n", "Session.Stop",
+                       "session.interrupt ", "run_stop", "run.stop.x", "", "run.unknown"):
+            with self.subTest(method=repr(method)):
+                self.assertIs(mcp_tools.is_error(method, {"code": "pending"}), True)
+                self.assertIs(mcp_tools.is_error(method, {"code": "ended"}), True)
+                self.assertIs(mcp_tools.is_error(method, {"code": "ok"}), False)
+
+    # Round 1 of #430, DeepSeek V4.1 Flash. F6: the exact-type check on the code is what keeps a str subclass,
+    # whose own hash may raise, out of the lookup (isinstance in its place stays green without this test). F1 and
+    # F2: a method that is not exactly a str (a subclass equal to another method, an unhashable value) is an error
+    # before the lookup, never another method's set and never a raise.
+
+    class PlainStr(str):
+        pass
+
+    class HashRaises(str):
+        def __hash__(self):
+            raise RuntimeError("synthetic: no hash")
+
+    class AlwaysEqual(str):
+        def __eq__(self, other):
+            return True
+
+        def __hash__(self):
+            return hash("run.stop")
+
+    def test_a_code_of_a_str_subclass_is_an_error(self) -> None:
+        for method in self.MAPPED:
+            for code in (self.PlainStr("pending"), self.HashRaises("pending")):
+                with self.subTest(method=method, code=type(code).__name__):
+                    self.assertIs(mcp_tools.is_error(method, {"code": code}), True)
+
+    def test_a_method_that_is_not_exactly_a_str_is_an_error(self) -> None:
+        methods = (self.AlwaysEqual("run.status"), self.PlainStr("run.stop"), self.HashRaises("run.stop"),
+                   ["run.stop"], {"run.stop": 1}, ("run.stop",), None, 1, b"run.stop")
+        for method in methods:
+            for code in ("pending", "ended", "ok", "stopped", "started"):
+                with self.subTest(method=repr(method), code=code):
+                    self.assertIs(mcp_tools.is_error(method, {"code": code}), True)
+
+    def test_is_error_reads_the_one_mapping_and_call_tool_reads_is_error(self) -> None:
+        from unittest import mock
+        with mock.patch.dict(mcp_tools.NOT_ERRORS, {"run.stop": frozenset({"synthetic_answer"})}):
+            self.assertIs(mcp_tools.is_error("run.stop", {"code": "synthetic_answer"}), False)
+            self.assertIs(mcp_tools.is_error("run.stop", {"code": "pending"}), True)
+            res = mcp_tools.call_tool(self.Answering("synthetic_answer"), "recursion_run_stop", {"run_id": "r1"})
+            self.assertIs(res["isError"], False)
+        marker = object()
+        with mock.patch.object(mcp_tools, "is_error", return_value=marker) as seen:
+            res = mcp_tools.call_tool(self.Answering("pending"), "recursion_run_stop", {"run_id": "r1"})
+        self.assertIs(res["isError"], marker)
+        seen.assert_called_once_with("run.stop", {"code": "pending", "run_id": "r1"})
 
 
 class CodexSnippetTest(unittest.TestCase):

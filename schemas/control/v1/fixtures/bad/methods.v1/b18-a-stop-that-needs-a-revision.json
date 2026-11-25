@@ -1,0 +1,35 @@
+{
+  "name": "run.stop",
+  "scope": "run",
+  "mutating": true,
+  "idempotency": "none",
+  "precondition": "expected_revision",
+  "requires": [],
+  "falls_back": [],
+  "service": null,
+  "page_allowed": true,
+  "mcp": {
+    "exposed": true,
+    "tool": "recursion_run_stop",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  "beta": false,
+  "codes": [
+    "stopped",
+    "pending",
+    "ended",
+    "run_unknown",
+    "request_invalid",
+    "registry_unavailable",
+    "unavailable",
+    "scope_refused"
+  ],
+  "lane": "STOP",
+  "params": "#/$defs/params.run.stop",
+  "result": "#/$defs/answer.run.stop"
+}

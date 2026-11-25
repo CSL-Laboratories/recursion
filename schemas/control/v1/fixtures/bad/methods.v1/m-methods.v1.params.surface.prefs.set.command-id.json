@@ -1,0 +1,8 @@
+{
+  "method": "surface.prefs.set",
+  "params": {
+    "surface": "page",
+    "theme": "dusk",
+    "expected_revision": 3
+  }
+}

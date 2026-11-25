@@ -69,8 +69,9 @@ What is proven, and what is not:
 - The whole-suite run: the whole test suite can also be run once with the hook in every Python
   process it starts: `python3 tools/network_audit.py`. On a clean checkout today it prints NOT
   PROVEN, and says why: the product's own tests start Python children with `-I` or with a cleared
-  environment, which the hook cannot reach (in one run of 2653 passing tests on CPython 3.12, 174
-  of 402 Python starts did not load the hook). So the whole-suite run is not a proof today; it
+  environment, which the hook cannot reach (in one run of 2653 passing tests, 176 of 404 Python
+  starts did not load the hook on CPython 3.12, and 143 of 377 on the free-threaded 3.14t). So the
+  whole-suite run is not a proof today; it
   names what it could not watch. It names a program that is not Python and refuses one that is not
   listed in `tools/network_audit.toml`. A program started through another program (`env`,
   `unshare`) is judged by the program it starts (a split-string option of `env`, also inside a group

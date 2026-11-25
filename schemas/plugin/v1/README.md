@@ -45,11 +45,14 @@ Install file:
 
 To bind a hand-made grant, set `developer_key_id` in its `install.json` grant entry.
 A manual grant with no developer key binding is refused before plugin code runs if the
-manifest requests permissions. A plugin that asks for no permissions can still load.
+manifest requests permissions, whether the manifest is signed or not. A plugin that asks for no
+permissions can still load. `order_after_revoked_key` is null or a developer key ID, the same shape
+as `developer_key_id`; any other value is refused.
 
-For a signed version 1 load, every listed path must name a file in the package. The loader
-checks file presence and the entry digest. The other file digests are reserved for a future
-content check.
+For a signed version 1 load, every listed path must name a file in the package. The package
+folder itself and every folder on a listed path must be a real folder: no symbolic link is
+followed. The loader checks file presence and the entry digest. The other file digests are
+reserved for a future content check.
 
 ## What is not decided
 

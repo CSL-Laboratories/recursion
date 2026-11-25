@@ -33,14 +33,17 @@ The route breaker is ``breaker.DurableRouteBreaker``: trips, run bindings and fa
 the plugin-security breaker store under the daemon's state directory and survive a restart.
 
 The socket binds the caller's principal from the peer credentials and asks the authorizer
-before the method runs. The peer whose uid is the daemon's is the owner and keeps every
-scope. A named peer with any other uid holds nothing (no device credential). Credentials
-that cannot be read, and a uid that names no process, are refused and are not the owner.
+before the method runs. The peer whose uid is the daemon's, and whose frame carries no
+device token, is the owner and keeps every scope. That includes a same-uid copy of an old
+relay: peer credentials cannot tell it from the owner. A frame that carries a device token
+is that device, whichever uid presented it, and holds the grant the token names. A token
+that does not verify is refused and is not the owner. Credentials that cannot be read, and
+a uid that names no process, are refused and are not the owner.
 
 Not here: custody (an API-key route has no credential source and refuses; a route that brings
 its own credential, ``key_source: api_key_helper`` or ``passthrough``, is refused before launch,
 see ``route_unsupported``), the O7 interventions, bar evidence for any route (every route reads
-BETA), a device credential, and the Control MCP transport.
+BETA), a phone page, a device approval or a step-up, and the Control MCP transport.
 """
 from __future__ import annotations
 
@@ -60,6 +63,8 @@ import uuid
 
 from recursion_core.control.api import ControlAPI
 from recursion_core.control.client import socket_directory
+from recursion_core.control.credentials import CredentialRefused, CredentialStore, CredentialStoreError
+from recursion_core.control.device_pairing import DevicePairings, PairingRefused
 from recursion_core.control.hooks import Hooks, Principal
 from recursion_core.control.registry import InMemoryRunRegistry, StaleGeneration
 from recursion_core.control.scopes import register as register_scopes
@@ -91,9 +96,13 @@ NO_BAR_EVIDENCE = 'no bar evidence is recorded by the daemon'
 def _scope_hooks():
     """The authorizer in seam S5, and nothing else. The credential service stays unregistered."""
     hooks = Hooks()
-    register_scopes(hooks)
+    authorizer = register_scopes(hooks)
     hooks.freeze()
-    return hooks
+    return hooks, authorizer
+
+
+# A control frame may carry these keys. ``assertion`` is accepted and ignored: it does not grant a scope.
+_ENVELOPE = frozenset({'op', 'method', 'params', 'id', 'auth', 'device_claim', 'assertion'})
 
 
 def _scope_refused(detail):
@@ -828,7 +837,7 @@ class DaemonControl:
     """``call(method, params) -> dict`` for the socket, the CLI and the GUI."""
 
     def __init__(self, api, registry, daemon, starter, state_dir, *, routes=None, plugins=None, breaker=None,
-                 breaker_store='not composed', list_reply_bytes=LIST_REPLY_BYTES):
+                 breaker_store='not composed', list_reply_bytes=LIST_REPLY_BYTES, wall=None):
         self.api, self.registry, self.daemon, self.starter = api, registry, daemon, starter
         self._list_reply_bytes = list_reply_bytes
         self._state = Path(state_dir)
@@ -837,9 +846,12 @@ class DaemonControl:
         self._stop_retry = {}  # run_id -> (not before, wait) for a Stop reconcile() could not get sent
         self._starts_lock = threading.Lock()
         self._starts_in_flight = 0  # run.start calls of this process that have not answered yet
-        # The uid of the process that built this door. A peer with that uid is the owner.
+        # The uid of the process that built this door. A peer with that uid and no device token is the owner.
         self._owner_uid = os.geteuid() if hasattr(os, 'geteuid') else None
-        self._hooks = _scope_hooks()
+        self._wall = time.time if wall is None else wall
+        self._hooks, self._authorizer = _scope_hooks()
+        self._pairing = None
+        self._open_device_store()
 
     # -- calls ---------------------------------------------------------------------------------
     def call(self, method, params=None):
@@ -854,6 +866,10 @@ class DaemonControl:
             if self.plugins is None:
                 return {'code': 'unavailable', 'detail': 'no plugin host is composed'}
             return {'code': 'ok', **self.plugins.inventory()}
+        if method == 'device.pair':
+            return self._pair_device(params)
+        if method == 'device.revoke':
+            return self._revoke_device(params)
         if method != 'run.start':
             answer = self.api.call(method, dict(params or {}))
         else:
@@ -1102,26 +1118,41 @@ class DaemonControl:
     def handle(self, message, conn):
         """``{"op": "control", "method", "params"}`` -> ``{"ok": true, "result": <control answer>}``.
 
-        The principal is taken from the peer credentials, never from the request. The authorizer
-        is asked for every method, and a refusal is returned before the method runs.
+        The principal is taken from the peer credentials, or from a device token on the frame, never
+        from the request. The authorizer is asked for every method, and a refusal is returned before
+        the method runs. A frame with no token, from the owner's uid, is the owner. A bad read is
+        never the owner.
         """
+        if not isinstance(message, dict):
+            return {'ok': False, 'error': {'code': 'request_invalid'}}
         if message.get('op') != 'control':
             return {'ok': False, 'error': {'code': 'unknown_op', 'op': message.get('op')}}
+        if not set(message) <= _ENVELOPE:
+            return {'ok': False, 'error': {'code': 'request_invalid', 'detail': 'envelope_field'}}
         method, params = message.get('method'), message.get('params')
         if not isinstance(method, str) or not isinstance(params, (dict, type(None))):
             return {'ok': False, 'error': {'code': 'request_invalid'}}
-        principal, refused = self._principal_from_peer(conn)
+        if 'auth' in message:
+            principal, refused = self._principal_from_token(message, conn)
+        else:
+            principal, refused = self._principal_from_peer(conn)
         if refused is not None:
             return refused
         verdict = self._hooks.authorize(principal, method, {} if params is None else params)
         if verdict is not None:
             return {'ok': False, 'error': {'code': verdict['code'], 'detail': verdict.get('detail', '')}}
+        if principal.kind == 'device' and principal.grant and self._pairing is not None:
+            self._pairing.note_accepted(principal.id)
         # The transport echoes the request's "id" in the reply frame; a run.list page leaves room for it.
         reserved = _wire_size(message['id']) + len(',"id":') if 'id' in message else 0
         return {'ok': True, 'result': self._answer(method, params, reserved)}
 
     def _principal_from_peer(self, conn):
-        """``(principal, None)`` or ``(None, refusal)``. A bad read is never the owner."""
+        """``(principal, None)`` or ``(None, refusal)``. A bad read is never the owner.
+
+        No ``auth`` key: the owner's uid is the owner, including a same-uid copy of an old relay.
+        Any other uid holds nothing.
+        """
         try:
             peer = conn.peer
             uid, pid = peer.uid, peer.pid
@@ -1136,6 +1167,81 @@ class DaemonControl:
                 return Principal('device', None, in_run_unit=peer_is_engine(pid)), None
             return None, _scope_refused('unknown_principal')
         return Principal('owner', 'local', in_run_unit=peer_is_engine(pid)), None
+
+    def _principal_from_token(self, message, conn):
+        """A frame that carries ``auth`` is a device credential, even when the uid is the owner's.
+
+        A token that does not verify is refused. It is not the owner. ``device_claim`` must name
+        the device the token was minted for. ``assertion`` is not read.
+        """
+        try:
+            peer = conn.peer
+            uid, pid = peer.uid, peer.pid
+        except Exception:  # noqa: BLE001 - unreadable credentials refuse the call
+            return None, _scope_refused('peer_credentials_unreadable')
+        if type(uid) is not int:
+            return None, _scope_refused('peer_credentials_unreadable')
+        if type(pid) is not int or pid <= 0:
+            return None, _scope_refused('unknown_principal')
+        if self._pairing is None:
+            return None, {'ok': False, 'error': {'code': 'store_unavailable', 'detail': 'store_unavailable'}}
+        try:
+            credential = self._pairing.credential_for(message.get('auth'), message.get('device_claim'), pid)
+        except CredentialRefused as exc:
+            return None, {'ok': False, 'error': {'code': exc.detail, 'detail': exc.detail}}
+        except PairingRefused as exc:
+            return None, {'ok': False, 'error': {'code': exc.code, 'detail': exc.detail or exc.code}}
+        except CredentialStoreError:
+            log.exception('device credential check failed')
+            return None, {'ok': False, 'error': {'code': 'store_unavailable', 'detail': 'store_unavailable'}}
+        return Principal('device', credential.id, in_run_unit=peer_is_engine(pid),
+                         grant=credential.token_id), None
+
+    def _open_device_store(self):
+        """Attach the credential store. A store that cannot be opened leaves pairing unset.
+
+        The owner, with no token, still works. A frame that carries ``auth``, and ``device.pair``,
+        refuse ``store_unavailable``. ``ScopesService`` is not registered.
+        """
+        path = os.path.join(os.path.abspath(self._state), 'control', 'credentials.json')
+        try:
+            store = CredentialStore(path, wall=self._wall)
+        except (CredentialStoreError, OSError) as exc:
+            log.error('no device credential is honoured (%s)', type(exc).__name__)
+            return
+        try:
+            self._pairing = DevicePairings(os.path.join(os.path.dirname(path), 'device-use.json'), store,
+                                           wall=self._wall)
+        except (PairingRefused, OSError):
+            log.error('no device credential is honoured (%s)', 'DevicePairings')
+            return
+        reader = self.registry.get if callable(getattr(self.registry, 'get', None)) else None
+        self._authorizer.attach(credentials=store, run_record=reader)
+
+    def _pair_device(self, params):
+        return self._device_result('pair', params)
+
+    def _revoke_device(self, params):
+        return self._device_result('revoke', params)
+
+    def _device_result(self, action, params):
+        if self._pairing is None:
+            return {'code': 'store_unavailable', 'detail': 'store_unavailable'}
+        params = params if isinstance(params, dict) else {}
+        try:
+            if action == 'pair':
+                body = self._pairing.pair(params.get('label'), params.get('scopes'), params.get('expires_at'))
+            else:
+                self._pairing.revoke(params.get('device_id'))
+                body = {}
+        except PairingRefused as exc:
+            return {'code': exc.code, 'detail': exc.detail or exc.code}
+        except CredentialRefused as exc:
+            return {'code': exc.detail, 'detail': exc.detail}
+        except CredentialStoreError:
+            log.exception('device %s could not use the credential store', action)
+            return {'code': 'store_unavailable', 'detail': 'store_unavailable'}
+        return {'code': 'ok', **body}
 
     # -- GUI -----------------------------------------------------------------------------------
     def gui_transport(self, method, path, body):
@@ -1283,7 +1389,7 @@ class Composition:
 
 
 def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.monotonic,
-                    confirm_timeout_s=5.0, plugin_dirs=(), plugin_options=None):
+                    confirm_timeout_s=5.0, plugin_dirs=(), plugin_options=None, wall=None):
     """Build the control API over ``daemon`` and serve it on the owner-only socket.
 
     ``daemon.manager`` must be an ``EngineUnitManager``. ``routes`` overrides the operator's
@@ -1344,7 +1450,7 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s)
     control = DaemonControl(api, registry, daemon, starter, state_dir, routes=routes, plugins=plugins,
                             breaker=breaker, breaker_store='durable' if breaker is not None
-                            else f'unavailable: {breaker_unavailable}')
+                            else f'unavailable: {breaker_unavailable}', wall=wall)
     directory = socket_directory(environ)
     door = DeviceDoor(directory, publish=False)
     server = UnixControlServer(directory, with_ping_health(control.handle), admit=admit_peer,

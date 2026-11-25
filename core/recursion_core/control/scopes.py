@@ -7,13 +7,11 @@ It holds no credentials and reads no run record, so only owner, internal and the
 hold scopes: the stricter state, and today's callers (the owner-only socket, in-process calls made for
 the owner, the page) keep every answer they have.
 
-``ScopesService`` (seam S13, ``control.scopes``) is built and tested here but NOT registered: once
-started it hands the authorizer the credential store (``<state_dir>/control/credentials.json``) and the
-control registry's run records, which any principal backed by a grant needs: a plugin, a session, a
-paired device other than the page, an agent. No entry point makes such a principal yet, and registering
-a service turns the composition's admission gate on for every daemon, so it is registered by the change
-that brings the first such principal (``questions.md``). A store that cannot be used (malformed
-included) is logged and leaves token principals holding nothing; it never stops the daemon.
+``ScopesService`` (seam S13, ``control.scopes``) is built and tested here but NOT registered: registering
+a service turns the composition's admission gate on for every daemon. The running daemon attaches the
+credential store to the authorizer itself when the store opens, and a socket frame that carries a device
+token is that device. A store that cannot be used (malformed included) is logged and leaves token
+principals holding nothing; it never stops the daemon. The owner, with no token, is unchanged.
 
 S5's contract (``control/hooks.py``, SPINE): ``authorize(principal, method, params)`` is called for every
 client call, before the method runs, and answers None (go on), a refusal code, or ``(code, detail)``. A
@@ -25,7 +23,7 @@ recovery Stop never passes here.
 1. A principal whose ``in_run_unit`` is not exactly False is refused ``scope_refused`` (today's predicate:
    true inside a run's unit, and when the peer's cgroup cannot be read).
 2. The scopes the principal holds NOW:
-   - ``owner`` and ``internal`` hold all four;
+   - ``owner`` and ``internal`` hold every scope;
    - the page's own device principal (``device`` with id ``page``, which no grant may name) holds
      ``PAGE_SCOPES``;
    - a principal made from a verified token carries that grant's id as ``grant`` (set by the server from
@@ -47,20 +45,23 @@ recovery Stop never passes here.
    - a principal that names a grant and claims ``owner`` or ``internal`` holds nothing: those kinds come
      from how a request arrives, never from a token.
    Every set is cut to the kind's ceiling (``credentials.CEILING``), so a plugin, session or agent never
-   holds ``approve`` and no device ever holds ``manage``, whatever a grant says. SPINE's ``Principal`` has
-   no ``grant`` field yet (``questions.md``); until it has, token principals hold nothing.
+   holds ``approve`` or ``stop`` and no device ever holds ``manage``, whatever a grant says.
+   ``Principal.grant`` defaults to None, which is an absent grant: a device, session or agent that names
+   no grant holds nothing.
 3. ``scope_of(method)`` reads the method's scope from the method table on every call. A name the table
    does not have runs nothing (the API answers ``method_unknown``); it passes only for a principal holding
-   all four scopes, so their answer is today's, and is refused to everyone else.
+   every scope, so their answer is today's, and is refused to everyone else.
 4. A principal without that scope is refused ``scope_refused``, detail ``needs_<scope>``. ``route.list``,
    ``plugin.list`` and ``operator.read`` are ``read`` rows like any other.
-5. ``run.stop``, exactly as the method table's row (4) "Who may Stop" freezes it (PROVISIONAL, the owner's
-   decision): it needs a currently held ``run`` scope; an owner or a device with ``run`` may stop any run,
-   one whose record names no principal included; a session principal only runs of its own session and the
-   sessions it started; a plugin principal only a run whose record's ``launch.owner`` is that plugin, never
-   a host-owned run, another plugin's, or one with no owner recorded. The row names no other kind, so an
-   internal or agent principal is refused (``questions.md``). A target that cannot be read is refused to a
-   session or plugin principal, which may stop only runs it can be shown to own.
+5. ``run.stop`` passes, before that check, when the principal holds ``run`` or ``stop``. Without either,
+   the refusal is the table scope's ``needs_<scope>``; the real row's scope is ``run``, so that refusal
+   is ``needs_run``. The rest of the Stop row is unchanged: an owner or a device may stop any run, one whose
+   record names no principal included; a session principal only runs of its own session and the sessions
+   it started; a plugin principal only a run whose record's ``launch.owner`` is that plugin, never a
+   host-owned run, another plugin's, or one with no owner recorded. The row names no other kind, so an
+   internal or agent principal is refused. A target that cannot be read is refused to a session or plugin
+   principal, which may stop only runs it can be shown to own. The method table's scope column for
+   ``run.stop`` stays ``run``. ``stop`` is not a column of that frozen schema.
 
 Every refusal the authorizer makes is ``("scope_refused", detail)``; ``scope_refused`` is the method table's
 code for it, and S5 (``control/hooks.py`` ``Hooks.authorize``) turns the pair into ``{"code", "detail"}``. A
@@ -99,13 +100,16 @@ def table_scope(method: str) -> str | None:
     return row.scope if row is not None else None
 
 
-def register(hooks) -> None:
+def register(hooks) -> Authorizer:
     """The registrant entry ``control/hooks.py`` calls once at composition: the authorizer into S5.
 
-    ``ScopesService`` is not registered yet (see the module text): ``hooks.service(ScopesService(a))``
-    is the one line that does it, for the change that brings the first plugin or session principal."""
+    Returns the authorizer so the daemon can attach the credential store without registering
+    ``ScopesService``. Registering that service would turn the admission gate on for every daemon.
+    ``hooks.service(ScopesService(a))`` is the one line that does it, and this does not call it."""
 
-    hooks.set("authorize", Authorizer(scope_of=table_scope))
+    authorizer = Authorizer(scope_of=table_scope)
+    hooks.set("authorize", authorizer)
+    return authorizer
 
 
 class ScopesService:
@@ -349,18 +353,20 @@ class Authorizer:
             return None if held >= ALL_SCOPES else (SCOPE_REFUSED, "method_not_in_table")
         if type(scope) is not str or scope not in ALL_SCOPES:   # exactly a str (round 5 of #385, DeepSeek F3)
             return (SCOPE_REFUSED, "scope_unknown")   # a table row naming no known scope opens nothing
+        # A held run or stop enters the Stop row before the generic check, so a stop-only device
+        # passes run.stop even though the table column stays run. A holder of neither is refused
+        # for the table scope (needs_run on the real row).
+        if type(method) is str and method == STOP_METHOD and ("run" in held or "stop" in held):
+            return self._stop(kind, pid, params)
         if scope not in held:
             return (SCOPE_REFUSED, f"needs_{scope}")
-        if method == STOP_METHOD:
-            if "run" not in held:
-                # The Stop row's own rule, whatever the table's scope column says for run.stop.
-                return (SCOPE_REFUSED, "needs_run")
-            return self._stop(kind, pid, params)
+        if type(method) is str and method == STOP_METHOD:
+            return (SCOPE_REFUSED, "needs_run")
         return None
 
     def _stop(self, kind: str | None, pid: str | None, params) -> Verdict:
         if kind in ("owner", "device"):
-            return None    # with run: any run, including one whose record names no principal
+            return None    # with run or stop: any run, including one whose record names no principal
         if kind not in ("session", "plugin"):
             return (SCOPE_REFUSED, "stop_not_granted_to_kind")
         # Each read of params, record and launch is guarded (round 5, DeepSeek F1), and the run named is exactly

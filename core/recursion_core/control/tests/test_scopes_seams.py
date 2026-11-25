@@ -805,8 +805,8 @@ class RoundSevenSeamsTest(unittest.TestCase):
 
 @NEEDS_POSIX
 class BearerWithoutGrantTest(unittest.TestCase):
-    """Until SPINE's Principal carries ``grant``, a device, session or agent principal holds nothing, live grants
-    or not; a host-attributed plugin holds its identity's grants."""
+    """A device or session principal that names no grant holds nothing, live grants or not. ``Principal.grant``
+    defaults to None, which is an absent grant. A host-attributed plugin holds its identity's grants."""
 
     def test_a_real_principal_of_a_bearer_kind_holds_nothing(self) -> None:
         base = tempfile.mkdtemp(prefix="scopes-bearer-")

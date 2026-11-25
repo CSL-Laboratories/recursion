@@ -439,10 +439,11 @@ class HostUnitsInTheUserManagerTest(unittest.TestCase):
         self.assertEqual(caught.exception.reason, 'ended')
         self.assertLess(time.monotonic() - began, 10)
         self.assertEqual(units.degraded, {'hostile': 1})
+        self.assertIsNone(units.unit_of('hostile'))  # the call failed at once: the new host starts with the next call
+        self.assertEqual(units.call('hostile', 'operator', {'command': 'ok'})['value'], 'ok')
         second = units.unit_of('hostile')
         self.assertIsNotNone(second)
         self.assertNotEqual(second.unit, first.unit)
-        self.assertEqual(units.call('hostile', 'operator', {'command': 'ok'})['value'], 'ok')
         self.assertEqual(units.degraded, {})
 
     def test_stop_ends_a_host_that_loops_and_swallows_system_exit_and_the_other_host_keeps_answering(self):
@@ -509,11 +510,12 @@ class HostUnitsInTheUserManagerTest(unittest.TestCase):
         self.assertLess(took, 12.0)
         self.assertTrue(gone(first.group), first.group)
         self.assertEqual(units.degraded, {'hostile': 1})
+        self.assertIsNone(units.unit_of('hostile'))  # the call failed at once: the new host starts with the next call
+        self.assertEqual(units.call('hostile', 'operator', {'command': 'ok'})['value'], 'ok')
         second = units.unit_of('hostile')
         self.assertIsNotNone(second)
         self.assertNotEqual(second.unit, first.unit)
         self.assertFalse(gone(second.group, timeout_s=0.1))
-        self.assertEqual(units.call('hostile', 'operator', {'command': 'ok'})['value'], 'ok')
         self.assertEqual(units.degraded, {})
 
     def test_the_daemons_close_ends_every_host_and_waits_on_none(self):

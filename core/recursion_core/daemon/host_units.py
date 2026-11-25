@@ -1,8 +1,10 @@
 """Plugin hosts as run units on Linux: one host per plugin, ended by the system's kill.
 
-Each plugin host (``python -X gil=0 -I -m recursion_core.plugin_host``) is one transient unit in the operator's user
-manager, started by ``EngineUnitManager.start_piped``: the launcher's own unit path (``KillMode=control-group``,
-``Delegate=yes``, the #916 ``STOP_PROPERTIES``, the argv passed verbatim) with ``--pipe``.
+Each plugin host (``python -I -c START_CODE <core folder>``, the code of ``recursion_core.plugin_host``) is one transient
+unit in the operator's user manager, started by ``EngineUnitManager.start_piped``: the launcher's own unit path
+(``KillMode=control-group``, ``Delegate=yes``, the #916 ``STOP_PROPERTIES``, the argv passed verbatim) with ``--pipe``.
+The host reads no variable of its environment, so the folder that holds Recursion's own code is handed to it as an
+argument: by default the folder this daemon's own code was imported from.
 
 * The channel is ONE socket pair (``AF_UNIX``, ``SOCK_STREAM``). One end is the unit's standard input AND standard
   output, and the daemon closes its own copy of that end as soon as systemd-run holds it. systemd-run stays running
@@ -14,9 +16,10 @@ manager, started by ``EngineUnitManager.start_piped``: the launcher's own unit p
   way as any other.
 * Nothing watches a host between calls. A host that has ended by itself is found by the next call into it, and that
   call fails with ``ended``; a host that has not answered a call by its deadline is ended, and that call fails with
-  ``timed_out``. Either way its plugin is marked degraded and a new unit is started for it then, with the same
-  package. The mark goes when the plugin answers a call again, as the in-process operator deadline in
-  ``plugins.py`` does for a plugin in the daemon's process.
+  ``timed_out``. Either way the call fails at once, within its own deadline, its plugin is marked degraded, and a
+  new unit is started for it with the plugin's next call, inside that call's deadline, with the package of its last
+  start. The mark goes when the plugin answers a call again, as the in-process operator deadline in ``plugins.py``
+  does for a plugin in the daemon's process.
 * A second ``start`` of a plugin ends its running host before the new one starts.
 * ``stop`` and ``close`` (the daemon's own Stop) end every host the same way and wait on none, a host that is still
   starting included: its start ends with ``stopped``.
@@ -41,10 +44,10 @@ import threading
 import time
 
 from recursion_core.control_transport.framing import HEADER
-from recursion_core.plugin_host import DEFAULT_GIL_CHECK
+from recursion_core.plugin_host import DEFAULT_GIL_CHECK, START_CODE, START_REFUSED
 from recursion_core.plugin_security import host_channel as hc
 
-from .launcher import _unit_path_ok, private_dir, require_launcher_platform
+from .launcher import _unit_path_ok, check_piped_properties, private_dir, require_launcher_platform
 from .plugins import OPERATOR_DEADLINE_S
 
 log = logging.getLogger(__name__)
@@ -61,12 +64,20 @@ CALL_DEADLINE_S = OPERATOR_DEADLINE_S
 START_DEADLINE_S = 10.0
 
 # The longest single wait the platform takes (Python's own figure, not a setting): a longer deadline is waited in
-# slices of it.
+# slices of it. poll takes at most a C int of milliseconds (the platform's own figure, not a setting).
 _LONGEST_WAIT_S = threading.TIMEOUT_MAX
+_LONGEST_POLL_S = (2 ** 31 - 1) / 1000
 
 HOST_UNIT = re.compile(r'recursion-host-[0-9a-f]{16}\.service')
-HOST_ARGV = ('-X', 'gil=0', '-I', '-m', 'recursion_core.plugin_host')
+# The interpreter and this argv start every host, and the core folder comes last. No switch forces the interpreter's
+# lock off: a free-threaded build starts with it off, and only without such a switch does an extension that is not
+# marked safe without the lock turn it on where the host's own check sees it (plugin_security/runtime.py).
+HOST_ARGV = ('-I', '-c', START_CODE)
+# The folder that holds the recursion_core this daemon runs: the one a host is handed unless another is given.
+CORE_FOLDER = str(Path(__file__).resolve().parents[2])
 STOPPED, ENDED, TIMED_OUT, NOT_STARTED = 'stopped', 'ended', 'timed_out', 'not_started'
+# What a person reads when a call got no answer from its host, by the reason.
+_NO_ANSWER = {TIMED_OUT: 'did not answer the call by its deadline', ENDED: 'ended during the call'}
 
 
 def _deadline(name, value):
@@ -83,15 +94,36 @@ def _deadline(name, value):
         return math.inf  # more seconds than a float holds: waited in slices, so no clock ever reaches it
 
 
+def _core_folder(value):
+    """The folder a host is handed for Recursion's own code: an absolute path of a folder, as a string."""
+    folder = os.fspath(value) if isinstance(value, (str, os.PathLike)) else None
+    if not isinstance(folder, str) or not os.path.isabs(folder) or not os.path.isdir(folder):
+        raise ValueError(f'core_folder = {reprlib.repr(value)} is not a folder a plugin host can be given: write the '
+                         'absolute path of the folder that holds recursion_core')
+    return folder
+
+
+def host_argv(python, core_folder):
+    """The argv of one host: the interpreter, HOST_ARGV and the folder of Recursion's own code."""
+    return [python, *HOST_ARGV, core_folder]
+
+
 def _ready(sock, writing, deadline):
-    """True once ``sock`` can be written (or read); False once ``deadline`` has passed first."""
-    while True:
-        left = deadline - time.monotonic()
-        if left <= 0:
-            return False
-        wait = min(left, _LONGEST_WAIT_S)
-        if (select.select([], [sock], [], wait)[1] if writing else select.select([sock], [], [], wait)[0]):
-            return True
+    """True once ``sock`` can be written (or read); False once ``deadline`` has passed first.
+
+    By poll, which takes a descriptor of any number. An error of the wait itself is an OSError, which every caller
+    takes as the end of that host."""
+    try:
+        poller = select.poll()
+        poller.register(sock, select.POLLOUT if writing else select.POLLIN)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            if poller.poll(math.ceil(min(left, _LONGEST_WAIT_S, _LONGEST_POLL_S) * 1000)):
+                return True
+    except (ValueError, OverflowError, TypeError) as exc:
+        raise OSError(f'the wait on the host channel failed: {exc}') from None
 
 
 class HostUnavailable(Exception):
@@ -154,6 +186,30 @@ class HostUnit:
                 return None
             self._buffer += chunk
 
+    def start_refusal(self):
+        """The host's refusal to start (``host_start_refused``) when it has sent one already, else None.
+
+        Waits on nothing and keeps every frame it read for ``receive``."""
+        try:
+            while chunk := self._sock.recv(1 << 16, socket.MSG_DONTWAIT):
+                self._buffer += chunk
+        except OSError:
+            pass
+        view = self._buffer
+        while len(view) >= HEADER.size:
+            (length,) = HEADER.unpack_from(view)
+            if length > hc.frame_limit('host') or len(view) < HEADER.size + length:
+                return None
+            try:
+                message = hc.decode(view[HEADER.size:HEADER.size + length], sender='host')
+            except hc.ChannelRefusal:
+                return None
+            if (type(message) is dict and message.get('type') == 'refusal' and message.get('code') == START_REFUSED
+                    and type(message.get('detail')) is str):
+                return message
+            view = view[HEADER.size + length:]
+        return None
+
     def wake(self):
         """Wake a thread of the daemon's that waits on this channel: it reads the end of the channel at once."""
         try:
@@ -174,14 +230,15 @@ class PluginHostUnits:
     """The daemon's plugin hosts on Linux: ``start``, ``call``, ``stop`` and ``close``, one host per plugin."""
 
     def __init__(self, manager, state_dir, core, *, python=None, gil_check=DEFAULT_GIL_CHECK,
-                 call_deadline_s=CALL_DEADLINE_S, start_deadline_s=START_DEADLINE_S, properties=()):
+                 call_deadline_s=CALL_DEADLINE_S, start_deadline_s=START_DEADLINE_S, properties=(), core_folder=None):
         require_launcher_platform()
         self._manager, self._state, self._core = manager, Path(state_dir), core
         self._python = python or sys.executable
+        self._core_folder = _core_folder(CORE_FOLDER if core_folder is None else core_folder)
         self._gil_check = gil_check
         self._call_deadline_s = _deadline('call_deadline_s', call_deadline_s)
         self._start_deadline_s = _deadline('start_deadline_s', start_deadline_s)
-        self._properties = tuple(properties)
+        self._properties = check_piped_properties(properties)
         self._lock = threading.Lock()
         self._turns = {}       # plugin id -> lock: one call at a time on a host's channel
         self._packages = {}    # plugin id -> (manifest, files): what a restart loads again
@@ -200,16 +257,17 @@ class PluginHostUnits:
             if self._closed:
                 raise HostUnavailable(plugin_id, STOPPED, 'the daemon is closing')
             self._stopped.discard(plugin_id)
-            self._packages[plugin_id] = (bytes(manifest), dict(files))
             turn = self._turns.setdefault(plugin_id, threading.Lock())
+        package = (bytes(manifest), dict(files))
         with turn:
             with self._lock:
+                self._packages[plugin_id] = package  # under the turn: the last start's package is what a call loads again
                 old = self._units.pop(plugin_id, None)
             if old is not None:  # a second start: the running host ends first
                 old.stopped = True
                 self._end(old)
                 self._discard(old)  # this start holds the plugin's turn: nothing else reads that channel now
-            return self._start(plugin_id)
+            return self._start(plugin_id, package)
 
     def unit_of(self, plugin_id):
         """The running HostUnit of ``plugin_id``, or None."""
@@ -219,8 +277,9 @@ class PluginHostUnits:
     def call(self, plugin_id, name, args):
         """Call one function of the plugin in its host. Returns the host's ``result`` or ``refusal`` message.
 
-        No answer by the deadline, or the end of the host, ends the host, marks the plugin degraded and starts a new
-        host for it; the call raises HostUnavailable. A stopped host is not started again here.
+        No answer by the deadline, or the end of the host, ends the host and marks the plugin degraded, and the call
+        raises HostUnavailable at once. A plugin whose host has ended gets a new one with its next call, started
+        inside that call's deadline. A stopped host is not started again here.
         """
         with self._lock:
             turn = self._turns.setdefault(plugin_id, threading.Lock())
@@ -229,12 +288,13 @@ class PluginHostUnits:
                 host = self._units.get(plugin_id)
                 if self._closed or plugin_id in self._stopped:
                     raise HostUnavailable(plugin_id, STOPPED)
-                if plugin_id not in self._packages:
+                package = self._packages.get(plugin_id)
+                if package is None:
                     raise HostUnavailable(plugin_id, NOT_STARTED, 'no host was started for this plugin')
-            if host is None:
-                host = self._start(plugin_id)
-            id_ = next(self._ids)
             deadline = None if self._call_deadline_s is None else time.monotonic() + self._call_deadline_s
+            if host is None:
+                host = self._start(plugin_id, package, deadline)
+            id_ = next(self._ids)
             try:
                 answer = self._exchange(host, {'type': 'call', 'id': id_, 'name': name, 'args': dict(args)}, deadline)
             except _HostWentAway as gone:
@@ -244,9 +304,9 @@ class PluginHostUnits:
                 if reason != STOPPED:
                     with self._lock:
                         self.degraded[plugin_id] = self.degraded.get(plugin_id, 0) + 1
-                    log.error('plugin host %s of %s %s; marked degraded and started again', host.unit, plugin_id,
-                              reason)
-                    self._restart(plugin_id)
+                    log.error('plugin %s: its host %s %s and was ended. The call was not answered, so it may be sent '
+                              'again; a new host is started for the plugin with its next call', plugin_id, host.unit,
+                              _NO_ANSWER.get(reason, reason))
                 raise HostUnavailable(plugin_id, reason, gone.detail) from None
             with self._lock:
                 self.degraded.pop(plugin_id, None)
@@ -291,9 +351,12 @@ class PluginHostUnits:
                     self._ended.append(host)  # a call still holds it; that call closes it
 
     # -- inside ------------------------------------------------------------------------------
-    def _start(self, plugin_id):
-        """Start one host unit and load the package. The caller holds the plugin's turn."""
-        manifest, files = self._packages[plugin_id]
+    def _start(self, plugin_id, package, limit=None):
+        """Start one host unit and load ``package``. The caller holds the plugin's turn.
+
+        ``limit``: a deadline of the caller's (a call's own) that the start does not pass, whatever the start
+        deadline is."""
+        manifest, files = package
         end = hc.DaemonEnd(plugin_id, self._core)
         load = end.load(plugin_id, manifest, files)
         token = secrets.token_hex(8)
@@ -305,7 +368,7 @@ class PluginHostUnits:
             raise HostUnavailable(plugin_id, NOT_STARTED, 'state_path_not_unit_safe')
         ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            process = self._manager.start_piped(unit, [self._python, *HOST_ARGV], theirs,
+            process = self._manager.start_piped(unit, host_argv(self._python, self._core_folder), theirs,
                                                 properties=self._properties, working_directory=folder)
         except BaseException:
             ours.close()
@@ -319,10 +382,14 @@ class PluginHostUnits:
         if late:
             self._end_start(host)
         deadline = None if self._start_deadline_s is None else time.monotonic() + self._start_deadline_s
+        if limit is not None:
+            deadline = limit if deadline is None else min(deadline, limit)
         try:
             hello = host.receive(deadline)
             if type(hello) is not dict or hello.get('type') != 'hello' or hello.get('channel') != hc.CHANNEL:
                 raise HostUnavailable(plugin_id, NOT_STARTED, 'the host did not say hello')
+            if host.start_refusal() is not None:  # a hello that came with the host's refusal to start
+                raise HostUnavailable(plugin_id, NOT_STARTED, START_REFUSED)
             group, _ = self._manager.unit_identity(unit)
             if not group or Path(group).name != unit:
                 raise HostUnavailable(plugin_id, NOT_STARTED, 'the unit has no control group')
@@ -330,6 +397,7 @@ class PluginHostUnits:
             host.send({'type': 'hello', 'channel': hc.CHANNEL, 'gil_check': self._gil_check}, deadline)
             host.send_frame(load, deadline)
         except BaseException as exc:
+            refused = host.start_refusal() if isinstance(exc, (OSError, HostUnavailable)) else None
             with self._lock:
                 self._starting.pop(plugin_id, None)
             self._end(host)
@@ -337,6 +405,10 @@ class PluginHostUnits:
             if host.stopped and isinstance(exc, Exception):
                 raise HostUnavailable(plugin_id, STOPPED, 'the host was stopped while it was starting; start the '
                                       'plugin again to run it') from None
+            if refused is not None:
+                log.error('plugin %s: its host %s refused to start, and no plugin code ran: %s', plugin_id, unit,
+                          refused['detail'])
+                raise HostUnavailable(plugin_id, NOT_STARTED, refused['detail']) from None
             if isinstance(exc, (OSError, hc.ChannelRefusal)):
                 raise HostUnavailable(plugin_id, NOT_STARTED, type(exc).__name__) from None
             raise
@@ -349,16 +421,6 @@ class PluginHostUnits:
         self._end(host)
         self._discard(host)
         raise HostUnavailable(plugin_id, STOPPED)
-
-    def _restart(self, plugin_id):
-        with self._lock:
-            self._units.pop(plugin_id, None)
-            if self._closed or plugin_id in self._stopped:
-                return
-        try:
-            self._start(plugin_id)
-        except Exception:  # noqa: BLE001 - the next call starts it again
-            log.exception('plugin host of %s could not be started again', plugin_id)
 
     def _exchange(self, host, message, deadline):
         """Send one call and read until its answer, answering what the host asks of the core on the way."""

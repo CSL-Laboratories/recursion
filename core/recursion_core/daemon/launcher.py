@@ -187,6 +187,91 @@ def _unit_path_ok(path):
     return os.path.isabs(text) and all(ch in _PATH_SAFE for ch in text) and '..' not in Path(text).parts
 
 
+# A piped unit (a plugin host) takes from a caller ONLY the properties named here, each with its reason: an allow list,
+# a definition and not a setting. Every other name is refused before any unit is made, so a property nobody thought
+# of, a later systemd's new key among them, never reaches a host. What stays out, and why, one sentence each:
+# * restart rules (Restart=, RestartSec=, RestartSteps=, RestartMaxDelaySec=, RestartForceExitStatus=,
+#   RestartPreventExitStatus=): with one, the system starts the host again after Stop has killed it, and that new host
+#   is one the daemon neither knows nor holds a channel to;
+# * activation: a host unit's name is the daemon's own (recursion-host-...) and is never handed to a socket, path or
+#   timer unit, and no property that names such a unit (Sockets=, say) is taken, so nothing but the daemon's own start
+#   starts a host;
+# * dependencies (Wants=, Requires=, Requisite=, BindsTo=, PartOf=, Upholds=, OnFailure=, OnSuccess= and their kin):
+#   each lets the system start a unit because of another unit's state, the host's own or one tied to it, outside the
+#   daemon's Stop.
+# A name is the text before the first '=' of the property, compared exactly as systemd compares it: case kept and no
+# space taken away. So 'restart=always' or ' Restart=always' is not a name on the list, and is refused like any other.
+PIPED_UNIT_ALLOWED = (
+    ('MemoryMax', 'a hard bound on the memory of the host and everything it starts'),
+    ('MemoryHigh', 'a soft bound on that memory: above it the system slows the host down'),
+    ('MemorySwapMax', 'a bound on the swap the host may take'),
+    ('CPUQuota', 'a bound on the processor time the host may take'),
+    ('CPUWeight', "the host's share of the processor beside other units"),
+    ('TasksMax', 'a bound on the processes and threads of the host'),
+    ('RuntimeMaxSec', 'a bound on how long the host may run: past it the system stops the host, and Restart=no, '
+                      'written last, keeps it stopped, so a bound on its life never brings an ended host back'),
+    ('IOWeight', "the host's share of the disks beside other units"),
+)
+_PIPED_ALLOWED_NAMES = frozenset(name for name, _ in PIPED_UNIT_ALLOWED)
+# What a piped unit needs from systemd and a caller may never change: name, and why (said in the refusal of the name).
+_STOP_WHY = 'Stop ends a host by the kill of its whole control group, which the launcher sets up'
+PIPED_UNIT_OWN = {
+    'RemainAfterExit': 'with it the unit stays active after the host has ended and systemd-run keeps its copy of the '
+                       'channel open, so the daemon would never see the host end',
+    'KillMode': _STOP_WHY, 'Delegate': _STOP_WHY,
+    **{item.partition('=')[0]: _STOP_WHY for item in STOP_PROPERTIES},
+    'Type': 'the start waits for the host process itself to run, as the launcher sets it',
+    'StandardInput': "the channel is the unit's standard input and output",
+    'StandardOutput': "the channel is the unit's standard input and output",
+    'Restart': 'with any rule but no, the system starts the host again after Stop has killed it',
+}
+# The launcher's own properties, written again AFTER the caller's, so a property that slipped past the check still
+# loses: for each of these systemd keeps the last value it is given.
+PIPED_UNIT_LAST = ('KillMode=control-group', 'Delegate=yes', *STOP_PROPERTIES, 'RemainAfterExit=no', 'Restart=no')
+_PIPED_WHY = ('only the properties the launcher lists may be given to a plugin host, so that a host the daemon ends '
+              'stays ended and nothing else can start it again')
+
+
+class PipedUnitPropertyRefused(ValueError):
+    """A caller's property that a piped unit cannot carry. ``name``: the property's name, as the caller wrote it."""
+
+    def __init__(self, name, why=_PIPED_WHY):
+        step = f'Take {name} out of the properties given to the plugin hosts'
+        if name not in PIPED_UNIT_OWN:
+            step += f', or ask for {name} to be added to the launcher\'s list (PIPED_UNIT_ALLOWED)'
+        super().__init__(f'a plugin host unit cannot carry the property {name}: {why}. {step}')
+        self.name = name
+
+
+def check_piped_properties(properties):
+    """The caller's properties for a piped unit as a tuple. Each must be NAME=VALUE with NAME on PIPED_UNIT_ALLOWED,
+    compared exactly; any other is refused by its name, before any unit is made."""
+    items = tuple(properties)
+    for item in items:
+        if not isinstance(item, str):
+            raise PipedUnitPropertyRefused(repr(item)[:80], 'a property is a text NAME=VALUE')
+        name, equals, _ = item.partition('=')
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in item):
+            raise PipedUnitPropertyRefused(repr(name)[:80], 'a property holds no control character')
+        if name in PIPED_UNIT_OWN:
+            raise PipedUnitPropertyRefused(name, f'{PIPED_UNIT_OWN[name]}; {_PIPED_WHY}')
+        if not equals or name not in _PIPED_ALLOWED_NAMES:
+            raise PipedUnitPropertyRefused(name)
+    return items
+
+
+def unit_shows_ended(state):
+    """True when what systemd shows of a unit (``EngineUnitManager.unit_state``) says it has ended and will not start
+    again by itself: gone (not loaded, as ``--collect`` leaves it), or inactive or failed with no restart pending and
+    no job queued. Nothing read is never ended."""
+    if not state:
+        return False
+    if state.get('LoadState') == 'not-found':
+        return True
+    return (state.get('ActiveState') in ('inactive', 'failed') and state.get('SubState') != 'auto-restart'
+            and not str(state.get('Job', '')).strip())
+
+
 class EngineUnitManager(SystemdUserManager):
     """``SystemdUserManager`` whose run units carry the #916 Stop properties and file stdio."""
 
@@ -219,6 +304,81 @@ class EngineUnitManager(SystemdUserManager):
             command.append('--working-directory=' + str(cwd))
         self._call([*command, '--', *argv])
 
+    def start_piped(self, unit, argv, channel, *, properties=(), working_directory=None):
+        """Start ``unit`` with ``channel`` (one socket) as its standard input and output; return systemd-run's process.
+
+        The unit path ``start`` builds (``KillMode=control-group``, ``Delegate=yes``, ``STOP_PROPERTIES``, the argv
+        verbatim) with ``--pipe``: systemd-run hands the unit its own standard input and output and stays running
+        until the unit has ended, then exits. So such a unit carries no ``RemainAfterExit=yes``: with it the unit stays
+        active after its process ends, and systemd-run, with its copy of the channel, stays too. ``--collect`` unloads
+        the unit once it has ended, killed or not. ``_call`` is not used: it waits for systemd-run to return.
+        """
+        if not argv:
+            raise ValueError('Empty launch')
+        properties = check_piped_properties(properties)  # a name off the allow list is refused by name
+        self.require_verbatim_argv()
+        command = ['systemd-run', '--user', '--quiet', '--unit=' + unit, '--service-type=exec',
+                   '--expand-environment=no', '--pipe', '--collect',
+                   '--property=KillMode=control-group', '--property=Delegate=yes']
+        # The launcher's own come last too: a property that slipped past the check still loses (Restart=no wins).
+        command += ['--property=' + item for item in (*STOP_PROPERTIES, *properties, *PIPED_UNIT_LAST)]
+        if working_directory is not None:
+            command.append('--working-directory=' + str(working_directory))
+        return subprocess.Popen([*command, '--', *argv], stdin=channel, stdout=channel,
+                                stderr=subprocess.DEVNULL, close_fds=True)
+
+    def kill_cgroup(self, group, unit):
+        """SIGKILL every process in ``unit``'s cgroup ``group`` now. True when a kill was delivered.
+
+        ``cgroup.kill`` where the kernel has it, otherwise by pidfd to each pid still in the cgroup (the path a
+        recorded Stop already takes). Waits for nothing: the processes are gone once the kernel has delivered it.
+        """
+        if (not isinstance(group, str) or not group.startswith('/') or '..' in Path(group).parts
+                or Path(group).name != unit):
+            return False
+        return self._kill_recorded_cgroup(self.cgroup_root / group.lstrip('/'), group)
+
+    def unit_state(self, unit, timeout_s):
+        """What systemd shows of ``unit`` now (LoadState, ActiveState, SubState and Job, blank for none), read within
+        ``timeout_s``. A read that fails raises (OSError or SubprocessError): the caller takes it as nothing shown."""
+        text = subprocess.run(['systemctl', '--user', 'show', '--property=LoadState,ActiveState,SubState,Job', '--',
+                               unit], check=True, text=True, capture_output=True, timeout=timeout_s).stdout
+        return dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
+
+    def unit_states(self, units, timeout_s):
+        """What systemd shows of each unit of ``units`` now, in ONE read within ``timeout_s``: a dict by unit of what
+        ``unit_state`` reads of one (LoadState, ActiveState, SubState and Job) and its ControlGroup, blank for none. A
+        read that fails raises (OSError or SubprocessError), and so does one that does not show every unit it was asked
+        about (ValueError): the caller takes it as nothing shown of any of them."""
+        units = list(units)
+        if not units:
+            return {}
+        text = subprocess.run(['systemctl', '--user', 'show',
+                               '--property=Id,LoadState,ActiveState,SubState,Job,ControlGroup', '--', *units],
+                              check=True, text=True, capture_output=True, timeout=timeout_s).stdout
+        shown = {}
+        for block in text.split('\n\n'):
+            props = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+            if props.get('Id'):
+                shown[props.pop('Id')] = props
+        missing = [unit for unit in units if unit not in shown]
+        if missing:
+            raise ValueError(f'the system showed nothing of {missing[0]}')
+        return {unit: shown[unit] for unit in units}
+
+    def stop_units(self, units, timeout_s):
+        """The system's own stop of every unit of ``units`` in ONE request, by each unit's kill rules (the launcher's:
+        the whole control group), which also cancels a start the system has queued for it. Waits at most ``timeout_s``
+        for all of them together."""
+        subprocess.run(['systemctl', '--user', 'stop', '--', *units], check=True, text=True, capture_output=True,
+                       timeout=timeout_s)
+
+    def listed_units(self, pattern, timeout_s):
+        """The names of the units of the user manager that match ``pattern``, loaded or not, read within ``timeout_s``."""
+        text = subprocess.run(['systemctl', '--user', 'list-units', '--all', '--plain', '--no-legend', '--', pattern],
+                              check=True, text=True, capture_output=True, timeout=timeout_s).stdout
+        return [line.split()[0] for line in text.splitlines() if line.split()]
+
     def require_verbatim_argv(self):
         """Refuse the launch unless this systemd-run can hand the engine its argv unchanged (ADV1-11).
 
@@ -237,9 +397,16 @@ class EngineUnitManager(SystemdUserManager):
             raise refused('systemd_run_cannot_pass_argv_verbatim')
         self._verbatim_argv = True
 
-    def unit_identity(self, unit):
-        """(cgroup path, main pid) as systemd reports them now; blank or 0 when it reports none."""
-        text = self._call(['systemctl', '--user', 'show', '--property=ControlGroup,MainPID', '--', unit])
+    def unit_identity(self, unit, timeout_s=None):
+        """(cgroup path, main pid) as systemd reports them now; blank or 0 when it reports none.
+
+        ``timeout_s``: how long the read may take (the time its caller has left); past it subprocess.TimeoutExpired.
+        None: the manager's own wait."""
+        argv = ['systemctl', '--user', 'show', '--property=ControlGroup,MainPID', '--', unit]
+        if timeout_s is None:
+            text = self._call(argv)
+        else:
+            text = subprocess.run(argv, check=True, text=True, capture_output=True, timeout=timeout_s).stdout
         props = dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
         group = props.get('ControlGroup', '')
         if not group.startswith('/') or '..' in Path(group).parts:

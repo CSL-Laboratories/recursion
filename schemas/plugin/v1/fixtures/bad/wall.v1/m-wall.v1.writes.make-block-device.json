@@ -1,4 +1,6 @@
 {
+  "threads": 1,
+  "descriptors_open_for_write": [],
   "reads_outside": true,
   "home_canary": true,
   "program_start": true,
@@ -17,12 +19,19 @@
     "make_link": "refused_by_landlock",
     "make_char_device": "refused_by_landlock",
     "remove_file": "refused_by_landlock",
-    "remove_folder": "refused_by_landlock"
+    "remove_folder": "refused_by_landlock",
+    "make_socket_node": "refused_by_landlock"
   },
   "writes_not_tried": {
-    "make_socket_node": "a socket file is made only by binding a new socket, and the wall refuses every new socket first (new_socket)",
-    "device_ioctl": "a device's own commands need a device opened, and the wall lets nothing be opened outside the install, where no device lies (reads_outside)",
-    "move_between_folders": "a move or a link into another folder also makes a name there, which the make kinds show refused"
+    "device_ioctl": "a device's own commands need a device opened: the wall lets nothing new be opened outside the paths it was given (reads_outside), and the probe opens no device and sends no command to one",
+    "move_between_folders": "the probe tries every kind in one folder, so it moves nothing into another; a move or a link into another folder makes a name there, which Landlock asks as the make rights that the make kinds show refused in the probe's folder",
+    "rename_within_folder": "the probe renames nothing; a rename within one folder makes the new name and removes the old one, which Landlock asks as the make and remove rights that the make and remove kinds show refused",
+    "change_owner": "the filter refuses every call that changes a file's owner, by path and by descriptor; the probe tries one call of the filter's list of changes to a file's attributes, a change of mode (metadata_change), and not this one",
+    "change_times": "the filter refuses every call that changes a file's times, by path and by descriptor; the probe tries one call of the filter's list of changes to a file's attributes, a change of mode (metadata_change), and not this one",
+    "change_extended_attributes": "the filter refuses every call that sets or removes a file's extended attributes, by path and by descriptor; the probe tries one call of the filter's list of changes to a file's attributes, a change of mode (metadata_change), and not this one",
+    "write_through_open_descriptor": "Landlock checks a file when it is opened, so a file opened for writing before the wall can still be written through; the probe writes through none, and names each such file it finds open (descriptors_open_for_write), which a proven record holds empty",
+    "writable_memory_map": "a file mapped shared and writable before the wall can still be written through the map; the list of the process's maps (/proc/self/maps) is outside what the wall lets the host read, and no other call lists them, so the probe cannot look for one",
+    "write_beneath_other_folder": "the probe tries every kind in one folder only: a rule that granted write rights beneath another folder would not show here; apply_wall adds rules with read and execute rights only"
   },
   "landlock_abi": 3,
   "landlock_scopes": [],

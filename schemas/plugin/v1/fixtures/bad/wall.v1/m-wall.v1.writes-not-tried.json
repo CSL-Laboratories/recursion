@@ -1,4 +1,6 @@
 {
+  "threads": 1,
+  "descriptors_open_for_write": [],
   "reads_outside": true,
   "home_canary": true,
   "program_start": true,
@@ -17,6 +19,7 @@
     "make_link": "refused_by_landlock",
     "make_char_device": "refused_by_landlock",
     "make_block_device": "refused_by_landlock",
+    "make_socket_node": "refused_by_landlock",
     "remove_file": "refused_by_landlock",
     "remove_folder": "refused_by_landlock"
   },

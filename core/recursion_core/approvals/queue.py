@@ -96,6 +96,7 @@ from recursion_core.approvals import model
 from recursion_core.approvals import store as rows
 from recursion_core.approvals.model import ApprovalRefused
 from recursion_core.approvals.record import SURFACES, binding_problem, milliseconds
+from recursion_core.plugin_security.approval import APPROVAL_DEADLINE_SECONDS
 
 try:  # EVENTS' store: a COMMIT that raised may or may not have been made durable
     from recursion_core.events.db import CommitUnknown as _CommitUnknown
@@ -107,8 +108,9 @@ __all__ = ["DEADLINE_SECONDS", "ApprovalQueue", "timestamp_of"]
 
 log = logging.getLogger(__name__)
 
-# PROVISIONAL: the brief's question (b) to Lucas, not yet answered.
-DEADLINE_SECONDS = {"engine_tool": 15 * 60, "plugin_effect": 300}
+# PROVISIONAL: the brief's question (b) to Lucas, not yet answered. A plugin effect's deadline is the gate's one
+# named value, so the gate and the queue cannot disagree on it.
+DEADLINE_SECONDS = {"engine_tool": 15 * 60, "plugin_effect": APPROVAL_DEADLINE_SECONDS}
 RETRY_SECONDS = 1.0  # the deadline worker's pause after a failure before it tries again
 _CONSUME_ATTEMPTS = 12  # a consumption refused by a concurrent writer is read again this many times (about 0.4 s)
 

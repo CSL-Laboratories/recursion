@@ -127,8 +127,9 @@ class TheFileAndItsDefaults(_Folder):
                          self.rows(loaded, "plugin_host.gil_check"))
 
     def test_the_whole_listing_is_pinned_line_for_line(self) -> None:
-        """The one place the whole output of the listing is pinned. A row added to SETTINGS changes the lines
-        expected here and no other test of the listing: each of the others compares the lines of its own rows."""
+        """The one place the whole output of the listing is pinned, line for line and in order, in every state the
+        other tests of the listing cover. A row added to SETTINGS changes the lines expected here and no other
+        test of the listing: each of the others compares the lines of its own rows."""
         row = "plugin_host.gil_check = true (default true; source: default)"
         self.assertEqual([row], settings.lines(settings.load(self.environ)))
         self.put(OFF)
@@ -139,6 +140,14 @@ class TheFileAndItsDefaults(_Folder):
                           "warning: note settings_unknown_key: 'plugin_host.unknown' is not a setting this "
                           "version knows; it is skipped"],
                          settings.lines(settings.load(self.environ)))
+        # The same, for every file the skipped-key and the unreadable-file tests use: the row at its default,
+        # then the one warning, and nothing else, in this order.
+        for case, (text, _) in {**UNKNOWN, **BROKEN}.items():
+            with self.subTest(case=case):
+                self.put(text, mode=0o620 if case == "group writable" else 0o600)
+                loaded = settings.load(self.environ)
+                self.assertEqual([row, f"warning: note {loaded.notes[0]}"], settings.lines(loaded))
+                self.assertEqual(1, len(loaded.notes))
 
     def test_a_dotted_key_is_the_same_setting(self) -> None:
         self.put("version = 1\nplugin_host.gil_check = false\n")

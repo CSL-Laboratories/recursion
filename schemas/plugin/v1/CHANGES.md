@@ -4,7 +4,12 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
-## `host.v1.json` is `1.0-draft.3` (2026-11-21)
+## `host.v1.json` is `1.0-draft.4` (2026-11-25)
+
+Two changes made side by side, each first written as `1.0-draft.3`, are one draft here: the
+`gil_check` field of the daemon's `hello` with the codes `host_gil_enabled` and `host_start_refused`,
+and the root's seven message forms with the channel's order and the wider `call_failed` and
+`load_too_large`. Each is described below as it was written.
 
 The daemon's first `hello` may carry `gil_check` (`on` or `off`). The host defaults to `on`
 and its own `hello` carries only the channel version. With checking on, a host that reads its GIL
@@ -16,6 +21,18 @@ messages still validate.
 Plugin code shares the host's process, so it can read and write the channel's two descriptors itself:
 every frame on the channel is the plugin's voice, and the daemon must check each request against that
 plugin's grant and take no result on trust.
+
+The root of the file now applies its seven message forms (`oneOf` over `$defs`): before, an outside
+validator pointed at the file accepted any value at all. The texts say what is true at this head: the
+daemon's end sends no call, and the daemon's own call of a plugin's function through the channel is later
+work. The channel's order is written down: a `bye` ends the channel at any time, also before the `hello`;
+after a `bye` every later message is refused `message_invalid`; a second `hello` is refused
+`message_invalid`. An id is a whole number written without a fraction; the schema cannot decide that, and
+says so. A refusal of ours uses only a listed code, while an arriving refusal with an unlisted code is
+still read as a refusal. `call_failed` also answers a function that tried to end the host process and a
+value that cannot be written as JSON; `load_too_large` also answers a manifest or a file over its own
+size. What it breaks: a value that matches none of the seven forms no longer validates at the root; no
+message definition changed.
 
 ## `host.v1.json` is `1.0-draft.2` (2026-11-18)
 

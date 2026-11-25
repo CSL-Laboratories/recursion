@@ -598,13 +598,18 @@ class HostProgramTests(unittest.TestCase):
             call(9), call(10, "registry"), call(11, command={}), call(12, "surfaces"),
             call(13, "surface", name="night", kind="theme"), BYE,
         )
+        not_json = ("object: the function returned a value that cannot be written as JSON; a call returns plain "
+                    "JSON (objects with text keys, lists, text, finite numbers, true, false, null)")
+        system_exit = ("SystemExit: the plugin's function tried to end the host process; the call is refused and "
+                       "the host goes on. A plugin's function returns a value or raises an exception; it never "
+                       "ends the process.")
         self.assertEqual(len(replies), 9)
         for reply, id_, code, detail in zip(
             replies[:7],
             (None, None, 7, 8, 9, 10, 11),
             ("message_invalid", "message_invalid", "call_unknown", "call_reserved",
              "call_args_invalid", "call_failed", "call_failed"),
-            ("frame_not_json", "frame_too_large", None, None, None, "TypeError", "SystemExit"),
+            ("frame_not_json", "frame_too_large", None, None, None, not_json, system_exit),
         ):
             self.assert_refusal(reply, id_, code, detail)
         self.assertEqual(replies[7:], [result(12, ["theme"]), result(13, {"pair": ["theme", "night"]})])
@@ -940,3 +945,144 @@ class CoreRequestNestingTests(unittest.TestCase):
         program, channel, _ = self.nested()
         self.assertEqual(program._relay_core(b"next"), b"next-answer")
         self.assertEqual(channel.sent, [core(0, b"outer"), core(1, b"next")])
+
+
+
+class OneRuleAndArrivingRefusalTests(unittest.TestCase):
+    """The host program on the channel end: ONE rule for a core request made from inside another request on the
+    same thread (refused with ChannelReentered before anything is sent), and a peer's refusal read as a
+    refusal whatever its code. Every scenario runs in its own thread under a bound, so a wait FAILS."""
+
+    BOUND = 20
+
+    def bounded(self, scenario):
+        out = {}
+
+        def run():
+            try:
+                out["value"] = scenario()
+            except BaseException as exc:  # noqa: BLE001 - handed to the test thread
+                out["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(self.BOUND)
+        self.assertFalse(worker.is_alive(), "the scenario waited past its bound")
+        if "error" in out:
+            raise out["error"]
+        return out["value"]
+
+    @staticmethod
+    def program(incoming):
+        from recursion_core.plugin_host import _Program
+
+        channel = _StandInChannel(incoming)
+        program = _Program(channel, FakeGilProbe((False,)))
+        program._greeted = True
+        return program, channel
+
+    @staticmethod
+    def from_inside_the_end(program, request, message):
+        """Dispatch ``message`` to the end; a trace function, on a line of the end's section while this thread
+        holds it, makes ``request`` once (what a plugin's trace function or signal handler can do)."""
+        end, seen = program._end, {}
+
+        def local(frame, event, arg):
+            if event == "line" and not seen and frame.f_locals.get("self") is end and end._depth:
+                try:
+                    seen["value"] = request()
+                except BaseException as exc:  # noqa: BLE001 - recorded for the test
+                    seen["raised"] = exc
+            return local
+
+        def tracer(frame, event, arg):
+            return local if frame.f_code.co_name == "_take" else None
+
+        sys.settrace(tracer)
+        try:
+            program._dispatch(message)
+        finally:
+            sys.settrace(None)
+        return seen
+
+    def test_a_core_request_refused_with_a_code_of_a_later_release_is_a_channel_refusal(self):
+        def scenario():
+            later = {"type": "refusal", "id": 0, "code": "a_code_of_a_later_release", "detail": "the daemon's words"}
+            program, channel = self.program([later])
+            try:
+                program._relay_core(b"request")
+            except hc.ChannelRefusal as exc:
+                return exc, channel.sent
+            return None, channel.sent
+
+        exc, sent = self.bounded(scenario)
+        self.assertIsInstance(exc, hc.ChannelRefusal)
+        self.assertEqual((exc.code, exc.detail, exc.known), ("a_code_of_a_later_release", "the daemon's words", False))
+        self.assertEqual(sent, [core(0, b"request")])
+
+    def test_a_core_request_refused_with_a_listed_code_is_known(self):
+        def scenario():
+            listed = {"type": "refusal", "id": 0, "code": "call_not_offered", "detail": "words"}
+            program, _ = self.program([listed])
+            with self.assertRaises(hc.ChannelRefusal) as caught:
+                program._relay_core(b"request")
+            return caught.exception
+
+        exc = self.bounded(scenario)
+        self.assertEqual((exc.code, exc.detail, exc.known), ("call_not_offered", "words", True))
+
+    def test_a_core_request_from_inside_the_end_is_refused_before_anything_is_sent(self):
+        def scenario():
+            program, channel = self.program([core(0, b"after")])
+            seen = self.from_inside_the_end(program, lambda: program._relay_core(b"inner"),
+                                            {"type": "refusal", "id": None, "code": "message_invalid", "detail": "x"})
+            sent_inside = list(channel.sent)
+            later = program._relay_core(b"after-request")
+            return seen, sent_inside, later, channel.sent
+
+        seen, sent_inside, later, sent = self.bounded(scenario)
+        self.assertIsInstance(seen.get("raised"), hc.ChannelReentered, seen)
+        self.assertIn("nothing was taken or sent", str(seen["raised"]))
+        self.assertEqual(sent_inside, [])
+        self.assertEqual(later, b"after")
+        self.assertEqual(sent, [core(0, b"after-request")])
+
+    def test_one_rule_both_routes_raise_channel_reentered_and_send_nothing(self):
+        def scenario():
+            # route 1: inside another core request's wait (the stand-in channel's hook runs inside that wait)
+            program, channel = self.program([core(0, b"outer-answer")])
+            seen = {}
+
+            def inner():
+                try:
+                    program._relay_core(b"inner")
+                except BaseException as exc:  # noqa: BLE001 - recorded for the test
+                    seen["wait"] = exc
+
+            channel.hook = inner
+            outer = program._relay_core(b"outer")
+            # route 2: inside the end's own section
+            program2, channel2 = self.program([])
+            inside = self.from_inside_the_end(program2, lambda: program2._relay_core(b"inner"),
+                                              {"type": "refusal", "id": None, "code": "message_invalid", "detail": "x"})
+            return outer, seen.get("wait"), channel.sent, inside.get("raised"), channel2.sent
+
+        outer, wait, sent, inside, sent2 = self.bounded(scenario)
+        self.assertEqual(outer, b"outer-answer")
+        for route, exc in (("wait", wait), ("inside", inside)):
+            with self.subTest(route=route):
+                self.assertIs(type(exc), hc.ChannelReentered)
+                self.assertIsInstance(exc, RuntimeError)
+                self.assertEqual(exc.code, "end_reentered")
+        self.assertIn("core requests do not nest", str(wait))
+        self.assertEqual(sent, [core(0, b"outer")])
+        self.assertEqual(sent2, [])
+
+    def test_a_handler_that_makes_a_core_request_inside_receive_is_served_and_never_waits(self):
+        def scenario():
+            program, channel = self.program([core(0, b"handler-answer")])
+            program._handlers["operator"] = lambda command: program._relay_core(b"from-handler").decode()
+            program._dispatch(call(7, command={}))
+            return channel.sent
+
+        self.assertEqual(self.bounded(scenario), [core(0, b"from-handler"), result(7, "handler-answer")])

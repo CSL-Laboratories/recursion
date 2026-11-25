@@ -196,7 +196,8 @@ class AcceptTests(_QuarantineCase):
         self.assertNotIn("\n", asked[0])
         for words in (PLUGIN, "1.1.0", "read, panel, network", "order is never granted this way", "yes"):
             self.assertIn(words, asked[0])
-        status, said, out = self.main(["plugin", "quarantine", "accept", PLUGIN, "--config", str(self.config)], "")
+        status, said, out = self.main(["plugin", "quarantine", "accept", PLUGIN, "--config", str(self.config),
+                                     "--state", str(self.state)], "")
         self.assertEqual((1, ""), (status, out))
         self.assertEqual(asked[0], said.splitlines()[0])
         self.assertTrue(said.splitlines()[1].startswith("not changed: "), said)

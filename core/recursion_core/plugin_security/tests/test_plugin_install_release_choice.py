@@ -44,6 +44,8 @@ class ReleaseChoiceTests(ProfileCase):
         path = live / "install.json"
         path.write_bytes((json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8"))
         os.chmod(path, 0o600)
+        from recursion_core.daemon.tests import plugin_fixture as fx
+        fx.ensure_revocation_store(self.state)
 
     def assert_refused_and_nothing_written(self, code, plugin_id="fixture.unsigned", **kwargs):
         from recursion_core.plugin_security.install import InstallRefused

@@ -8,7 +8,7 @@ it in `README.md` has a passing fixture in `fixtures/`.
 
 The install file may carry `pins`, by plugin id the signing key id and version of a plugin installed signed (a closed object of both members); a release of a pinned plugin that is unsigned or fails its check is refused, and `plugin unpin` drops a pin; an omitted map is no pin and today's files are unchanged; one good fixture (`h06`) and one bad fixture (`b11`); the version stays `1.0-draft.4`, which a conformance test of this tree holds.
 
-## `install.v1.json` is `1.0-draft.4` (Nov 17, 2026)
+## `install.v1.json` is `1.0-draft.4` (2026-11-17)
 
 The install file may carry `registry_labels`: a map from the SHA-256 of one installed manifest's bytes
 to `verified` or `non_verified`. Draft 3 had no place for that label, and the reader refused any
@@ -19,7 +19,7 @@ permission and not a grant. One good fixture (`h05`) and one bad fixture (`b10`)
 values. A label whose key is not the bytes of the manifest now installed is the reader's rule, and a
 schema cannot see that file (`README.md`). The developer-key bump stays `1.0-draft.3`; this is the next bump.
 
-## `install.v1.json` is `1.0-draft.3` (Nov 17, 2026)
+## `install.v1.json` is `1.0-draft.3` (2026-11-17)
 
 A grant may name `developer_key_id` as null or as a key id (`ed25519:` and 32 lower-case hex digits). Draft 2
 allowed the member and the reader refused it as an unknown grant field, so a file of the schema was not read.

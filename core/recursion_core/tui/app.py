@@ -631,7 +631,11 @@ class TuiApp:
             for run in self.runs:
                 if run.get("run_id") == answer["run_id"]:
                     run["state"] = "stopped" if code == "stopped" else "stop_pending"
-                    run["stop"] = {**(run.get("stop") or {}), "reason": answer.get("reason")}
+                    prior = run.get("stop")
+                    # A stop record that is not a mapping (a string, from a bad list) is not spread:
+                    # spreading it raises, and this Stop's answer would not be taken.
+                    run["stop"] = {**(prior if isinstance(prior, Mapping) else {}),
+                                   "reason": answer.get("reason")}
         elif code == "started" and isinstance(answer.get("run"), dict):
             if not self._before_stop(answer["run"], asked):  # a late retry cannot undo a Stop (#443 r1, F4)
                 self._merge(answer["run"])
@@ -1288,7 +1292,9 @@ class TuiApp:
         return dict(sorted(found.items(), key=lambda kv: p.LABELS.index(kv[0][0])))
 
     def conditions(self) -> list[tuple[str, str]]:
-        return list(self._current().values())
+        # The same lock the answer writer holds: a Stop answer cannot change the dicts this reads.
+        with self._lock:
+            return list(self._current().values())
 
     def sync_conditions(self) -> None:
         """Log each condition that appeared, changed or cleared since the last sync; nothing else."""
@@ -1638,7 +1644,19 @@ def call_api(api, method: str, params: dict) -> dict:
         return {"code": p.UNAVAILABLE, "detail": type(err).__name__}
     if not isinstance(answer, dict):
         return {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
-    return json.loads(json.dumps(answer, default=str))  # a private copy: the view never aliases API state
+    try:
+        # A private copy: the view never aliases API state. A cycle, or a value that cannot be copied,
+        # is an unavailable answer, not a crash (ValueError from a circular reference).
+        copied = json.loads(json.dumps(answer, default=str))
+    except (TypeError, ValueError):
+        return {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
+    code = copied.get("code")
+    if code is not None and not isinstance(code, str):
+        try:
+            hash(code)  # a number is a refusal, as before; a list or a dict cannot be one
+        except TypeError:
+            return {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
+    return copied
 
 
 class Loop:

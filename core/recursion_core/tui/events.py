@@ -77,28 +77,36 @@ class EventLog:
         return event
 
     def __iter__(self) -> Iterator[Event]:
-        return iter(self._events)
+        # A tuple taken under the writer's lock: a later append cannot raise from this iterator,
+        # and the reader keeps the events that were retained when it began.
+        with self._lock:
+            return iter(tuple(self._events))
 
     def __len__(self) -> int:
         return len(self._events)
 
     def since(self, seq: int) -> tuple[list[Event], int]:
-        """Events after ``seq``, oldest first, and how many of them already left the bounded log."""
+        """Events after ``seq``, oldest first, and how many of them already left the bounded log.
 
-        newer: list[Event] = []
-        for event in reversed(self._events):  # O(new events), not O(log)
-            if event.seq <= seq:
-                break
-            newer.append(event)
-        newer.reverse()
-        first = newer[0].seq if newer else self.last_seq + 1
-        return newer, max(0, first - seq - 1)
+        The walk and the eviction count share the writer's lock, so an append cannot change the deque
+        under the walk, and a retained event is not counted as already gone."""
+
+        with self._lock:
+            newer: list[Event] = []
+            for event in reversed(self._events):  # O(new events), not O(log)
+                if event.seq <= seq:
+                    break
+                newer.append(event)
+            newer.reverse()
+            first = newer[0].seq if newer else self.last_seq + 1
+            return newer, max(0, first - seq - 1)
 
     def latest(self, event_type: str) -> Event | None:
-        for event in reversed(self._events):
-            if event.event_type == event_type:
-                return event
-        return None
+        with self._lock:
+            for event in reversed(self._events):
+                if event.event_type == event_type:
+                    return event
+            return None
 
 
 # U+2028 and U+2029 end a line for str.splitlines and for JavaScript, so a record that held one raw
@@ -112,11 +120,53 @@ def to_jsonl(events: Iterable[Event]) -> str:
                    for e in events)
 
 
+class EventInvalid(ValueError):
+    """One JSONL line is not an event this log can keep. ``line_no`` is one-based."""
+
+    code = "event_invalid"
+
+    def __init__(self, line_no: int) -> None:
+        self.line_no = line_no
+        super().__init__(f"event_invalid line {line_no}")
+
+
+_STATES = ("live", "watch_only", "closed")
+
+
+def _event_from_record(raw: object, line_no: int) -> Event:
+    if not isinstance(raw, dict) or set(raw) != set(FIELDS):
+        raise EventInvalid(line_no)
+    seq, ms = raw.get("seq"), raw.get("time_rel_ms")
+    if type(seq) is not int or type(ms) is not int:  # bool is an int, and it is not a sequence number
+        raise EventInvalid(line_no)
+    event_type, source, trust = raw.get("event_type"), raw.get("source"), raw.get("trust")
+    state, text, speech, focus = raw.get("state"), raw.get("text"), raw.get("speech"), raw.get("focus")
+    if (not isinstance(event_type, str) or event_type not in EVENT_TYPES
+            or not isinstance(source, str) or source not in SOURCES
+            or not isinstance(state, str) or state not in _STATES
+            or not isinstance(text, str) or not isinstance(speech, str) or not isinstance(focus, str)):
+        raise EventInvalid(line_no)
+    # Trust is the log's own mark, not a field a record may choose: engine text is untrusted.
+    if trust != ("untrusted" if source == "engine" else "trusted"):
+        raise EventInvalid(line_no)
+    return Event(seq, ms, event_type, source, trust, state, text, speech, focus)
+
+
 def from_jsonl(text: str) -> list[Event]:
     """One event per LF-ended line. Only LF ends a record, so a log written before the writer escaped
-    U+2028 and U+2029 still reads back whole."""
+    U+2028 and U+2029 still reads back whole. A line that is not one event raises ``EventInvalid``
+    and nothing of that line is returned."""
 
-    return [Event(**json.loads(line)) for line in text.split("\n") if line]
+    out: list[Event] = []
+    for line_no, line in enumerate(text.split("\n"), 1):
+        if not line:
+            continue
+        try:
+            raw = json.loads(line)
+        except ValueError:
+            raise EventInvalid(line_no) from None
+        out.append(_event_from_record(raw, line_no))
+    return out
 
 
 def speech_lines(events: Iterable[Event]) -> list[str]:

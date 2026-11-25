@@ -98,7 +98,9 @@ class LogReader:
 
     def new_lines(self) -> list[str]:
         events, skipped = self.app.log.since(self.seq)
-        self.seq = self.app.log.last_seq
+        # The cursor is the last event this snapshot returned. Reading last_seq afterwards would skip
+        # an event appended after the snapshot and still retained.
+        self.seq = events[-1].seq if events else self.seq + skipped
         head = [f"({skipped} events not shown: the log moved past them)"] if skipped else []
         return head + speech_lines(events)
 

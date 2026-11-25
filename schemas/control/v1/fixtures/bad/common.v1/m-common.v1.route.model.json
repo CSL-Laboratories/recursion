@@ -1,0 +1,7 @@
+{
+  "engine": "claude_code",
+  "connection": {
+    "kind": "subscription",
+    "id": "personal-max"
+  }
+}

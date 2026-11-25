@@ -1,0 +1,7 @@
+{
+  "method": "session.list",
+  "params": {
+    "state": "x-nobody-defined-this",
+    "limit": 20
+  }
+}

@@ -1,0 +1,539 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "event.v1.json",
+  "title": "event.v1: one event of a session's log",
+  "x-version": "1.0-draft.7",
+  "description": "PUBLIC record, and the row lane EVENTS stores. Each log is ordered and append-only; everything a client shows comes from it. seq starts at 1 in each log, has no holes, and is never used twice. session_id names the LOG: a session's id, or 'run:<run_id>' for a run that has no session. run_id and turn_id are null for an event that belongs to no run or no turn. time is when the core wrote the event. source says where the event's content came from: 'core' (the daemon's own code), 'engine' (an engine's output or its typed stream), 'plugin', or 'client' (something a user or a calling program sent). trust says whether the content may be shown as the product's own words: content from an engine or a plugin is always 'untrusted', and a core event that carries engine text is 'untrusted' too. Every type has exactly one payload schema, below; none is a name only. The lane that emits an event owns its payload: it may reshape a draft here by sending a fixture. Only the core writes approval.requested: a surface opens its approval state on that event and on nothing an engine printed. A number that is not known is null with quality 'unknown', never 0. Engine-shaped values (a tool call's input) are open objects marked untrusted; nothing a core lane reads lives in one. A reader that meets a type it does not know keeps the envelope, shows nothing from the payload, and reads on.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["seq", "session_id", "run_id", "turn_id", "time", "type", "source", "trust", "payload"],
+  "properties": {
+    "seq": {"$ref": "common.v1.json#/$defs/seq"},
+    "session_id": {"$ref": "common.v1.json#/$defs/log_id"},
+    "run_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/run_id"}]},
+    "turn_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]},
+    "time": {"$ref": "common.v1.json#/$defs/timestamp"},
+    "type": {
+      "enum": [
+        "state.changed", "engine.output", "tool.call", "tool.result",
+        "approval.requested", "approval.answered", "usage", "limit", "result", "replay.gap",
+        "turn.started", "turn.ended", "steer.queued", "steer.sent", "input.accepted", "interrupt",
+        "stop.requested", "stop.result", "diff", "checkpoint", "fork",
+        "workspace.grant", "workspace.revoke", "route.decision", "effect.outcome_unknown"
+      ]
+    },
+    "source": {"enum": ["core", "engine", "plugin", "client"]},
+    "trust": {"enum": ["trusted", "untrusted"]},
+    "payload": {"type": "object"},
+    "causation_id": {
+      "description": "What caused this event: a command_id, or an event of the same log written as '<seq>'.",
+      "$ref": "common.v1.json#/$defs/token"
+    },
+    "correlation_id": {
+      "description": "Ties together every event of one piece of work, for example one tool call and its result.",
+      "$ref": "common.v1.json#/$defs/token"
+    },
+    "command_id": {
+      "description": "The client's id of the request that this event answers, when there is one.",
+      "$ref": "common.v1.json#/$defs/command_id"
+    }
+  },
+  "allOf": [
+    {
+      "if": {"required": ["source"], "properties": {"source": {"enum": ["engine", "plugin"]}}},
+      "then": {"properties": {"trust": {"const": "untrusted"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "state.changed"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/state.changed"}, "source": {"const": "core"}, "trust": {"const": "trusted"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "engine.output"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/engine.output"}, "source": {"const": "engine"}, "run_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "tool.call"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/tool.call"}, "source": {"enum": ["engine", "plugin"]}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "tool.result"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/tool.result"}, "source": {"enum": ["engine", "plugin"]}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "approval.requested"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/approval.requested"}, "source": {"const": "core"}, "trust": {"const": "trusted"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "approval.answered"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/approval.answered"}, "source": {"const": "core"}, "trust": {"const": "trusted"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "usage"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/usage"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "limit"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/limit"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "result"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/result"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "replay.gap"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/replay.gap"}, "source": {"const": "core"}, "trust": {"const": "trusted"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "turn.started"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/turn.started"}, "source": {"const": "core"}, "turn_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "turn.ended"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/turn.ended"}, "source": {"const": "core"}, "turn_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "steer.queued"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/steer.queued"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "steer.sent"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/steer.sent"}, "source": {"const": "core"}, "turn_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "input.accepted"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/input.accepted"}, "source": {"const": "engine"}, "turn_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "interrupt"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/interrupt"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "stop.requested"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/stop.requested"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "stop.result"}}},
+      "then": {"properties": {"payload": {"$ref": "stop.result.v1.json"}, "source": {"const": "core"}, "trust": {"const": "trusted"}, "run_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "diff"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/diff"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "checkpoint"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/checkpoint"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "fork"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/fork"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "workspace.grant"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/workspace.grant"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "workspace.revoke"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/workspace.revoke"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "route.decision"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/route.decision"}, "source": {"const": "core"}, "trust": {"const": "trusted"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "effect.outcome_unknown"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/effect.outcome_unknown"}, "source": {"const": "core"}, "trust": {"const": "trusted"}}}
+    }
+  ],
+  "$defs": {
+    "state_word": {
+      "type": "string",
+      "pattern": "^[a-z][a-z_]{0,31}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "requested_by": {
+      "description": "Who asked: a principal, or the word 'daemon' for the daemon's own recovery, which is not a client's call.",
+      "anyOf": [{"const": "daemon"}, {"$ref": "common.v1.json#/$defs/principal"}]
+    },
+    "daemon_row": {
+      "description": "The daemon's own row for a run's unit, as its registry reads it: the unit's name, whether a Stop is recorded for it, the daemon's state word, the boot it was started in, and a detail.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "unit", "stop", "state", "boot_id", "detail"],
+      "properties": {
+        "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
+        "unit": {"type": "string", "pattern": "^recursion-run-[A-Za-z0-9_-]{1,64}\\.service$", "not": {"pattern": "[\\r\\n]"}},
+        "stop": {"type": "boolean"},
+        "state": {"enum": ["starting", "running", "stopping", "terminated", "lost_reboot", "unknown"]},
+        "boot_id": {"type": ["string", "null"], "minLength": 1},
+        "detail": {"type": "string"}
+      }
+    },
+    "state.changed": {
+      "description": "One record changed. It carries the record as it is AFTER the change (the post-image), typed by entity, so a log can rebuild state without another read. For a run the post-image is the daemon's row and the stored control record; either may be null when that half does not exist yet. For a session it is the session record; for a turn it is the turn. post_image_sha256 is SHA-256 of post_image under rfc8785/v1, the UTF-8 bytes of the post-image as RFC 8785 writes it (conformance/rules.py, post_image_digest); all positive examples contain the computed digest. A consumer compares it only with the LAST image committed for that entity: an entity seen as A, then B, then A is three changes, never one that an earlier digest suppresses. reason: 'commit' (the change was seen as it was made), 'reconcile' (it was found by a later scan, so earlier steps may be missing), 'snapshot' (the first record of an entity that already existed when logging began). coalesced is the number of marks this image stands for, given only when it was measured (1 when it is known to stand for exactly one), and null when it cannot be known: an image that came from a scan, or from a producer that keeps a set of marked runs and not a count.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity", "entity_id", "post_image", "post_image_sha256", "reason", "coalesced"],
+      "properties": {
+        "entity": {"enum": ["run", "session", "turn"]},
+        "entity_id": {"type": "string", "minLength": 1, "maxLength": 128, "not": {"pattern": "[\\r\\n]"}},
+        "post_image": {"type": "object"},
+        "post_image_sha256": {"$ref": "common.v1.json#/$defs/sha256"},
+        "reason": {"enum": ["commit", "reconcile", "snapshot"]},
+        "coalesced": {"type": ["integer", "null"], "minimum": 1}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["entity"], "properties": {"entity": {"const": "run"}}},
+          "then": {
+            "properties": {
+              "post_image": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["daemon_row", "control_record"],
+                "properties": {
+                  "daemon_row": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/daemon_row"}]},
+                  "control_record": {"anyOf": [{"type": "null"}, {"$ref": "run.record.v1.json"}]}
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"required": ["entity"], "properties": {"entity": {"const": "session"}}},
+          "then": {"properties": {"post_image": {"$ref": "session.v1.json"}}}
+        },
+        {
+          "if": {"required": ["entity"], "properties": {"entity": {"const": "turn"}}},
+          "then": {"properties": {"post_image": {"$ref": "session.v1.json#/$defs/turn"}}}
+        }
+      ]
+    },
+    "engine.output": {
+      "description": "A span of the engine's output file, as text. offset_start and offset_end are byte offsets into that file (the end is exclusive), so a reader that restarts can resume without losing or repeating a line. Untrusted.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stream", "text", "offset_start", "offset_end"],
+      "properties": {
+        "stream": {"enum": ["stdout", "stderr"]},
+        "text": {"type": "string"},
+        "offset_start": {"type": "integer", "minimum": 0},
+        "offset_end": {"type": "integer", "minimum": 0}
+      }
+    },
+    "tool.call": {
+      "description": "The engine asked to use a tool. call_id is the engine's id for the call and pairs it with its tool.result. input is the tool's input as the engine gave it, or null when it is not carried (too large, or withheld); its inside is the tool's own shape and is untrusted. input_digest is the SHA-256 of the input under rfc8785/v1, the UTF-8 bytes of the input as RFC 8785 writes it (conformance/rules.py, input_digest), taken by the core when it read the call; every positive example that carries the input carries its computed digest.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["call_id", "name", "input_digest", "input"],
+      "properties": {
+        "call_id": {"type": "string", "minLength": 1, "maxLength": 128, "not": {"pattern": "[\\r\\n]"}},
+        "name": {"type": "string", "minLength": 1, "maxLength": 256, "not": {"pattern": "[\\r\\n]"}},
+        "input_digest": {"$ref": "common.v1.json#/$defs/sha256"},
+        "input": {"type": ["object", "null"]}
+      }
+    },
+    "tool.result": {
+      "description": "What a tool call returned. Exactly one of text and output_ref is not null: text carries the output; output_ref names where a large output was put. truncated is true when the text is shorter than what the tool produced.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["call_id", "status", "text", "output_ref", "truncated"],
+      "properties": {
+        "call_id": {"type": "string", "minLength": 1, "maxLength": 128, "not": {"pattern": "[\\r\\n]"}},
+        "status": {"enum": ["ok", "error", "denied", "cancelled"]},
+        "text": {"type": ["string", "null"]},
+        "output_ref": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/token"}]},
+        "truncated": {"type": "boolean"}
+      },
+      "oneOf": [
+        {"properties": {"text": {"type": "string"}, "output_ref": {"type": "null"}}},
+        {"properties": {"text": {"type": "null"}, "output_ref": {"type": "string"}}}
+      ]
+    },
+    "approval.requested": {
+      "description": "The core opened an approval request. The payload is the approval's public view exactly as it was at that moment (approval.v1, state 'pending', nobody has shown it yet), with the lines the core's renderer produced. It is immutable: a log can be replayed and show what was asked without any lookup. What the request is NOW (answered, expired, its revision) is read with approval.list and approval.open, never from this event.",
+      "allOf": [
+        {"$ref": "approval.v1.json"},
+        {"properties": {"state": {"const": "pending"}, "opened_by": {"maxItems": 0}}}
+      ]
+    },
+    "approval.answered": {
+      "description": "An approval request left 'pending'. state is what it became. A deadline or a veto is not a person's answer: for 'expired', answer and answered_by are null. revision is the request's revision after this change.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approval_id", "answer", "answered_by", "revision", "state"],
+      "properties": {
+        "approval_id": {"$ref": "common.v1.json#/$defs/approval_id"},
+        "answer": {"enum": ["approve", "deny", null]},
+        "answered_by": {"anyOf": [{"type": "null"}, {"$ref": "approval.v1.json#/$defs/approver"}]},
+        "revision": {"$ref": "common.v1.json#/$defs/revision"},
+        "state": {"enum": ["approved", "denied", "expired", "vetoed"]}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["state"], "properties": {"state": {"const": "approved"}}},
+          "then": {"properties": {"answer": {"const": "approve"}, "answered_by": {"type": "object"}}}
+        },
+        {
+          "if": {"required": ["state"], "properties": {"state": {"enum": ["denied", "vetoed"]}}},
+          "then": {"properties": {"answer": {"const": "deny"}, "answered_by": {"type": "object"}}}
+        },
+        {
+          "if": {"required": ["state"], "properties": {"state": {"const": "expired"}}},
+          "then": {"properties": {"answer": {"type": "null"}, "answered_by": {"type": "null"}}}
+        }
+      ]
+    },
+    "token_count": {
+      "description": "One measured count with what is known about it. quality: 'known' (the value is exact), 'lower_bound' (the true value is at least this), 'unknown' (nothing is known, and then the value is null and the provenance is 'unavailable'). provenance: 'observed' in the engine's typed stream, 'modelled' from a table, 'inferred' from other evidence, 'unavailable'. A value is never 0 because it was not known.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "quality", "provenance"],
+      "properties": {
+        "value": {"type": ["integer", "null"], "minimum": 0},
+        "quality": {"enum": ["known", "lower_bound", "unknown"]},
+        "provenance": {"enum": ["observed", "modelled", "inferred", "unavailable"]}
+      },
+      "if": {"required": ["quality"], "properties": {"quality": {"const": "unknown"}}},
+      "then": {"properties": {"value": {"type": "null"}, "provenance": {"const": "unavailable"}}},
+      "else": {"properties": {"value": {"type": "integer"}, "provenance": {"enum": ["observed", "modelled", "inferred"]}}}
+    },
+    "dollar_amount": {
+      "description": "One amount in US dollars with what is known about it; the same rules as a token count.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "quality", "provenance"],
+      "properties": {
+        "value": {"type": ["number", "null"], "minimum": 0},
+        "quality": {"enum": ["known", "lower_bound", "unknown"]},
+        "provenance": {"enum": ["observed", "modelled", "inferred", "unavailable"]}
+      },
+      "if": {"required": ["quality"], "properties": {"quality": {"const": "unknown"}}},
+      "then": {"properties": {"value": {"type": "null"}, "provenance": {"const": "unavailable"}}},
+      "else": {"properties": {"value": {"type": "number"}, "provenance": {"enum": ["observed", "modelled", "inferred"]}}}
+    },
+    "usage": {
+      "description": "Tokens and cost, as far as they are known. Each measurement carries its own quality and provenance, because they differ in practice: tokens can be observed while the cost is modelled, and cache counts can be missing while input and output are exact. span says what the numbers cover: 'call' (one model call), 'turn' (the envelope's turn), or 'session_total' (everything the engine has counted for its session so far: a running total, which is never summed). reasoning_tokens is the part of output_tokens the engine reports as reasoning. bucket is the vendor's limit bucket the call counted against, when the vendor names one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connection_id", "model", "bucket", "span", "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd"],
+      "properties": {
+        "connection_id": {"$ref": "common.v1.json#/$defs/connection_id"},
+        "model": {"type": ["string", "null"], "minLength": 1},
+        "bucket": {"type": ["string", "null"], "minLength": 1},
+        "span": {"enum": ["call", "turn", "session_total"]},
+        "input_tokens": {"$ref": "#/$defs/token_count"},
+        "output_tokens": {"$ref": "#/$defs/token_count"},
+        "reasoning_tokens": {"$ref": "#/$defs/token_count"},
+        "cache_read_tokens": {"$ref": "#/$defs/token_count"},
+        "cache_write_tokens": {"$ref": "#/$defs/token_count"},
+        "cost_usd": {"$ref": "#/$defs/dollar_amount"}
+      }
+    },
+    "limit": {
+      "description": "A limit was met. kind: 'plan_limit' is a typed limit signal from the vendor; 'short_fault' is a brief fence after quota-sounding text outside the model's output; 'spend_cap' is the user's own dollar cap. scope says whether the whole connection or one model on it is limited; model is a string exactly when scope is 'model'. bucket is the vendor's limit bucket when the vendor names one. reset_at is when it may clear, null when not known.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connection_id", "scope", "kind", "model", "bucket", "reset_at"],
+      "properties": {
+        "connection_id": {"$ref": "common.v1.json#/$defs/connection_id"},
+        "scope": {"enum": ["connection", "model"]},
+        "kind": {"enum": ["plan_limit", "short_fault", "spend_cap"]},
+        "model": {"type": ["string", "null"], "minLength": 1},
+        "bucket": {"type": ["string", "null"], "minLength": 1},
+        "reset_at": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]}
+      },
+      "if": {"required": ["scope"], "properties": {"scope": {"const": "model"}}},
+      "then": {"properties": {"model": {"type": "string"}}},
+      "else": {"properties": {"model": {"type": "null"}}}
+    },
+    "result": {
+      "description": "A run produced its result. code is null when it succeeded and a typed code when it did not. detail may carry engine text; when it does, the event's trust is 'untrusted'. A turn's result is in turn.ended.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "detail"],
+      "properties": {
+        "code": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/code_word"}]},
+        "detail": {"type": "string"}
+      }
+    },
+    "replay.gap": {
+      "description": "The events numbered from..to (both included) of this log cannot be given. The gap event takes the place of that span and carries the sequence number 'to', so the numbers a reader sees still have no holes. A gap is a span: from is at most to, it starts at the next missing position, and the event's own seq is to. reason: 'retention' (old events were dropped by policy), 'store_reset' (the store was lost or rebuilt), 'output_lost' (a span of an engine's output file could not be read).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "reason"],
+      "properties": {
+        "from": {"$ref": "common.v1.json#/$defs/seq"},
+        "to": {"$ref": "common.v1.json#/$defs/seq"},
+        "reason": {"enum": ["retention", "store_reset", "output_lost"]}
+      }
+    },
+    "turn.started": {
+      "description": "A turn began. The core writes this when an input.accepted with how new_turn arrives; delivery_id is the id that input was written toward the engine with. index is the turn's place in the session (from 0). text is the input as it was sent. These are copies of the committed turn/queue state at that event, not separately editable state.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["delivery_id", "index", "text"],
+      "properties": {
+        "delivery_id": {"$ref": "common.v1.json#/$defs/delivery_id"},
+        "index": {"type": "integer", "minimum": 0},
+        "text": {"type": "string"}
+      }
+    },
+    "turn.ended": {
+      "description": "A turn reached its end. outcome says how (session.v1, turn_outcome). result is the turn's result as the session record keeps it, or null when the turn has none (it was interrupted or stopped before one).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "result"],
+      "properties": {
+        "outcome": {"$ref": "session.v1.json#/$defs/turn_outcome"},
+        "result": {"anyOf": [{"type": "null"}, {"$ref": "session.v1.json#/$defs/turn_result"}]}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["outcome"], "properties": {"outcome": {"enum": ["candidate_done", "done", "waiting", "paused"]}}},
+          "then": {"properties": {"result": {"type": "object", "properties": {"code": {"type": "null"}}}}}
+        },
+        {
+          "if": {"required": ["outcome"], "properties": {"outcome": {"const": "failed"}}},
+          "then": {"properties": {"result": {"type": "object", "properties": {"code": {"type": "string"}}}}}
+        }
+      ]
+    },
+    "steer.queued": {
+      "description": "A message was queued, edited or withdrawn. The message itself is the queue item (queue.item.v1), read with the session; the log carries its id, its place in the order, how it is to be delivered, and the item's revision and state after this change. These are copies of the committed turn/queue state at that event, not separately editable state.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "order", "delivery", "revision", "state"],
+      "properties": {
+        "item_id": {"$ref": "common.v1.json#/$defs/item_id"},
+        "order": {"type": "integer", "minimum": 1},
+        "delivery": {"enum": ["next_turn", "steer"]},
+        "revision": {"$ref": "common.v1.json#/$defs/revision"},
+        "state": {"enum": ["queued", "cancelled"]}
+      }
+    },
+    "steer.sent": {
+      "description": "The daemon wrote a queued message into the turn in progress, under delivery_id. This is the WRITE and it is NOT acceptance: that the engine took the message is a later input.accepted that names the same delivery_id. An item whose write is followed by no acceptance by the end of that turn, or by a restart, is outcome_unknown. There is at most one steer.sent for one delivery, filed under the turn its committed binding aims at. A concrete write/acceptance must name its target.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "delivery_id"],
+      "properties": {
+        "item_id": {"$ref": "common.v1.json#/$defs/item_id"},
+        "delivery_id": {"$ref": "common.v1.json#/$defs/delivery_id"}
+      }
+    },
+    "input.accepted": {
+      "description": "The ENGINE's own typed acceptance of an input, produced by a driver's parse and only from the engine's typed signal (its protocol's acknowledgement, or its replay of the user message), never read out of free text. delivery_id is the id the input was written with; turn_id is the turn that took it; how says whether it began a new turn (new_turn, on which the core writes turn.started) or went into the turn in progress (mid_turn). It is what turns a queue item from delivering into delivered, and only when it agrees with the durable binding that was committed before the write (queue.item.v1, $defs/delivery_binding): the core verifies delivery, log, run, turn and how, and a difference in any of them is delivery_mismatch and changes nothing. A concrete write/acceptance must name its target: the event is filed under the turn its payload names. The driver correlates acceptance with its own pending request/protocol token and worker incarnation, not an arbitrary ID read from engine output.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["delivery_id", "turn_id", "how"],
+      "properties": {
+        "delivery_id": {"$ref": "common.v1.json#/$defs/delivery_id"},
+        "turn_id": {"$ref": "common.v1.json#/$defs/turn_id"},
+        "how": {"enum": ["new_turn", "mid_turn"]}
+      }
+    },
+    "interrupt": {
+      "description": "An interrupt was asked, and what came of it. turn_id is the turn it was aimed at, null when the session had no live turn. outcome: 'delivered' (the turn was interrupted), 'fell_back_to_stop' (the driver cannot interrupt, so the run was asked to stop instead and the session is resumed after it), 'no_live_turn'.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turn_id", "requested_by", "outcome"],
+      "properties": {
+        "turn_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]},
+        "requested_by": {"$ref": "common.v1.json#/$defs/principal"},
+        "outcome": {"enum": ["delivered", "fell_back_to_stop", "no_live_turn"]}
+      },
+      "if": {"required": ["outcome"], "properties": {"outcome": {"const": "no_live_turn"}}},
+      "then": {"properties": {"turn_id": {"type": "null"}}},
+      "else": {"properties": {"turn_id": {"type": "string"}}}
+    },
+    "stop.requested": {
+      "description": "A Stop was asked. scope: 'run' (run.stop on one run; run_id names it), 'session' (session.stop on this session), 'subtree' (this session and every session it started). requested_by is who asked.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "requested_by", "scope"],
+      "properties": {
+        "run_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/run_id"}]},
+        "requested_by": {"$ref": "#/$defs/requested_by"},
+        "scope": {"enum": ["run", "session", "subtree"]}
+      },
+      "if": {"required": ["scope"], "properties": {"scope": {"const": "run"}}},
+      "then": {"properties": {"run_id": {"type": "string"}}}
+    },
+    "diff": {
+      "description": "DRAFT, lane WORKSPACE supplies the fields. The workspace changed. The counts are of the change since base_ref; the text of the diff is read with workspace.diff. truncated is true when the counts stopped at a limit.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_ref", "files_changed", "insertions", "deletions", "truncated"],
+      "properties": {
+        "base_ref": {"type": ["string", "null"], "minLength": 1},
+        "files_changed": {"type": "integer", "minimum": 0},
+        "insertions": {"type": "integer", "minimum": 0},
+        "deletions": {"type": "integer", "minimum": 0},
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "checkpoint": {
+      "description": "DRAFT, lane WORKSPACE supplies the fields. A checkpoint of the workspace was taken. ref is the git ref or commit that holds it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkpoint_id", "ref", "label"],
+      "properties": {
+        "checkpoint_id": {"$ref": "common.v1.json#/$defs/token"},
+        "ref": {"type": "string", "minLength": 1, "maxLength": 256, "not": {"pattern": "[\\r\\n]"}},
+        "label": {"type": ["string", "null"]}
+      }
+    },
+    "fork": {
+      "description": "DRAFT, lane WORKSPACE supplies the fields. A new session was forked from this one. at_turn_id is the turn it was forked at: the state after that turn ended.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["child_session_id", "at_turn_id"],
+      "properties": {
+        "child_session_id": {"$ref": "common.v1.json#/$defs/session_id"},
+        "at_turn_id": {"$ref": "common.v1.json#/$defs/turn_id"}
+      }
+    },
+    "workspace.grant": {
+      "description": "DRAFT, lane WORKSPACE supplies the fields. A run was given access to a folder.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "run_id"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "run_id": {"$ref": "common.v1.json#/$defs/run_id"}
+      }
+    },
+    "workspace.revoke": {
+      "description": "DRAFT, lane WORKSPACE supplies the fields. A run's access to a folder was taken away.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "run_id"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "run_id": {"$ref": "common.v1.json#/$defs/run_id"}
+      }
+    },
+    "route.decision": {
+      "description": "Routing chose a route for a run. The routing part of start normalisation returns these fields in the effective launch snapshot and emits nothing itself; the event is written when the run is first logged.",
+      "$ref": "common.v1.json#/$defs/route_decision"
+    },
+    "effect.outcome_unknown": {
+      "description": "DRAFT, lane EVENTS supplies the fields. Something with an effect outside the daemon was in flight when the daemon stopped watching it, and nobody can say whether it happened: for a queued message, delivery outcome unknown; the message may not have been sent. It will not be resent automatically. It is shown to the user and is never retried by itself; it is committed together with the state that quarantines the effect. effect names what it was and which one; why is a typed code: 'turn_ended' is a queued message whose target turn (the turn in progress it was written into, or the new turn allocated for it) ended with no acceptance of it from the engine.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effect", "why"],
+      "properties": {
+        "effect": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": {
+            "kind": {"enum": ["queue_delivery", "approval_answer", "tool_call", "plugin_effect"]},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128, "not": {"pattern": "[\\r\\n]"}}
+          }
+        },
+        "why": {"enum": ["daemon_restart", "engine_gone", "deadline", "turn_ended"]}
+      }
+    }
+  }
+}

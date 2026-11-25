@@ -1,0 +1,21 @@
+{
+  "trusted_keys": {
+    "notes-dev": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+  },
+  "grants": [
+    {
+      "plugin_id": "notes.search",
+      "artifact_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signer_key_id": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "permissions": [
+        "read",
+        "panel"
+      ]
+    }
+  ],
+  "reserved": {
+    "hosts": [],
+    "credential_prefixes": []
+  },
+  "authority_anchor": null
+}

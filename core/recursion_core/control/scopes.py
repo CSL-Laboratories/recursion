@@ -51,7 +51,9 @@ recovery Stop never passes here.
    no ``grant`` field yet (``questions.md``); until it has, token principals hold nothing.
 3. ``scope_of(method)`` reads the method's scope from the method table on every call. A name the table
    does not have runs nothing (the API answers ``method_unknown``); it passes only for a principal holding
-   all four scopes, so their answer is today's, and is refused to everyone else.
+   all four scopes, so their answer is today's, and is refused to everyone else. A method that is not text
+   at all (bytes, an object whose equality says ``run.stop``) has no row and never takes that shortcut: it
+   is refused to every principal, ``method_not_text`` to one holding all four scopes.
 4. A principal without that scope is refused ``scope_refused``, detail ``needs_<scope>``. ``route.list``,
    ``plugin.list`` and ``operator.read`` are ``read`` rows like any other.
 5. ``run.stop``, exactly as the method table's row (4) "Who may Stop" freezes it (PROVISIONAL, the owner's
@@ -72,8 +74,10 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import threading
 import types
 from collections.abc import Callable
+from typing import NamedTuple
 
 from recursion_core.control.credentials import (ALL_SCOPES, PAGE_DEVICE_ID, SCOPE_REFUSED, CredentialStore,
                                                 CredentialStoreError, ceiling)
@@ -115,6 +119,13 @@ class ScopesService:
     the control registry's ``get``. It never raises: a store that cannot be opened, no state directory, or
     a state directory or registry that cannot be read is logged and leaves token principals holding
     nothing (or no run record read), and the daemon still starts. It is ready once it has attached. ``stop`` detaches, so a call after it holds only what owner, internal and the page hold.
+
+    Start and stop are one ordered sequence. ``start`` takes its place in that order when it begins, opens
+    the store and reads the registry outside the order (so ``stop`` never waits for those reads), and then
+    attaches and sets ``ready`` only if no ``stop`` came after its beginning; otherwise it attaches nothing,
+    leaves ``ready`` as it is and logs that the start was set aside. ``stop`` detaches and clears ``ready``
+    in one step of that order. So once ``stop`` has returned, nothing of a start that began before it can
+    attach, open or use the credential store through the authorizer.
     """
 
     name = SERVICE_NAME
@@ -122,8 +133,12 @@ class ScopesService:
     def __init__(self, authorizer: Authorizer) -> None:
         self._authorizer = authorizer
         self.ready = False
+        self._order = threading.Lock()   # start's final step and stop, one at a time
+        self._stops = 0                  # how many stops the order has seen; a start compares it at its end
 
     def start(self, context) -> None:
+        with self._order:
+            began_after = self._stops   # this start's place in the order
         store = None
         try:
             state_dir = getattr(context, "state_dir", None)
@@ -144,12 +159,24 @@ class ScopesService:
             log.error("control.scopes: the control registry cannot be read (%s); no run record is read",
                       type(exc).__name__)
             reader = None
-        self._authorizer.attach(credentials=store, run_record=reader if callable(reader) else None)
-        self.ready = True
+        with self._order:
+            if self._stops != began_after:
+                # A stop came after this start began: what it read belongs to a lifetime that has ended.
+                if self.ready:
+                    log.warning("control.scopes: a start that began before the last stop was not applied; "
+                                "a later start stands")
+                else:
+                    log.warning("control.scopes: a start that began before the last stop was not applied; "
+                                "the service stays stopped")
+                return
+            self._authorizer.attach(credentials=store, run_record=reader if callable(reader) else None)
+            self.ready = True
 
     def stop(self, context) -> None:
-        self.ready = False
-        self._authorizer.attach(credentials=None, run_record=None)
+        with self._order:
+            self._stops += 1
+            self.ready = False
+            self._authorizer.attach(credentials=None, run_record=None)
 
 
 def _same_session(run_session: str, principal_session: str) -> bool:
@@ -164,6 +191,15 @@ def _same_session(run_session: str, principal_session: str) -> bool:
 
 
 _ABSENT = object()   # nothing named grant declared, told apart from a declared grant that cannot be read
+
+
+class _Binding(NamedTuple):
+    """What one call decides from, read once at its top: the credential store, the run reader and the
+    generation of the attach that published them. A call never mixes two attaches."""
+
+    credentials: CredentialStore | None
+    run_record: Callable[[str], dict | None] | None
+    generation: int
 
 
 def _get(mapping, key):
@@ -266,16 +302,29 @@ class Authorizer:
                  page_scopes: frozenset[str] = PAGE_SCOPES) -> None:
         if not callable(scope_of) or not callable(in_subtree):
             raise TypeError("scope_of and in_subtree must be callable")
+        self._lock = threading.Lock()   # attach and the one read of a call: never a half-published binding
         self._scope_of, self._credentials, self._run_record = scope_of, credentials, run_record
+        self._generation = 0
         self._in_subtree = in_subtree
         self._page_scopes = frozenset(page_scopes)   # cut to the device ceiling by held(), like every set
 
     def attach(self, *, credentials: CredentialStore | None, run_record: Callable[[str], dict | None] | None) -> None:
-        """What the service hands over at start (and takes back at stop). A call in flight reads each of the two
-        once, so it sees the old one or the new one, never a store that vanished between two reads (the read of
-        #385 by DeepSeek V4.1 Flash, F4: on 3.14t a stop landing between them raised AttributeError)."""
+        """What the service hands over at start (and takes back at stop), published as ONE binding: the store,
+        the run reader and the next generation together, all or nothing. A call reads the binding once at its
+        top and decides from that one value, so it sees the old pair or the new pair, never the old store with
+        the new run reader, and never a store that vanished between two reads (the read of #385 by DeepSeek
+        V4.1 Flash, F4: on 3.14t a stop landing between them raised AttributeError). Which attach wins is the
+        service's order: start and stop are one sequence there (``ScopesService``)."""
 
-        self._credentials, self._run_record = credentials, run_record
+        with self._lock:
+            self._credentials, self._run_record = credentials, run_record
+            self._generation += 1
+
+    def _binding(self) -> _Binding:
+        """The binding as the last attach published it, read in one step: one call reads it once."""
+
+        with self._lock:
+            return _Binding(self._credentials, self._run_record, self._generation)
 
     def held(self, principal) -> frozenset[str]:
         """The scopes ``principal`` holds now, within its kind's ceiling.
@@ -283,10 +332,10 @@ class Authorizer:
         A credential store that cannot be read raises here (``CredentialStoreError``, or whatever the store
         raised); a call of the authorizer itself turns that into the refusal ``credentials_unavailable``."""
 
-        return self._held(principal, *_identity(principal))
+        return self._held(principal, *_identity(principal), self._binding())
 
-    def _held(self, principal, kind: str | None, pid: str | None) -> frozenset[str]:
-        """``held`` for a kind and id already read once by the caller."""
+    def _held(self, principal, kind: str | None, pid: str | None, binding: _Binding) -> frozenset[str]:
+        """``held`` for a kind and id already read once by the caller, from the caller's one binding."""
 
         try:
             # Each class's own dictionary first, read past any metaclass: a metaclass answering __dict__ hid a
@@ -314,7 +363,7 @@ class Authorizer:
             # Owner and internal come from how a request arrives, never from a token: a principal naming a grant
             # is a token principal, and one that also claims those kinds holds nothing (round 5, DeepSeek F5).
             return frozenset()
-        credentials = self._credentials   # read once: attach may replace it while this call runs
+        credentials = binding.credentials   # the caller's one read: attach may publish another meanwhile
         if kind in ("owner", "internal"):
             held = ALL_SCOPES
         elif grant is not None:
@@ -333,8 +382,9 @@ class Authorizer:
         if _attr(principal, "in_run_unit", True) is not False:
             return (SCOPE_REFUSED, "peer is inside a run unit")
         kind, pid = _identity(principal)   # read once; the whole decision below uses only these (round 6, F1)
+        binding = self._binding()          # read once; held and the Stop fence both decide from it
         try:
-            held = self._held(principal, kind, pid)
+            held = self._held(principal, kind, pid, binding)
         except Exception:  # noqa: BLE001 - a credential store that cannot be read refuses; it never lets through
             log.exception("the credential store could not be read; the call is refused")
             return (SCOPE_REFUSED, "credentials_unavailable")
@@ -344,7 +394,12 @@ class Authorizer:
             # Its text, as a plain str: no __eq__ or __hash__ of a subclass decides which row applies, so a method
             # name that compares unequal cannot step past the Stop row below (round 6, DeepSeek 5).
             method = str.__str__(method)
-        scope = self._scope_of(method) if type(method) is str else None
+        if type(method) is not str:
+            # Not text at all (bytes, an object whose equality says run.stop): no row, and never the shortcut
+            # below, so no principal steps past the Stop row's refusal for its kind. Those holding fewer than
+            # all four scopes keep today's answer.
+            return (SCOPE_REFUSED, "method_not_text" if held >= ALL_SCOPES else "method_not_in_table")
+        scope = self._scope_of(method)
         if scope is None:
             return None if held >= ALL_SCOPES else (SCOPE_REFUSED, "method_not_in_table")
         if type(scope) is not str or scope not in ALL_SCOPES:   # exactly a str (round 5 of #385, DeepSeek F3)
@@ -355,10 +410,10 @@ class Authorizer:
             if "run" not in held:
                 # The Stop row's own rule, whatever the table's scope column says for run.stop.
                 return (SCOPE_REFUSED, "needs_run")
-            return self._stop(kind, pid, params)
+            return self._stop(kind, pid, params, binding)
         return None
 
-    def _stop(self, kind: str | None, pid: str | None, params) -> Verdict:
+    def _stop(self, kind: str | None, pid: str | None, params, binding: _Binding) -> Verdict:
         if kind in ("owner", "device"):
             return None    # with run: any run, including one whose record names no principal
         if kind not in ("session", "plugin"):
@@ -366,7 +421,7 @@ class Authorizer:
         # Each read of params, record and launch is guarded (round 5, DeepSeek F1), and the run named is exactly
         # the text sent (round 6 of #385, DeepSeek F2: a str subclass or a dict subclass chose another record).
         run_id = _exact(_get(params, "run_id"))
-        record, run_record = None, self._run_record   # read once, like the store in held()
+        record, run_record = None, binding.run_record   # the call's one binding, like the store in held()
         if isinstance(run_id, str) and run_record is not None:
             try:
                 record = run_record(run_id)

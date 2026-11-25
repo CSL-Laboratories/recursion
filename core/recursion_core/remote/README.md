@@ -130,6 +130,11 @@ the caller.
 Caps on the forwarded stream, each a setting on the same command line: `--max-frames N` frames in any
 `--window-s S` seconds (first values 300 and 60), `--max-frame-bytes N` (first value 1 MiB, the socket's
 own frame). `none` is no limit. A length over the frame cap is refused before its body is read.
+No frame the relay writes is above its own `--max-frame-bytes`, at any value: an answer of its own that
+does not fit is written without the request's id (`;id_left_out`), then without its named fields, then
+with only its code, layer and delivered word, so that the delivered word always reaches the client.
+The least value is `RELAY_LEAST_FRAME_BYTES`, the bytes of the relay's longest code written that way (a
+figure of the frame's format); a smaller value is refused at the start, naming that figure.
 
 The frame window holds for the key, across every session it opens (`--cap-scope key`, the first value):
 the client opens a fresh session per call, and more sessions let no more frames through. A key is named

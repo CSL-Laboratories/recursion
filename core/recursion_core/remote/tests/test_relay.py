@@ -25,6 +25,7 @@ from pathlib import Path
 from recursion_core.control_transport import FrameError, InsecureSocketPath, RemoteBindRefused, UnixControlClient
 from recursion_core.control_transport.framing import HEADER, MAX_FRAME_BYTES, encode_frame
 from recursion_core.remote import codec
+from recursion_core.remote import relay as relay_module
 try:  # names this round adds; imported so that, without them, only the tests that use them fail
     from recursion_core.control.client import state_directory
     from recursion_core.remote import relay_store
@@ -1283,12 +1284,14 @@ class RelayDeliveredWordTests(unittest.TestCase):
 
     def test_an_answer_too_large_even_without_its_id_keeps_delivery_unknown(self) -> None:
         daemon = support.SocketDaemon(self)
-        relay = Relay(environ=daemon.environ, connect=ResetAfterConnect, max_frame_bytes=64, max_frames=None,
+        least = relay_module.RELAY_LEAST_FRAME_BYTES
+        relay = Relay(environ=daemon.environ, connect=ResetAfterConnect, max_frame_bytes=least, max_frames=None,
                       record_max=0)
-        request = of_body({"op": "ping"}, 64)
+        request = of_body({"op": "ping"}, least)
         code, answers = served(relay, request)
         self.assertEqual(code, EXIT_OK)
-        self.assertEqual(answers, [codec.relay_error("response_too_large", delivered="unknown", request=request)])
+        self.assertEqual(answers, [{"ok": False, "error": {"code": codec.UNAVAILABLE, "layer": "relay",
+                                                           "delivered": "unknown"}}])
 
     def test_a_request_at_the_frame_limit_still_gets_its_refusal_not_delivered(self) -> None:
         daemon = support.SocketDaemon(self)
@@ -1328,6 +1331,140 @@ class RelayDeliveredWordTests(unittest.TestCase):
         self.assertEqual(codec.relay_error("bad_frame", delivered=False, request=request, max_bytes=512)["error"]
                          ["detail"], codec.ID_LEFT_OUT)
         self.assertEqual(codec.relay_error("bad_frame", delivered=False, request=request)["id"], "i" * 600)
+
+
+def body_length(message: dict) -> int:
+    return len(encode_frame(message, max_bytes=1 << 30)) - HEADER.size
+
+
+def bodies(data: bytes) -> list[bytes]:
+    """The raw bodies of the frames in ``data``, as written (none is read through a limit)."""
+    out, at = [], 0
+    while at < len(data):
+        (size,) = HEADER.unpack(data[at:at + HEADER.size])
+        out.append(data[at + HEADER.size:at + HEADER.size + size])
+        at += HEADER.size + size
+    return out
+
+
+class SizedReply:
+    """A socket client whose daemon answers every request with a reply of ``length`` bytes of body, its id copied."""
+
+    length = 0
+
+    def __call__(self, path, timeout_s):
+        return self
+
+    def request(self, message):
+        reply = {"ok": True, "result": "", "id": message.get("id")}
+        reply["result"] = "r" * (self.length - body_length(reply))
+        return reply
+
+    def close(self):
+        pass
+
+
+class EchoReply(SizedReply):
+    """A socket client whose daemon answers with a short result and the request's own id, whatever its size."""
+
+    def request(self, message):
+        return {"ok": True, "result": "r" * 16, "id": message.get("id")}
+
+
+def raises_inside(path, timeout_s):
+    raise RuntimeError("a fault of the relay's own code")
+
+
+# Test figures: the frame sizes swept (the shipped first value last) and the offsets of the sizes swept around each.
+SWEEP_LIMITS = (256, 512, 1024, 4096, relay_module.RELAY_MAX_FRAME_BYTES)
+SWEEP_OFFSETS = tuple(range(-64, 9))
+
+
+@unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
+class RelayFrameLimitTests(unittest.TestCase):
+    """No frame the relay writes is above the frame size it was set to, and the client at that size reads the
+    delivered word the relay wrote."""
+
+    def sweep(self, limits) -> tuple[list, list]:
+        daemon = support.SocketDaemon(self)
+        over, words = [], []
+        for limit in limits:
+            sized = SizedReply()
+            relays = {name: Relay(environ=daemon.environ, connect=connect, max_frame_bytes=limit, max_frames=None,
+                                  record_max=0)
+                      for name, connect in (("daemon", sized), ("echo", EchoReply()), ("reset", ResetAfterConnect),
+                                            ("inside", raises_inside), ("scope", raises_inside))}
+            for offset in SWEEP_OFFSETS:
+                size = limit + offset
+                cases = []
+                if size >= body_length({"ok": True, "result": "", "id": 7}):
+                    cases.append(("daemon", {"op": "ping", "id": 7}, True, EXIT_OK))
+                if size >= body_length({"op": "ping", "id": ""}):
+                    if size <= limit:
+                        cases += [("echo", of_body({"op": "ping"}, size), True, EXIT_OK),
+                                  ("reset", of_body({"op": "ping"}, size), "unknown", EXIT_OK),
+                                  ("inside", of_body({"op": "ping"}, size), "unknown", EXIT_OK),
+                                  ("scope", of_body({"op": "x"}, size), False, EXIT_OK)]
+                    else:
+                        cases.append(("reset", of_body({"op": "ping"}, size), False, EXIT_STREAM))
+                for name, request, word, exit_code in cases:
+                    sized.length = size
+                    out = io.BytesIO()
+                    code = relays[name].serve(io.BytesIO(encode_frame(request, max_bytes=1 << 30)), out)
+                    written = bodies(out.getvalue())
+                    if len(written) != 1 or code != exit_code or len(written[0]) > limit:
+                        over.append((name, limit, offset, code, [len(body) for body in written]))
+                        continue
+                    try:  # the client's own reader, at the same frame size
+                        answer = codec.read_message(io.BytesIO(out.getvalue()), max_bytes=limit)
+                    except FrameError as exc:
+                        words.append((name, limit, offset, str(exc)))
+                        continue
+                    delivered = True if answer.get("ok") is True else answer["error"]["delivered"]
+                    if delivered != word:
+                        words.append((name, limit, offset, delivered))
+        return over, words
+
+    def test_no_frame_the_relay_writes_is_above_its_own_limit_at_any_setting(self) -> None:
+        over, words = self.sweep(SWEEP_LIMITS)
+        self.assertEqual(over, [])
+        self.assertEqual(words, [])
+
+    def test_at_the_least_frame_size_every_answer_still_carries_its_code_and_delivered_word(self) -> None:
+        least = relay_module.RELAY_LEAST_FRAME_BYTES
+        self.assertEqual(self.sweep((least, least + 1)), ([], []))
+
+    def test_a_frame_size_below_the_relays_shortest_answer_is_refused_at_the_start(self) -> None:
+        least = relay_module.RELAY_LEAST_FRAME_BYTES
+        daemon = support.SocketDaemon(self)
+        for limit in (1, 64, least - 1):
+            with self.subTest(limit=limit):
+                with self.assertRaises(ValueError) as caught:
+                    Relay(environ=daemon.environ, max_frame_bytes=limit)
+                self.assertIn(f"{limit} is below {least}", str(caught.exception))
+                out, err = io.BytesIO(), io.StringIO()
+                code = main(["relay", "--max-frame-bytes", str(limit)], environ=daemon.environ,
+                            stdin=io.BytesIO(frames(control("run.list", 1))), stdout=out, stderr=err)
+                self.assertEqual((code, out.getvalue()), (EXIT_REFUSED, b""))
+                self.assertIn(f"--max-frame-bytes) {limit} is below {least}", err.getvalue())
+        self.assertIsInstance(Relay(environ=daemon.environ, max_frame_bytes=least), Relay)
+        self.assertEqual(daemon.seen, [])
+
+    def test_a_relay_error_too_large_for_the_frame_keeps_its_first_reason(self) -> None:
+        least = relay_module.RELAY_LEAST_FRAME_BYTES
+        for error in (codec.relay_error("scope_refused", delivered=False, detail="method_not_in_table",
+                                        request={"id": "i" * 300}, fields={"method": "m" * 64, "needs": "all"}),
+                      codec.relay_error("response_too_large", delivered=True, request={"id": 7})):
+            for limit in (least, least + 16, 128, 256, 512):
+                with self.subTest(code=error["error"]["code"], limit=limit):
+                    answer = codec.fitted(error, max_bytes=limit)
+                    self.assertLessEqual(body_length(answer), limit)
+                    self.assertEqual((answer["error"]["code"], answer["error"]["delivered"]),
+                                     (error["error"]["code"], error["error"]["delivered"]))
+        self.assertIsNone(codec.fitted({"ok": True, "result": "r" * 512}, max_bytes=256))
+        refusal = codec.relay_error("scope_refused", delivered=False, detail="method_not_in_table",
+                                    request={"id": "i" * 300}, fields={"method": "m" * 64, "needs": "all"})
+        self.assertEqual(codec.fitted(refusal, max_bytes=400), codec.without_id(refusal))  # only the id goes
 
 
 if __name__ == "__main__":

@@ -262,6 +262,28 @@ def without_id(reply: Message) -> Message:
     return shorter
 
 
+def fitted(reply: Message, *, max_bytes: int = MAX_FRAME_BYTES) -> Message | None:
+    """``reply`` as it can be written in a frame of at most ``max_bytes``, or ``None`` when it cannot.
+
+    A relay error keeps its code and its delivered word whatever the frame size: it is written as it is,
+    else without its id (``without_id``), else without the named fields it adds, else with only its code,
+    layer and delivered word. Any other reply is written as it is or not at all (``None``).
+    """
+    candidates = [reply]
+    error = relay_error_of(reply)
+    if error is not None:
+        shorter = without_id(reply) if "id" in reply else reply
+        candidates.append(shorter)
+        kept = {key: value for key, value in shorter["error"].items()
+                if key in ("code", "layer", "delivered", "detail")}
+        candidates.append({"ok": False, "error": kept})
+        candidates.append({"ok": False, "error": {key: error[key] for key in ("code", "layer", "delivered")}})
+    for candidate in candidates:
+        if frame_refusal(candidate, max_bytes=max_bytes) is None:
+            return candidate
+    return None
+
+
 def relay_error_of(reply: Message) -> dict[str, Any] | None:
     """The relay's own error in ``reply``, or ``None`` when the reply is not one."""
     if not isinstance(reply, dict) or reply.get("ok") is not False:

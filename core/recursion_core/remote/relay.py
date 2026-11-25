@@ -84,12 +84,12 @@ from recursion_core.control.client import DEFAULT_TIMEOUT_S, socket_path as defa
 from recursion_core.control_transport.errors import (FrameError, InsecureSocketPath, PeerNotAdmitted,
                                                      PlatformNotSupported, RemoteBindRefused, TransportBusy,
                                                      TransportRefused)
-from recursion_core.control_transport.framing import MAX_FRAME_BYTES
+from recursion_core.control_transport.framing import HEADER, MAX_FRAME_BYTES, encode_frame
 from recursion_core.control_transport.unix import UnixControlClient, refuse_remote_bind, require_unix_transport
 
-from .codec import (BUSY_MESSAGE, HELLO_OP, NOT_ADMITTED_MESSAGE, RELAY_OP_PREFIX, RELAY_VERSION, UNAVAILABLE,
-                    Message, RefusedFrame, ascii_text, copyable_id, daemon_reply, frame_refusal, read_message,
-                    relay_error, relay_error_of, without_id, write_message)
+from .codec import (BUSY_MESSAGE, DELIVERED_VALUES, HELLO_OP, NOT_ADMITTED_MESSAGE, RELAY_LAYER, RELAY_OP_PREFIX,
+                    RELAY_VERSION, UNAVAILABLE, Message, RefusedFrame, ascii_text, copyable_id, daemon_reply, fitted,
+                    frame_refusal, read_message, relay_error, relay_error_of, write_message)
 from .pairing import DEVICE_SCOPES, PairingRefused, device_scopes
 from .relay_store import KeyWindow, RefusalRecord, relay_folder
 from .rights import NEEDS_ALL, key_rights, needs
@@ -119,6 +119,15 @@ UNNAMED_KEY = "unnamed"
 # A frame the relay may read (a --max-frame-bytes above the socket's frame) that the socket client refuses
 # before a byte is sent: refused here, not delivered.
 SOCKET_FRAME_TOO_LARGE = "frame_too_large_for_socket"
+# The codes of the relay's own answers. The least frame size the relay can be set to is the body of the
+# longest of them with only its code, layer and delivered word: a figure of the frame's format, derived here,
+# not a person's setting. Below it no answer could be written within the limit, so such a size is refused
+# at the start; at or above it no frame the relay writes is ever above its own limit (``fitted``).
+RELAY_CODES = ("bad_frame", "unknown_relay_op", "scope_refused", "relay_internal_error", "rate_limited", UNAVAILABLE,
+               "response_too_large", "response_not_encodable")
+RELAY_LEAST_FRAME_BYTES = max(
+    len(encode_frame({"ok": False, "error": {"code": code, "layer": RELAY_LAYER, "delivered": delivered}}))
+    - HEADER.size for code in RELAY_CODES for delivered in DELIVERED_VALUES)
 
 Connect = Callable[..., Any]
 
@@ -237,6 +246,10 @@ class Relay:
         self._timeout_s = _positive_number(timeout_s, "timeout_s")
         if max_frame_bytes is not None and (type(max_frame_bytes) is not int or max_frame_bytes < 1):
             raise ValueError("max_frame_bytes must be a positive integer, or None for no limit")
+        if max_frame_bytes is not None and max_frame_bytes < RELAY_LEAST_FRAME_BYTES:
+            raise ValueError(f"max_frame_bytes (--max-frame-bytes) {max_frame_bytes} is below "
+                             f"{RELAY_LEAST_FRAME_BYTES}, the bytes the relay's shortest answer takes: set "
+                             f"{RELAY_LEAST_FRAME_BYTES} or more, or none for no limit of the relay's own")
         self.max_frames = _cap(max_frames, "max_frames", 0)
         if isinstance(window_s, bool) or not isinstance(window_s, (int, float)) or not math.isfinite(window_s) \
                 or not window_s > 0:
@@ -442,23 +455,26 @@ class Relay:
     def _unframed(self, reply: Message, request: Message, delivered: bool | str, exc: Exception) -> Message:
         """What is written in place of an answer that cannot be framed.
 
-        The relay's own error that does not fit only because of the id it copied is written without the id,
-        its detail saying so, so that the first reason stands (a refusal stays that refusal). Any other
-        answer becomes ``response_too_large`` (or ``response_not_encodable``) with what is known of the
-        request: ``delivered`` true only when the daemon's reply was read, ``"unknown"`` when the request may
-        have reached the daemon and no reply was read, false when nothing was sent.
+        The relay's own error stays that error, so that the first reason stands (a refusal stays that
+        refusal): ``_write_quietly`` makes it fit. Any other answer becomes ``response_too_large`` (or
+        ``response_not_encodable``) with what is known of the request: ``delivered`` true only when the
+        daemon's reply was read, ``"unknown"`` when the request may have reached the daemon and no reply was
+        read, false when nothing was sent.
         """
-        if relay_error_of(reply) is not None and "id" in reply:
-            shorter = without_id(reply)
-            if frame_refusal(shorter, max_bytes=self._max_frame_bytes) is None:
-                return shorter
+        if relay_error_of(reply) is not None:
+            return reply
         code = "response_too_large" if isinstance(exc, FrameError) else "response_not_encodable"
         return relay_error(code, delivered=delivered, request=request)
 
-    @staticmethod
-    def _write_quietly(stdout: BinaryIO, message: Message) -> bool:
+    def _write_quietly(self, stdout: BinaryIO, message: Message) -> bool:
+        """Write the relay's own error within the relay's own frame limit (``fitted``); false when the stream
+        broke. Its code and delivered word are always written: the limit is never below
+        ``RELAY_LEAST_FRAME_BYTES``."""
+        answer = fitted(message, max_bytes=self._max_frame_bytes)
+        if answer is None:
+            return False
         try:
-            write_message(stdout, message)
+            write_message(stdout, answer, max_bytes=self._max_frame_bytes)
         except (OSError, ValueError):
             return False
         return True

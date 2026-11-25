@@ -915,6 +915,44 @@ class Lingers(PipeProc):
         return super().wait()
 
 
+class RelayBehindPipe(PipeProc):
+    """The ssh child as a real ``Relay``: each whole request is served by it and its frames go to the pipe as
+    written, so that the client reads exactly the relay's bytes."""
+
+    def __init__(self, relay, **options) -> None:
+        super().__init__(**options)
+        self._relay, self._pending, self.answered = relay, bytearray(), []
+
+    def write(self, data):
+        self._pending += bytes(data)
+        while len(self._pending) >= 4 and len(self._pending) >= 4 + int.from_bytes(self._pending[:4], "big"):
+            size = int.from_bytes(self._pending[:4], "big")
+            frame = bytes(self._pending[:4 + size])
+            del self._pending[:4 + size]
+            if json.loads(frame[4:]).get("op") == "relay_hello":
+                continue
+            out = io.BytesIO()
+            self._relay.serve(io.BytesIO(frame), out)
+            self.answered.append(len(out.getvalue()) - 4)
+            with self._exit_lock:
+                if self._write_end is not None:
+                    os.write(self._write_end, out.getvalue())
+        return len(data)
+
+
+class TooLargeReply:
+    """A socket client whose daemon answers with a result and the request's own id: too large when the id is."""
+
+    def __call__(self, path, timeout_s):
+        return self
+
+    def request(self, message):
+        return {"ok": True, "result": "r" * 64, "id": message.get("id")}
+
+    def close(self):
+        pass
+
+
 class ReplyIdAndCloseGraceTests(unittest.TestCase):
     REQUEST = {"op": "control", "method": "run.stop", "params": {"run_id": "r"}, "id": 1}
 
@@ -943,6 +981,22 @@ class ReplyIdAndCloseGraceTests(unittest.TestCase):
         worker.join(SHORT_WATCHDOG_S)
         self.assertFalse(worker.is_alive(), "the call outlived the watchdog")
         return outcome[0], time.monotonic() - started
+
+    def test_a_relay_and_client_at_a_small_frame_size_read_an_answer_too_large_as_carried_out(self) -> None:
+        from recursion_core.remote.relay import Relay
+        daemon = support.SocketDaemon(self)
+        for limit in (512, 4096):
+            with self.subTest(limit=limit):
+                relay = Relay(environ=daemon.environ, connect=TooLargeReply(), max_frame_bytes=limit, max_frames=None,
+                              record_max=0)
+                proc = RelayBehindPipe(relay)
+                # The request's id is as long as the frame allows, so that an answer copying it cannot fit.
+                request = {**self.REQUEST, "id": "i" * (limit - len(encode_frame({**self.REQUEST, "id": ""})) + 4)}
+                reply = self.client(proc, max_frame_bytes=limit).request(request)
+                self.assertEqual((reply["error"]["code"], reply["error"]["delivered"]), ("response_too_large", True))
+                self.assertEqual(len(proc.answered), 1)
+                self.assertLessEqual(proc.answered[0], limit)
+        self.assertEqual(daemon.seen, [])
 
     def test_a_reply_id_must_equal_the_requests_in_type_and_value(self) -> None:
         cases = ((None, {}), (1, {"id": True}), (1, {"id": 1.0}), (True, {"id": 1}), (1, {}), (1, {"id": 2}),

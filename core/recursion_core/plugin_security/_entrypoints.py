@@ -47,7 +47,7 @@ from pathlib import Path
 from .install import (InstallRefused, NothingChanged, disable_plugin, enable_plugin, install_plugin,
                       list_plugins, quarantine_accept, quarantine_drop, quarantine_list, remove_plugin,
                       rollback_generation, unpin_plugin)
-from .registry_source import install_from_registry, split_registry
+from .registry_source import install_from_registry, list_not_wired, shown_lines, split_registry
 
 __all__ = ["main"]
 
@@ -90,6 +90,8 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument("--registry", help="<address>@<full commit>, or a registry folder")
     install.add_argument("--plugin")
     install.add_argument("--version")
+    install.add_argument("--allow-withdrawn", metavar="VERSION",
+                         help="install this one withdrawn release, named again by its version")
     install.add_argument("--git", help="local bare repository")
     install.add_argument("--config")
     install.add_argument("--state")
@@ -130,6 +132,11 @@ def _parser() -> argparse.ArgumentParser:
     unpin.add_argument("plugin_id")
     unpin.add_argument("--config")
     unpin.add_argument("--state")
+
+    registry = commands.add_parser("registry")
+    registry.error = _error  # type: ignore[method-assign]
+    registry.add_argument("action", choices=("list", "add", "remove", "pin"))
+    registry.add_argument("words", nargs="*")
 
     quarantine = commands.add_parser("quarantine")
     quarantine.error = _error  # type: ignore[method-assign]
@@ -185,7 +192,8 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None, stdin=None
     try:
         args = _parser().parse_args(argv)
     except _Usage as exc:
-        err.write(f"usage: recursion plugin install|list|remove|enable|disable|rollback|unpin|quarantine ({exc})\n")
+        err.write(f"usage: recursion plugin install|list|remove|enable|disable|rollback|unpin|quarantine|registry "
+                  f"({exc})\n")
         return 2
     said = []
 
@@ -229,7 +237,13 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None, stdin=None
                 result = install_plugin(_config_dir(args.config), args.registry, plugin_id, **options)
             else:
                 result = install_from_registry(_config_dir(args.config), plugin_id, registry=args.registry,
-                                               **options)
+                                               allow_withdrawn=args.allow_withdrawn, **options)
+                if result.get("result") != "quarantined":
+                    for line in shown_lines(result):
+                        err.write(f"{line}\n")
+        elif args.command == "registry":
+            # The registry list lives in the person's settings file, which this build does not read yet.
+            raise list_not_wired(f"recursion plugin registry {args.action}")
         elif args.command == "list":
             result = list_plugins(_config_dir(args.config), state=_state_dir(args.state))
         elif args.command == "enable":

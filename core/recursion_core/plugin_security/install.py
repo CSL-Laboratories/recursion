@@ -312,8 +312,12 @@ class Snapshot:
 def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, plugin_id: str, *,
                    version: str | None = None, state: os.PathLike | str | None = None, wait: bool = True,
                    git_repository: str | None = None, report_kept=None, confirm=None,
-                   write_grant: bool | None = None, confirm_grant=None) -> dict:
+                   write_grant: bool | None = None, confirm_grant=None, refuse_withdrawn: bool = False,
+                   allow_withdrawn: str | None = None) -> dict:
     """Check ``registry_root``, then write the release as the next generation.
+
+    ``refuse_withdrawn`` True (the install by registry) refuses a withdrawn release, with its status and
+    reason, unless ``allow_withdrawn`` names that same version: the person's explicit step.
 
     ``git_repository`` is a local bare path. The fetch, and every refusal of
     that fetch, finishes before the profile lock. A refusal does not fall
@@ -352,6 +356,11 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
     if version is not None and type(version) is not str:
         raise InstallRefused("release_not_in_registry")
     chosen = _select(report, plugin_id, version)
+    if refuse_withdrawn and chosen.status == "withdrawn" and allow_withdrawn != chosen.version:
+        raise InstallRefused("release_withdrawn", detail=(
+            f"The release {chosen.version} of {plugin_id} is withdrawn: {chosen.status_reason or 'no reason given'}. "
+            f"Nothing was installed. To install it anyway, name it with --version {chosen.version} "
+            f"--allow-withdrawn {chosen.version}."), show_detail=True)
     artifact = chosen.artifact
     fetched = False
     if git_repository is not None or artifact is None:

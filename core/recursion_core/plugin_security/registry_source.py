@@ -15,15 +15,23 @@ no other registry is tried in its place.
 from __future__ import annotations
 
 import os
+import re
 
 from .git_source import SourceRefused, registry_address, registry_checkout
 from .install import InstallRefused, install_plugin
 
-__all__ = ["install_from_registry", "registry_words", "split_registry"]
+__all__ = ["install_from_registry", "list_not_wired", "registry_words", "shown_lines", "split_registry"]
 
 # The most lines of a registry's failed check that one refusal prints. It becomes a row of the person's
 # settings file once that file is on this base; until then its shipped first value stands here.
 _MAX_FINDINGS_SHOWN = 20
+# A registry's name in the list (registry_list.py): a short lowercase word with no slash.
+_LIST_NAME = re.compile(r"[a-z][a-z0-9_.-]{0,63}")
+
+
+def list_not_wired(what: str) -> InstallRefused:
+    """The refusal of a command that would read or rewrite the registry list, which no file holds yet."""
+    return _refused("registry_list_not_wired", given=what)
 
 # What stopped the person and what to do next, for each refusal of this module. ``{given}`` is the
 # registry as the person named it, ``{address}`` as it was read, ``{commit}`` the commit, ``{path}`` the file.
@@ -34,6 +42,10 @@ _WORDS = {
     "registry_check_failed": (
         "The registry {given} did not pass its check, so nothing was installed. Each file "
         "and the rule it broke is below. Ask the registry's keepers, or name another registry."),
+    "registry_list_not_wired": (
+        "The list of registries lives in your settings file, and this recursion does not read that file "
+        "yet, so the list was neither read nor changed ({given}). Name the registry for each install "
+        "with --registry <address>@<full commit> or --registry <folder>."),
     "registry_commit_refused": (
         "The registry {given} is not named at a full commit. Name it as <address>@<the 40-character "
         "commit id>: a branch, a tag or a short id can move, so it is not read."),
@@ -77,6 +89,17 @@ _FROM_SOURCE = {
 }
 
 
+def shown_lines(result: dict) -> list:
+    """What a person reads after an install by registry: the label, the requested permissions, the status."""
+    lines = [f"Registry label: {result.get('registry_label')} (a label, not a gate).",
+             "Requested permissions (requested by the release, not enforced by this install): "
+             + (", ".join(result.get("requested_permissions") or ()) or "none") + "."]
+    if result.get("status") in ("deprecated", "withdrawn"):
+        reason = (result.get("status_reason") or "no reason given").rstrip(".")
+        lines.append(f"This release is {result['status']}: {reason}.")
+    return lines
+
+
 def registry_words(code: str, **values: str) -> str:
     """The sentence a person reads for ``code``, with the values filled in."""
     filled = {"given": "", "address": "", "commit": "", "path": ""}
@@ -104,13 +127,17 @@ def split_registry(value: object) -> tuple[str, str, str | None]:
         return "pinned", head, tail
     if networked:
         raise _refused("registry_commit_refused", given=value)
+    if _LIST_NAME.fullmatch(value) is not None and not os.path.lexists(value):
+        # A registry named by its name in the list: the list lives in the settings file, not read yet.
+        raise _refused("registry_list_not_wired", given=value)
     return "folder", value, None
 
 
 def _checked_install(config, root, plugin_id, given, commit, **options) -> dict:
     """``install_plugin`` on ``root``; a registry that fails its check is refused with each file named."""
     try:
-        return install_plugin(config, root, plugin_id, **options)
+        # A withdrawn release is refused unless the person named it (allow_withdrawn) for this install.
+        return install_plugin(config, root, plugin_id, refuse_withdrawn=True, **options)
     except InstallRefused as exc:
         findings = getattr(exc, "findings", None)
         if not findings:

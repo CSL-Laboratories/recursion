@@ -1,0 +1,8 @@
+{
+  "method": "run.start",
+  "params": {
+    "tenant": "t1",
+    "engine": "claude_code",
+    "client_key": "k-1"
+  }
+}

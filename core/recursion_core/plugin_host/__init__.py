@@ -226,6 +226,11 @@ def _check_json(value):
     raise TypeError("expected a JSON value")
 
 
+# The words of a core request made inside another one's wait on the same thread (a ChannelReentered).
+_NESTED = ("core requests do not nest: an earlier core request of this plugin is still waiting for its answer; "
+           "make this request after that one returns")
+
+
 class _Program:
     def __init__(self, channel, probe):
         self._channel, self._probe = channel, probe
@@ -351,17 +356,22 @@ class _Program:
     def _relay_core(self, request: bytes) -> bytes:
         """Send one core request for the plugin and return the daemon's answer.
 
-        Core requests do not nest. While one waits for its answer, a second one on the same thread
-        (plugin code that a trace function or a signal handler runs inside that wait) is refused at the
-        plugin's own call before anything is sent or read, so it never waits on the channel or on a
-        lock below it; the first request still gets its own answer, and a request made after it
-        returns is sent as usual.
+        ONE RULE for a request made from inside another on the same thread (plugin code that a trace or
+        profile function, a signal handler or a finalizer runs): while a core request waits for its
+        answer, or while this thread is inside the channel end's own section, a core request is refused at
+        the plugin's own call with ``hc.ChannelReentered`` (a ``RuntimeError``) before anything is sent or
+        read, so it never waits on the channel or on the end's lock and no answer comes late; the request
+        the thread was busy with still gets its own answer, and a request made after it returns is sent
+        as usual with the next id. A refusal of this request that arrives is raised as
+        ``hc.ChannelRefusal`` whatever its code: a code this release does not list is kept as it came
+        (``known`` is then False).
         """
         if get_ident() != self._thread:
             raise RuntimeError("core requests run on the plugin dispatch thread")
         if self._core_pending:
-            raise RuntimeError("core requests do not nest: an earlier core request of this plugin is still "
-                               "waiting for its answer; make this request after that one returns")
+            raise hc.ChannelReentered(_NESTED)
+        if self._end._inside():
+            raise hc.ChannelReentered()
         if self._closed:
             raise EOFError("plugin channel ended")
         if type(request) is not bytes:
@@ -375,7 +385,7 @@ class _Program:
                 if kind == "core" and message["id"] == id_:
                     return base64.b64decode(message["bytes_b64"])
                 if kind == "refusal" and message["id"] == id_:
-                    raise hc.ChannelRefusal(message["code"], message["detail"])
+                    raise hc._read_refusal(message)
                 if kind in ("call", "load"):
                     self._deferred.append(message)
                 else:

@@ -481,6 +481,11 @@
       "shows": "The installer recorded verified for one manifest's bytes and non_verified for another's. The label is not a grant."
     },
     {
+      "file": "good/install.v1/h06-a-pin-for-a-signed-plugin.json",
+      "schema": "install.v1.json",
+      "shows": "A plugin installed signed is pinned to its signing key and version: a release of it that is unsigned, fails its check or is signed by a key not on the trusted list is refused."
+    },
+    {
       "file": "bad/install.v1/b01-a-field-the-reader-does-not-know.json",
       "schema": "install.v1.json",
       "rule": "Today's reader refuses a top-level field it does not know. registry_labels is a field it knows; any other new field is still refused.",
@@ -559,6 +564,15 @@
       "expect": {
         "keyword": "enum",
         "at": "/registry_labels/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "file": "bad/install.v1/b11-a-pin-with-a-member-nobody-defined.json",
+      "schema": "install.v1.json",
+      "rule": "A pin holds the signing key id and the version, and nothing else.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/pins/notes.search"
       }
     },
     {

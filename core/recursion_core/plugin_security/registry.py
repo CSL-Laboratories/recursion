@@ -122,6 +122,8 @@ class CheckedRelease:
     signature: bytes | None
     signature_text: str | None
     declared_signature: bool
+    status_reason: str | None = None
+    in_examples: bool = False
     source_commit: str | None = None
     source_path: str | None = None
     source_repository: str | None = None
@@ -561,7 +563,7 @@ def _declared_signature(release: dict) -> tuple[object, bool]:
 
 
 def _check_release_directory(report: Report, tree: _Tree, release_dir: str, entry_plugin_id: object,
-                             release: dict) -> None:
+                             release: dict, in_examples: bool = False) -> None:
     files: dict[str, str] = {}
     for name, path, kind in tree.children(release_dir):
         if kind == "link":
@@ -649,7 +651,9 @@ def _check_release_directory(report: Report, tree: _Tree, release_dir: str, entr
             release["status"] if type(release.get("status")) is str else "",
             release["label"] if type(release.get("label")) is str else "",
             raw, artifact_bytes, signature_bytes, signature_text if signature_ok else None,
-            declared is not None, _source_part(release, "commit"), _source_part(release, "path"),
+            declared is not None,
+            release["status_reason"] if type(release.get("status_reason")) is str else None,
+            in_examples, _source_part(release, "commit"), _source_part(release, "path"),
             _source_part(release, "repository"), _hex64_or_none(release.get("manifest_sha256")),
             _hex64_or_none(release.get("artifact_sha256"))))
 
@@ -749,7 +753,7 @@ def _check_entry(report: Report, tree: _Tree, entry_dir: str, in_examples: bool)
                     continue
                 report.error(release_dir, "release_directory_missing")
                 continue
-            _check_release_directory(report, tree, release_dir, plugin_id, release)
+            _check_release_directory(report, tree, release_dir, plugin_id, release, in_examples)
     for name, path in subdirs.items():
         if name not in named:
             report.error(path, "entry_release_unlisted")
@@ -802,9 +806,32 @@ def _check_index(report: Report, tree: _Tree, registry: str, entries: list) -> N
         report.error(path, "index_stale")
 
 
+def platform_gap() -> str | None:
+    """The first name the registry reads need that this platform lacks, or None when it has them all."""
+    if os.name == "nt":
+        return "os.name posix"
+    for name in ("O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC"):
+        if not hasattr(os, name):
+            return name
+    # By name: the sets hold the platform's own functions, and a caller may stand in for os.open.
+    if not {"open", "stat"} <= {getattr(item, "__name__", "") for item in os.supports_dir_fd}:
+        return "dir_fd"
+    if "listdir" not in {getattr(item, "__name__", "") for item in os.supports_fd}:
+        return "listdir of a descriptor"
+    return None
+
+
 def check_registry(root: str | os.PathLike) -> Report:
     """Check ``root`` (the folder that contains ``registry/``) and return the report."""
     text = os.fspath(root)
+    # The marketplace checker's code for a system that cannot open a directory without following
+    # links. The report comes back before the root or any child is opened.
+    missing = platform_gap()
+    if missing is not None:
+        report = Report(os.path.abspath(text))
+        report.error(".", "root_unavailable",
+                     f"this system cannot open a directory without following links ({missing} is missing)")
+        return report
     try:
         tree = _Tree(text)
     except _RootUnavailable as exc:

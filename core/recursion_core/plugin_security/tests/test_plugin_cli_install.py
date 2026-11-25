@@ -40,7 +40,7 @@ DEVELOPER_PHRASES = (
     "stall other work",
     "GIL",
     "untrusted plugin config folder refuses every plugin",
-    "revocation store that goes missing after first install fails closed",
+    "missing revocation store reads as empty",
     "a label, not a gate",
     "loads as unsigned",
 )
@@ -396,6 +396,7 @@ class InstallCommandTests(ProfileCase):
         text = "\n".join(result["developer_checks"])
         for phrase in DEVELOPER_PHRASES:
             self.assertIn(phrase, text)
+        self.assertIn("A missing revocation store reads as empty: no key counts as revoked.", result["developer_checks"])
         self.assertIn("by hand", text)
         self.assertIn("warning", text)
         shown = self.listed()
@@ -528,8 +529,9 @@ class InstallCommandTests(ProfileCase):
 
         install_mod._copy_generation_to_live = boom
         try:
-            with self.assertRaises(OSError):
+            with self.assertRaises(install_mod.InstallRefused) as caught:
                 self.install()
+            self.assertEqual("filesystem_refused", caught.exception.code)
         finally:
             install_mod._copy_generation_to_live = real
         self.assertFalse((self.config / "plugins" / "fixture.unsigned").exists())

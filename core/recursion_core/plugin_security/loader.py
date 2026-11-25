@@ -53,7 +53,14 @@ PACKAGE_FOLDER_NOT_A_FOLDER_TEXT = ("the plugin's folder is missing, is a symbol
                                     "give the folder itself, or install the package again from its source.")
 GRANT_UNBOUND_TEXT = ("The grant for this plugin in install.json names no developer key ID (developer_key_id), so the "
                       "plugin was not loaded and none of its code ran. Make the grant again with developer_key_id set "
-                      "to this plugin's developer key ID, then load the plugin again.")
+                      "to this plugin's developer key ID, then load the plugin again. This manifest is not signed, so "
+                      "the ID is never taken from it: the plugin's developer gives it (ed25519: and 32 lower-case hex "
+                      "digits).")
+# A signed manifest: the loader holds the developer key ID it verified, so the words name it.
+GRANT_UNBOUND_SIGNED_TEXT = ("The grant for this plugin in install.json names no developer key ID (developer_key_id), "
+                             "so the plugin was not loaded and none of its code ran. Its manifest is signed by a key on "
+                             "this install's trusted list, developer key ID %s: make the grant again with signer_key_id "
+                             "and developer_key_id set to %s, then load the plugin again.")
 
 
 class CoreHealth:
@@ -274,7 +281,8 @@ class PluginLoader:
         # A manual grant bound to no developer key, signed manifest or not: refused before any code runs.
         if (grant is not None and grant.signer_key_id is None
                 and _bound_developer_key(grant) is None and manifest.permissions and not perms):
-            raise Refused("grant_unbound", GRANT_UNBOUND_TEXT)
+            raise Refused("grant_unbound", GRANT_UNBOUND_SIGNED_TEXT % (kid, kid) if trust == "signed"
+                          else GRANT_UNBOUND_TEXT)
         for perm in ("process", "network", "credential"):
             if perm in perms:
                 findings.append(_finding("admit", perm + "_granted", "warn",

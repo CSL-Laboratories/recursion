@@ -386,7 +386,9 @@ class LoaderBindingTests(unittest.TestCase):
         self.assertEqual(str(ctx.exception), "grant_unbound: The grant for this plugin in install.json names no "
                                              "developer key ID (developer_key_id), so the plugin was not loaded and "
                                              "none of its code ran. Make the grant again with developer_key_id set to "
-                                             "this plugin's developer key ID, then load the plugin again.")
+                                             "this plugin's developer key ID, then load the plugin again. This "
+                                             "manifest is not signed, so the ID is never taken from it: the "
+                                             "plugin's developer gives it (ed25519: and 32 lower-case hex digits).")
 
     def test_an_unbound_manual_grant_can_load_a_plugin_that_asks_for_nothing(self) -> None:
         grant = Grant("demo.plugin", DIGEST, None, ALL, True)
@@ -407,7 +409,9 @@ class LoaderBindingTests(unittest.TestCase):
         self.assertEqual(str(ctx.exception), "grant_unbound: The grant for this plugin in install.json names no "
                                              "developer key ID (developer_key_id), so the plugin was not loaded and "
                                              "none of its code ran. Make the grant again with developer_key_id set to "
-                                             "this plugin's developer key ID, then load the plugin again.")
+                                             "this plugin's developer key ID, then load the plugin again. This "
+                                             "manifest is not signed, so the ID is never taken from it: the "
+                                             "plugin's developer gives it (ed25519: and 32 lower-case hex digits).")
 
     def test_a_stale_bound_manual_grant_still_loads_with_no_permissions(self) -> None:
         marker = Path(temp_dir(self)) / "plugin-code-ran"

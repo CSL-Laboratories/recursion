@@ -494,13 +494,20 @@ class UnixControlServer:
                 except Exception:
                     response = {"ok": False, "error": {"code": "internal_error"}}
                 response = _handler_reply(response)
-                if "id" in request and "id" not in response:
-                    response = {**response, "id": request["id"]}
+                echo = {"id": request["id"]} if "id" in request else {}
+                if echo and "id" not in response:
+                    response = {**response, **echo}
                 try:
                     conn.settimeout(self._idle_timeout_s)  # sendall's timeout bounds the whole write
                     write_frame(conn, response, max_bytes=self._max_frame_bytes)
                 except FrameError:
-                    _send_quietly(conn, {"ok": False, "error": {"code": "response_too_large"}})
+                    # The request's id stays on the refusal, so the client reads it as this request's answer.
+                    _send_quietly(conn, {"ok": False, "error": {"code": "response_too_large"}, **echo})
+                    return
+                except (TypeError, ValueError):
+                    # A handler reply that is not JSON (a non-finite number, an object) must not kill the
+                    # worker after the handler acted: the client gets a typed answer, not a silent close.
+                    _send_quietly(conn, {"ok": False, "error": {"code": "internal_error"}, **echo})
                     return
                 except OSError:
                     return
@@ -575,9 +582,11 @@ def _is_busy(response: Message) -> bool:
 
 
 def _send_quietly(conn: socket.socket, message: Message) -> None:
+    """Best effort, and it never raises: a refusal that cannot be written must not be what ends the worker
+    (the read of #385 by DeepSeek V4.1 Flash, F1)."""
     try:
         write_frame(conn, message)
-    except (OSError, FrameError):
+    except (OSError, FrameError, TypeError, ValueError):
         pass
 
 

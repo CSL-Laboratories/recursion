@@ -228,6 +228,45 @@ class LabelLoadTests(unittest.TestCase):
         self.assertEqual(control.call('plugin.status', {})['code'], 'request_invalid')
         self.assertEqual(control.call('plugin.status', None)['code'], 'request_invalid')
 
+    def test_plugin_status_answers_the_loaded_row_whatever_the_directory_order(self):
+        # A directory refused after its manifest parsed carries the id its own manifest claims.
+        # For an id the loader holds active, plugin.status answers the loaded row, whichever directory
+        # sorts first. A refused row is answered only for an id no loaded row carries. plugin.list
+        # keeps every row.
+        from recursion_core.daemon import control_adapter as adapter
+        for copy_dir, real_dir in (('a-copy', 'b-real'), ('b-copy', 'a-real')):
+            with self.subTest(refused=copy_dir, loaded=real_dir):
+                config = self.tmp / copy_dir / 'config' / 'recursion'
+                state = self.tmp / copy_dir / 'state'
+                folder = config / 'plugins'
+                manifest = fx.write_plugin(folder / real_dir, self.source, plugin_id='label.x', permissions=PERMS)
+                fx.write_plugin(folder / copy_dir, self.source, plugin_id='label.x', permissions=PERMS)
+                fx.write_plugin(folder / 'c-lone', self.source, plugin_id='label.lone', permissions=PERMS)
+                for tampered in (copy_dir, 'c-lone'):
+                    (folder / tampered / 'plugin.py').write_bytes(self.source + b'TAMPERED = True\n')
+                    os.chmod(folder / tampered / 'plugin.py', 0o600)
+                grants = [fx.grant_for(self.source, plugin_id=pid, permissions=PERMS)
+                          for pid in ('label.x', 'label.lone')]
+                fx.write_install(config, grants=grants, registry_labels={_digest(manifest): 'verified'})
+                with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+                    host = plugins.PluginHost(config, state, gil_probe=FakeGilProbe())
+                self.addCleanup(host.close)
+                control = adapter.DaemonControl(None, None, None, None, state, plugins=host)
+                rows = [row for row in control.call('plugin.list')['plugins'] if row['plugin_id'] == 'label.x']
+                self.assertEqual(sorted((row['state'], row['source']) for row in rows),
+                                 [('loaded', str(folder / real_dir)), ('refused', str(folder / copy_dir))])
+                loaded = next(row for row in rows if row['state'] == 'loaded')
+                answer = control.call('plugin.status', {'plugin_id': 'label.x'})
+                self.assertEqual(answer['code'], 'ok')
+                self.assertEqual((answer['plugin']['state'], answer['plugin']['source']),
+                                 ('loaded', str(folder / real_dir)))
+                self.assertEqual(answer['plugin']['trust'], 'unsigned')
+                self.assertEqual(answer['plugin']['registry_label'], 'verified')
+                self.assertEqual(answer['plugin']['permissions'], ['read', 'panel'])
+                self.assertEqual(answer['plugin']['permissions'], loaded['permissions'])
+                lone = control.call('plugin.status', {'plugin_id': 'label.lone'})
+                self.assertEqual((lone['code'], lone['plugin']['state'], lone['plugin']['code']),
+                                 ('ok', 'refused', 'artifact_digest_mismatch'))
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)
 @needs_crypto

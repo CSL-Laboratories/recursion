@@ -147,6 +147,11 @@ def _first_imports(before, own=None):
 
 def _read_owned(path, limit, *, missing_ok=False):
     """Bytes of an operator-owned regular file nobody else can write, or a typed refusal."""
+    # Same shape as subscription_routes.policy._check_home: a typed refusal before any
+    # file is opened. Windows has no O_NOFOLLOW; a no-follow open for it is not this round,
+    # so install refuses instead of dropping the guard (no default of 0, no open without it).
+    if os.name == 'nt' or not hasattr(os, 'O_NOFOLLOW'):
+        raise PluginRefused('platform_unsupported', 'O_NOFOLLOW is missing; no plugin file is read')
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -450,15 +455,19 @@ class PluginHost:
     def status(self, plugin_id):
         """One installed plugin, the same row ``inventory`` carries, or a typed refusal.
 
+        For an id the loader holds active the answer is the loaded row, whatever the directory
+        order; a refused row is answered only when no loaded row carries that id.
         The registry label on that row is what the installer recorded for this manifest.
-        It is ``unlisted`` when the install recorded none, or recorded one for other bytes.
+        On a loaded row it is ``unlisted`` when the install recorded none, or one for other bytes.
         """
         if not isinstance(plugin_id, str) or not plugin_id:
             return {'code': 'request_invalid', 'detail': 'plugin_id'}
-        for item in self.inventory()['plugins']:
-            if item.get('plugin_id') == plugin_id:
-                return {'code': 'ok', 'plugin': item}
-        return {'code': 'plugin_unknown', 'detail': plugin_id}
+        rows = [item for item in self.inventory()['plugins'] if item.get('plugin_id') == plugin_id]
+        if not rows:
+            return {'code': 'plugin_unknown', 'detail': plugin_id}
+        # A refused row carries the id its own, unverified manifest claims: it never hides a loaded one.
+        row = next((item for item in rows if item['state'] == 'loaded'), rows[0])
+        return {'code': 'ok', 'plugin': row}
 
     def inventory(self):
         """Every installed plugin, loaded or refused, with its findings. Plain JSON values."""

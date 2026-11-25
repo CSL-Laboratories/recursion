@@ -292,7 +292,7 @@ class StructureTest(unittest.TestCase):
     """The reads modules cannot reach run.start, run.stop or the ControlAPI: they never import them."""
 
     MODULES = ("operator_reads.py", "operator_reads_socket.py")
-    STDLIB = {"__future__", "collections.abc", "json", "math", "os", "re", "socket", "stat", "struct",
+    STDLIB = {"__future__", "collections.abc", "fcntl", "json", "math", "os", "re", "socket", "stat", "struct",
               "threading", "time", "uuid"}
     OWN = {"recursion_core.control.operator_reads", "recursion_core.control.operator_reads_socket"}
 

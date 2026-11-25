@@ -353,6 +353,16 @@ class StaticProofTests(unittest.TestCase):
                 self.assertIn("NOT PROVEN", run.stdout)
                 self.assertIn("cannot be read", run.stdout)
 
+    def test_a_green_scan_says_of_what_it_is_proven(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = nr.main([])
+        self.assertEqual(status, 0, out.getvalue())
+        self.assertIn("of the kinds the tests plant", out.getvalue())
+        self.assertIn("tools/network_gaps.toml", out.getvalue())
+
     def test_a_file_the_scan_cannot_read_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _copy_package(Path(tmp))

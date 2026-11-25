@@ -1033,6 +1033,8 @@ def main(argv=None):
     n_mod = len(listing.get("module", []))
     print(f"PROVEN: all {len(findings)} finding(s) of the shipped package have a row; it imports only the "
           f"{n_mod} module(s) of the allow list; no address comes from the code itself.")
+    print("This is proven of the kinds the tests plant (core/tests/test_network_reach.py); the known ways "
+          "past this scan that are not built are the rows of tools/network_gaps.toml, named in the README.")
     return 0
 
 

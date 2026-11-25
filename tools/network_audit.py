@@ -276,6 +276,16 @@ def load_launchers(root: Path = ROOT):
     return {row["name"]: set(row.get("value_options", [])) for row in rows}
 
 
+def whole_suite_note(problems):
+    """The words a whole-suite run prints when Python children did not load the hook, or None."""
+    n = sum(("does not load the audit hook" in p) or ("did not load the audit hook" in p) for p in problems)
+    if not n:
+        return None
+    return (f"The whole suite is NOT PROVEN today on a clean checkout: the product's own tests start Python "
+            f"children with -I or with a cleared environment, which the hook cannot reach ({n} of the "
+            f"problems above). The README says so; this run names what it could not watch.")
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     allowed = []
@@ -285,6 +295,7 @@ def main(argv=None):
     if argv[:1] == ["--"]:
         argv = argv[1:]
     command = argv
+    suite = not command
     if not command:
         command = [sys.executable, "-B", "-m", "unittest", "discover", "-s", "core/recursion_core",
                    "-t", "core", "-p", "test_*.py"]
@@ -340,11 +351,16 @@ def main(argv=None):
     if problems:
         print(f"NOT PROVEN: {len(problems)} problem(s): a reach of an address that is not on this machine, "
               f"a program that is not watched and not allowed, or a foreign-function call.")
+        note = whole_suite_note(problems) if suite else None
+        if note:
+            print(note)
         return 1
     print("PROVEN: every address reached or looked up by a watched process was a door on this machine; "
           "the programs that are not Python are named above and are not watched.")
     print("Not watched by this run: code that hides from the hook (it sees only what Python code reports; "
-          "the tests themselves are not scanned), and what a unit started by systemd-run runs.")
+          "the tests themselves are not scanned), what a unit started by systemd-run runs, and the other "
+          "run-time ways past it that are known and not built: the rows of tools/network_gaps.toml, named "
+          "in the README.")
     return 0
 
 

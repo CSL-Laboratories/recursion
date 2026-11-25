@@ -65,6 +65,8 @@ NOT_COVERED = (
     "together with the static proof (tools/network_reach.py)",
     "plugins: a plugin reaches a network only under a grant a person gave; that proof is the plugin "
     "wall's (core/recursion_core/plugin_security)",
+    "the known ways past the proofs that are not built: the rows of tools/network_gaps.toml, named in the "
+    "README; together with the static proof this proof holds for the kinds its tests plant",
 )
 
 # The audit events that can reach a network, look up a name, start a program or call foreign code.
@@ -346,6 +348,19 @@ class SuiteHookTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("NOT PROVEN", out.getvalue())
 
+    def test_a_green_run_names_the_ways_it_does_not_watch(self):
+        status, out = self._run("pass")
+        self.assertEqual(status, 0, out)
+        self.assertIn("tools/network_gaps.toml", out)
+
+    def test_a_whole_suite_run_says_why_it_is_not_proven(self):
+        unhooked = ("process 1: started the Python program 'p', which does not load the audit hook (it is "
+                    "started with -I): what it reaches is not watched")
+        self.assertIn("NOT PROVEN today on a clean checkout", self.audit.whole_suite_note([unhooked]))
+        self.assertIn("NOT PROVEN today on a clean checkout",
+                      self.audit.whole_suite_note(["2 Python process(es) did not load the audit hook"]))
+        self.assertIsNone(self.audit.whole_suite_note(["process 1: socket.connect to ['192.0.2.7', 443]"]))
+
     def _starts(self, *argvs, allowed=(), audit=True):
         events = [(1, "subprocess.Popen", [a[0], list(a), None, {"PATH": None, "audit": audit}]) for a in argvs]
         return self.audit.judge(events, allowed_programs=allowed)
@@ -479,6 +494,38 @@ class ReadmeWordsTests(unittest.TestCase):
                       "names every program that is not Python"):
             with self.subTest(claim=claim):
                 self.assertNotIn(claim, section)
+
+    def _gaps(self):
+        import tomllib
+        with open(ROOT / "tools" / "network_gaps.toml", "rb") as fh:
+            return tomllib.load(fh)
+
+    def test_every_known_way_past_the_proofs_is_named_with_its_reason(self):
+        data = self._gaps()
+        section = " ".join(self._section().split())
+        self.assertTrue(data.get("gap"))
+        self.assertIn("tools/network_gaps.toml", section)
+        for row in data["gap"]:
+            with self.subTest(row=row.get("id")):
+                self.assertTrue(str(row.get("reason", "")).strip(), row)
+                self.assertIn(row.get("proof"), ("static", "run-time", "both"), row)
+                self.assertIn(" ".join(row["words"].split()), section)
+
+    def test_no_sentence_of_the_claims_list_stands_in_the_readme(self):
+        data = self._gaps()
+        section = " ".join(self._section().split()).lower()
+        self.assertTrue(data.get("claim"))
+        for row in data["claim"]:
+            with self.subTest(claim=row["text"]):
+                self.assertTrue(str(row.get("reason", "")).strip(), row)
+                self.assertNotIn(" ".join(row["text"].split()).lower(), section)
+
+    def test_the_readme_says_the_whole_suite_run_is_not_proven_today(self):
+        section = " ".join(self._section().split())
+        for words in ("Proven today, by the second command", "There may be more",
+                      "On a clean checkout today it prints NOT PROVEN", "is not a proof today"):
+            with self.subTest(words=words):
+                self.assertIn(words, section)
 
     def test_a_green_run_prints_no_refusal_meant_for_a_planted_case(self):
         # The second command's own planted cases keep their words to themselves: on a green run the

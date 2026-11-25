@@ -119,7 +119,7 @@ SETTINGS: tuple[Setting, ...] = (
     Setting('plugin_memory.wal_max_bytes', int, 16777216,
             "How large the write-ahead file of a plugin's saved data may grow, in bytes, before Recursion folds it into the store ahead of the next write; none for no limit.", floor=1, allow_no_limit=True),
     Setting('plugin_memory.record_each_write', bool, True,
-            "Whether every write and delete of saved data leaves a record row; false leaves one summary when the plugin's host ends."),
+            "Whether every write and delete of saved data leaves a record row; false leaves one summary when the plugin's host ends, and if Recursion stops before that the summary of those writes is lost (the saved data itself is kept)."),
     Setting('plugin_memory.record_key_text', bool, False,
             'Whether a record row keeps the text of a saved-data key; false keeps only its SHA-256 and its length.'),
 )

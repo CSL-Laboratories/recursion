@@ -17,12 +17,18 @@ refusal carries a path.
 * BOUNDS are settings rows (``plugin_memory.*``, read when Recursion starts); a write over one is refused
   ``memory_full`` naming the row, in ONE transaction, so nothing is half written; a full disk gives the same
   code with the disk as the cause.
-* A file that fails SQLite's check is moved aside (never deleted) and this store answers
-  ``memory_unreadable``; other plugins' stores are other files and go on.
+* OPENING. A file that fails SQLite's integrity check, or that SQLite calls corrupt or not a database, is
+  moved aside (never deleted) and this store answers ``memory_unreadable``; other plugins' stores are other
+  files and go on. Any other error at open (the file busy or locked by another connection, read-only, a
+  full disk) moves nothing: the file stays where it is, the store answers ``memory_unavailable`` and tries
+  to open it again at the next call.
 * THE RECORD. One row per write, delete and set-aside goes to ``record`` (the daemon's sink for its event
   log): time, plugin, identity, call, the key's SHA-256 and length (its text only when
   ``plugin_memory.record_key_text`` is true), the store's bytes before and after, the revision and the result
-  or refusal code. A read is not recorded. A write committed after ``host_ended`` was called says so.
+  or refusal code. A read is not recorded. A write committed after ``host_ended`` was called says so. The
+  row of a write is sent BEFORE its commit: a sink that raises rolls the write back, so no write stands
+  without its row. Each open sends one set-aside row for every other install's store it finds beside its
+  own, so a return to an earlier signer leaves rows as a first install does.
 * The table keeps a namespace column ``ns`` and a ``kind`` column, each held empty by the table's own
   check, so a later slice fills them without a migration. There is no state column.
 """
@@ -61,9 +67,13 @@ ROWS = ("plugin_memory.plugins", "plugin_memory.max_bytes_per_plugin", "plugin_m
         "plugin_memory.sync", "plugin_memory.wal_max_bytes", "plugin_memory.record_each_write",
         "plugin_memory.record_key_text")
 PACE_WINDOW_S = 60.0  # "per minute" is the row's own meaning, not a figure a person picks
+# How long an open waits for a store file another connection holds, in seconds. It becomes the settings row
+# plugin_memory.open_wait_seconds; until that row exists it is this one named value.
+OPEN_WAIT_S = 5.0
 _KEY_ID = re.compile(r"[a-z0-9]{1,16}:[0-9a-f]{1,64}")
 _PLUGIN_ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
 _SQLITE_FULL, _SQLITE_CORRUPT, _SQLITE_NOTADB = 13, 11, 26
+_SQLITE_BUSY, _SQLITE_LOCKED, _SQLITE_READONLY = 5, 6, 8
 _TIME_SHAPE = "2026-11-23T21:00:00.000Z"  # the form of written_at: its length is what the frame bound counts
 
 
@@ -160,6 +170,18 @@ def _code(exc: BaseException) -> int | None:
     return value & 0xFF if type(value) is int else None
 
 
+def _not_open(exc: BaseException) -> dict:
+    """The words' fill for a store file that could not be opened now and was left in place."""
+    code = _code(exc)
+    if code in (_SQLITE_BUSY, _SQLITE_LOCKED):
+        return {"cause": "another program was using it", "act": "end the other program that holds it"}
+    if code == _SQLITE_READONLY:
+        return {"cause": "it could not be written", "act": "make Recursion's state folder writable again"}
+    if code == _SQLITE_FULL:
+        return {"cause": "your disk is full", "act": "free some space on your disk"}
+    return {"cause": "SQLite could not open it", "act": "restart Recursion"}
+
+
 class PluginMemory:
     """One plugin's saved data for one install identity. Thread-safe: one call at a time."""
 
@@ -188,6 +210,7 @@ class PluginMemory:
         self._summary: collections.Counter = collections.Counter()
         self._db: sqlite3.Connection | None = None
         self.unreadable = False
+        self.unavailable: dict | None = None  # why the file could not be opened now, when it could not
         self._open()
 
     # -- what a person is shown
@@ -215,29 +238,37 @@ class PluginMemory:
             raise PermissionError("a store file must be a regular file of the daemon's own user")
         if info.st_mode & 0o077:
             os.chmod(self._path, 0o600)
+        db = None
         try:
-            db = sqlite3.connect(str(self._path), isolation_level=None, check_same_thread=False)
-            try:
-                if not new:
-                    (verdict,), = db.execute("PRAGMA integrity_check(1)").fetchall()
-                    if verdict != "ok":
-                        raise sqlite3.DatabaseError("integrity check")
-                mode, = db.execute("PRAGMA journal_mode=WAL").fetchone()
-                if str(mode).lower() != "wal":
-                    raise sqlite3.DatabaseError("not in WAL mode")
-                db.execute(f"PRAGMA synchronous={self.sync}")
-                db.executescript(_SCHEMA)
-            except BaseException:
+            db = sqlite3.connect(str(self._path), timeout=OPEN_WAIT_S, isolation_level=None,
+                                 check_same_thread=False)
+            if not new:
+                (verdict,), = db.execute("PRAGMA integrity_check(1)").fetchall()
+                if verdict != "ok":
+                    db.close()
+                    self._set_aside_damaged()
+                    return
+            mode, = db.execute("PRAGMA journal_mode=WAL").fetchone()
+            if str(mode).lower() != "wal":
+                raise sqlite3.OperationalError("not in WAL mode")
+            db.execute(f"PRAGMA synchronous={self.sync}")
+            db.executescript(_SCHEMA)
+        except sqlite3.DatabaseError as exc:
+            if db is not None:
                 db.close()
-                raise
-        except sqlite3.DatabaseError:
-            self._set_aside_damaged()
+            if _code(exc) in (_SQLITE_CORRUPT, _SQLITE_NOTADB):
+                self._set_aside_damaged()
+            else:
+                self.unavailable = _not_open(exc)
             return
-        self._db = db
-        if new:
-            for item in others:
-                if item["why"] == "another install":
-                    self._record("set_aside", None, "set_aside", install=item["install"], forced=True)
+        except BaseException:
+            if db is not None:
+                db.close()
+            raise
+        self._db, self.unavailable = db, None
+        for item in others:
+            if item["why"] == "another install":
+                self._record("set_aside", None, "set_aside", install=item["install"], forced=True)
 
     def _set_aside_damaged(self) -> None:
         if self._db is not None:
@@ -294,13 +325,17 @@ class PluginMemory:
         while self._calls and now - self._calls[0] >= PACE_WINDOW_S:
             self._calls.popleft()
         if len(self._calls) >= limit:
-            return self._refused("memory_full_pace", limit=str(limit))
+            return self._refused("memory_paced", limit=str(limit))
         self._calls.append(now)
         return None
 
     def _call(self, call: str, key: str | None, work: Callable[[], dict]) -> dict:
         writes = call in ("memory.put", "memory.delete")
         with self._lock:
+            if self.unavailable is not None and not self.unreadable:
+                self._open()
+                if self.unavailable is not None:
+                    return self._refused("memory_unavailable", **self.unavailable)
             if self.unreadable or self._db is None:
                 return self._refused("memory_unreadable")
             answer = self._paced()
@@ -379,6 +414,8 @@ class PluginMemory:
             self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def _write(self, step: Callable[[sqlite3.Connection], tuple]) -> dict:
+        """ONE transaction. A row of the record is sent before COMMIT: a sink that raises rolls the write back
+        (the plugin is answered call_failed and nothing is written). A summary only counts after COMMIT."""
         db = self._db
         db.execute("BEGIN IMMEDIATE")
         try:
@@ -387,13 +424,16 @@ class PluginMemory:
                 if db.in_transaction:
                     db.execute("ROLLBACK")
                 return answer
+            if self.record_each:
+                self._record(*done[0], **done[1])
             if db.in_transaction:
                 db.execute("COMMIT")
         except BaseException:
             if db.in_transaction:
                 db.execute("ROLLBACK")
             raise
-        self._record(*done[0], **done[1])
+        if not self.record_each:
+            self._record(*done[0], **done[1])
         return answer
 
     def _between(self) -> None:
@@ -412,14 +452,14 @@ class PluginMemory:
         after = before - (found[0][1] if found else 0) + len(key.encode("utf-8")) + len(value)
         count = items + (0 if found else 1)
         if self.max_items is not NO_LIMIT and count > self.max_items:
-            return self._refused("memory_full", size=f"{self.max_items} items",
+            return self._refused("memory_full", size=words.count_text(self.max_items),
                                  row="plugin_memory.max_items_per_plugin"), None
         if self.max_bytes is not NO_LIMIT and after > self.max_bytes:
             return self._refused("memory_full", size=words.size_text(self.max_bytes),
                                  row="plugin_memory.max_bytes_per_plugin"), None
         revision = found[0][0] + 1 if found else 1
         if revision > MAX_ID:
-            return self._refused("memory_full", size=f"revision {MAX_ID}", row="the channel's largest number"), None
+            return self._refused("memory_full_revision", size=str(MAX_ID)), None
         written = datetime.datetime.fromtimestamp(self._clock(), datetime.timezone.utc)
         written_at = written.strftime("%Y-%m-%dT%H:%M:%S.") + f"{written.microsecond // 1000:03d}Z"
         db.execute("INSERT INTO items (key, value, revision, written_at) VALUES (?, ?, ?, ?) "
@@ -451,5 +491,5 @@ class PluginMemory:
                 self._db = None
 
 
-__all__ = ["MAX_VALUE_BYTES", "PluginMemory", "ROWS", "STORE_DIR", "STORE_FILE", "for_plugin", "identity_for",
-           "memory_key_ok", "set_aside"]
+__all__ = ["MAX_VALUE_BYTES", "OPEN_WAIT_S", "PluginMemory", "ROWS", "STORE_DIR", "STORE_FILE", "for_plugin",
+           "identity_for", "memory_key_ok", "set_aside"]

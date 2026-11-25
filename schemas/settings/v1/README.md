@@ -16,7 +16,7 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
 | `plugin_memory.calls_per_minute` | whole number or `"none"` | `6000` | The most calls on its saved data one plugin may make in one minute; none for no limit. |
 | `plugin_memory.sync` | text | `full` | How each write of saved data reaches the disk: full waits for the disk; normal is faster and may lose the last writes if the power fails. Any other text reads as full. |
 | `plugin_memory.wal_max_bytes` | whole number or `"none"` | `16777216` | How large the write-ahead file of a plugin's saved data may grow, in bytes, before Recursion folds it into the store ahead of the next write; none for no limit. |
-| `plugin_memory.record_each_write` | boolean | `true` | Whether every write and delete of saved data leaves a record row; false leaves one summary when the plugin's host ends. |
+| `plugin_memory.record_each_write` | boolean | `true` | Whether every write and delete of saved data leaves a record row; false leaves one summary when the plugin's host ends, and if Recursion stops before that the summary of those writes is lost (the saved data itself is kept). |
 | `plugin_memory.record_key_text` | boolean | `false` | Whether a record row keeps the text of a saved-data key; false keeps only its SHA-256 and its length. |
 
 ## What holds for the file

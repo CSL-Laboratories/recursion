@@ -15,6 +15,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from recursion_core import settings
 from recursion_core.plugin_security import canonical, parse
@@ -29,6 +30,9 @@ if hasattr(os, "geteuid"):
 REPO = Path(__file__).resolve().parents[4]
 KEY_A = "ed25519:" + "a" * 32
 KEY_B = "ed25519:" + "b" * 32
+DAMAGED_NEXT = ("The plugin goes on with no saved data. The damaged file stays in Recursion's state folder for you; no "
+                "command of Recursion lists, shows or restores saved data yet.")
+DIR_A, DIR_B = "ed25519-" + "a" * 32, "ed25519-" + "b" * 32
 
 
 def b64(data: bytes) -> str:
@@ -45,6 +49,13 @@ class Rows:
 
     def __getitem__(self, name):
         return self.values[name]
+
+
+class Garbled:
+    """A stand-in core whose answer cannot be read."""
+
+    def client_for(self, caller):
+        return lambda request: b"not an answer"
 
 
 class Core:
@@ -246,7 +257,7 @@ class SavedData(unittest.TestCase):
                 if value is settings.NO_LIMIT:
                     self.assertEqual(last["code"], "memory_key_unknown")
                 else:
-                    self.assertEqual(last["code"], "memory_full")
+                    self.assertEqual(last["code"], "memory_paced")
                     self.assertIn("plugin_memory.calls_per_minute", last["why"])
         for value, expect in ((2, (["a", "b"], True, "b")), (settings.NO_LIMIT, (["a", "b", "c"], False, None))):
             with self.subTest(row="list_page_max", value=value):
@@ -354,7 +365,7 @@ class SavedData(unittest.TestCase):
             self.assertEqual({key: answer[key] for key in ("code", "what", "why", "next", "changed")},
                              {"code": "memory_unreadable", "what": "demo.notes's saved data could not be read.",
                               "why": "Its file is damaged, so Recursion set it aside and gave the plugin none.",
-                              "next": "Nothing was deleted.", "changed": "The damaged file was moved aside."})
+                              "next": DAMAGED_NEXT, "changed": "The damaged file was moved aside; nothing was deleted."})
         self.assertTrue(self.value(self.put(other, "k"))["ok"])
         listed = ms.set_aside(self.state, "demo.notes", KEY_A)
         self.assertEqual([item["why"] for item in listed], ["damaged"])
@@ -440,7 +451,8 @@ class SavedData(unittest.TestCase):
                              (hc.CALL_NAMES[name], "memory", None))
         self.assertEqual(list(hc.CALL_NAMES)[-4:], list(hc.MEMORY_CALL_NAMES))
         self.assertEqual(host["x-memory"]["answer_codes"], ["memory_key_unknown", "memory_revision_moved",
-                                                            "memory_item_too_large", "memory_full", "memory_unreadable"])
+                                                            "memory_item_too_large", "memory_full", "memory_unreadable",
+                                                            "memory_unavailable", "memory_paced"])
         self.assertEqual(set(host["x-memory"]["answer_codes"]) & set(hc.REFUSAL_CODES), set())
         manifest = json.loads((REPO / "schemas" / "plugin" / "v1" / "manifest.v1.json").read_text(encoding="utf-8"))
         install = json.loads((REPO / "schemas" / "plugin" / "v1" / "install.v1.json").read_text(encoding="utf-8"))
@@ -461,6 +473,174 @@ class SavedData(unittest.TestCase):
         self.assertEqual(PERMISSIONS[-1], hc.MEMORY_PERMISSION)
         self.assertEqual(sorted(set(words.CODE_OF.values()) - {"call_not_offered"}),
                          sorted(host["x-memory"]["answer_codes"]))
+
+    # Round on 08f90f7e. A1: a file that is only busy is not called damaged, not moved, and opened again later
+    def test_a_busy_file_is_left_in_place_and_opened_again_at_the_next_call(self):
+        first = self.store()
+        self.put(self.end(memory=first), "k", b"healthy")
+        path = first._path
+        first.close()
+        held = sqlite3.connect(str(path), isolation_level=None)  # the test's own connection, released below
+        try:
+            held.execute("PRAGMA locking_mode=EXCLUSIVE")
+            held.execute("BEGIN EXCLUSIVE")
+            held.execute("UPDATE totals SET items = items WHERE one = 1")
+            with mock.patch.object(ms, "OPEN_WAIT_S", 0.05):
+                memory = self.store()
+                end = self.end(memory=memory)
+                answers = [self.value(self.ask(end, "memory.get", key="k")) for _ in range(2)]
+        finally:
+            if held.in_transaction:
+                held.execute("ROLLBACK")
+            held.close()
+        for answer in answers:
+            self.assertEqual({key: answer[key] for key in ("code", "what", "why", "next", "changed")},
+                             {"code": "memory_unavailable", "what": "demo.notes's saved data could not be opened just now.",
+                              "why": "Recursion could not open its file because another program was using it; the file "
+                                     "is not damaged as far as Recursion can tell.",
+                              "next": "Recursion tries again at the plugin's next call; if this goes on, end the other "
+                                      "program that holds it.",
+                              "changed": "Nothing was moved or deleted: the file and its data stay where they were."})
+        self.assertTrue(path.is_file())
+        self.assertEqual(ms.set_aside(self.state, "demo.notes", KEY_A), [])
+        self.assertNotIn("memory_unreadable", [row["result"] for row in self.rows])
+        got = self.value(self.ask(end, "memory.get", key="k"))
+        self.assertEqual((got["ok"], base64.b64decode(got["value_b64"])), (True, b"healthy"))
+        self.assertFalse(memory.unreadable)
+
+    # A2: the row is sent before the commit; a sink that raises leaves nothing written
+    def test_a_record_sink_that_raises_rolls_the_write_back(self):
+        failing = []
+
+        def sink(row):
+            if failing:
+                raise OSError("the record could not be written")
+            self.rows.append(row)
+        memory = ms.PluginMemory(self.state, "demo.notes", KEY_A, settings=Rows(), record=sink)
+        self.addCleanup(memory.close)
+        end = self.end(memory=memory)
+        self.assertTrue(self.value(self.put(end, "kept", b"one"))["ok"])
+        failing.append(True)
+        for name, args in (("memory.put", {"key": "new", "value_b64": b64(b"x"), "if_revision": None}),
+                           ("memory.put", {"key": "kept", "value_b64": b64(b"two"), "if_revision": 1}),
+                           ("memory.delete", {"key": "kept", "if_revision": None})):
+            with self.subTest(call=name, key=args["key"]):
+                answer = self.ask(end, name, **args)
+                self.assertEqual((answer["type"], answer["code"], answer["detail"]), ("refusal", "call_failed", "OSError"))
+        failing.clear()
+        self.assertEqual(self.value(self.ask(end, "memory.get", key="new"))["code"], "memory_key_unknown")
+        got = self.value(self.ask(end, "memory.get", key="kept"))
+        self.assertEqual((base64.b64decode(got["value_b64"]), got["revision"]), (b"one", 1))
+        self.assertEqual(memory._totals(memory._db), (1, len("kept") + 3))
+        self.assertEqual([(row["call"], row["result"]) for row in self.rows], [("memory.put", "ok")])
+
+    # A3: going back to an earlier install sets the other store aside WITH a row, as a first install does
+    def test_a_return_to_an_earlier_install_records_the_other_store_set_aside(self):
+        for identity in (KEY_A, KEY_B):
+            self.store(identity=identity).close()
+        count = len(self.rows)
+        self.store(identity=KEY_A)
+        self.assertEqual([(r["call"], r["identity"], r["install"], r["result"]) for r in self.rows[count:]],
+                         [("set_aside", KEY_A, DIR_B, "set_aside")])
+        self.assertEqual(ms.set_aside(self.state, "demo.notes", KEY_A), [{"install": DIR_B, "why": "another install"}])
+
+    # A5: damage that only SQLite's integrity check finds is set aside too
+    def test_damage_only_the_integrity_check_finds_is_set_aside(self):
+        first = self.store()
+        self.put(self.end(memory=first), "k", b"v")
+        path = first._path
+        first.close()
+        raw = sqlite3.connect(str(path), isolation_level=None)
+        try:
+            raw.execute("CREATE TABLE extra (a INTEGER)")
+            raw.execute("CREATE INDEX extra_a ON extra (a)")
+            raw.executemany("INSERT INTO extra (a) VALUES (?)", [(i,) for i in range(300)])
+            raw.execute("PRAGMA writable_schema = ON")
+            raw.execute("UPDATE sqlite_master SET sql = 'CREATE INDEX extra_a ON extra (a DESC)' WHERE name = 'extra_a'")
+        finally:
+            raw.close()
+        check = sqlite3.connect(str(path))
+        try:
+            self.assertEqual(check.execute("SELECT key FROM items").fetchall(), [("k",)])
+            (verdict,), = check.execute("PRAGMA integrity_check(1)").fetchall()
+            self.assertNotEqual(verdict, "ok")
+        finally:
+            check.close()
+        damaged = self.end(memory=self.store())
+        self.assertEqual(self.value(self.ask(damaged, "memory.get", key="k"))["code"], "memory_unreadable")
+        self.assertEqual([item["why"] for item in ms.set_aside(self.state, "demo.notes", KEY_A)], ["damaged"])
+
+    # A6: pacing answers a code of its own, on a read and a list too
+    def test_pacing_has_a_code_of_its_own_on_a_read_or_a_list(self):
+        end = self.end(memory=self.store(calls_per_minute=2))
+        self.put(end, "k")
+        self.ask(end, "memory.get", key="k")
+        for name, args in (("memory.get", {"key": "k"}), ("memory.list", {"prefix": "", "after": None, "limit": None})):
+            with self.subTest(call=name):
+                answer = self.value(self.ask(end, name, **args))
+                self.assertEqual((answer["code"], answer["what"]),
+                                 ("memory_paced", "demo.notes asked for its saved data too often."))
+                self.assertEqual(answer["changed"], "No: nothing of this call was done.")
+
+    # A7: the full words say this write would pass the limit, and count items right
+    def test_the_full_words_say_this_write_would_pass_the_limit(self):
+        end = self.end(memory=self.store(max_bytes_per_plugin=100))
+        self.assertTrue(self.value(self.put(end, "a", b"x" * 89))["ok"])
+        self.assertEqual(self.value(self.put(end, "b", b"x" * 20))["why"],
+                         "With this write its saved data would pass 100 bytes, the limit in "
+                         "plugin_memory.max_bytes_per_plugin.")
+        one = self.end("demo.one", memory=self.store("demo.one", max_items_per_plugin=1))
+        self.put(one, "a")
+        self.assertEqual(self.value(self.put(one, "b"))["why"],
+                         "With this write its saved data would pass 1 item, the limit in "
+                         "plugin_memory.max_items_per_plugin.")
+        self.assertEqual(words.count_text(2), "2 items")
+
+    # A8: both missing grants are named
+    def test_both_missing_grants_are_named(self):
+        answer = self.ask(self.end(memory=None, core=Core(permissions=("read",))), "memory.get", key="k")
+        self.assertEqual(answer["code"], "call_not_offered")
+        self.assertEqual(answer["detail"], "memory.get: demo.notes tried to keep saved data between runs. It was not "
+                         "given the permission to keep saved data when it was installed, and it is not listed in "
+                         "plugin_memory.plugins in your settings file. To allow it, install it again and grant it saved "
+                         "data, add demo.notes to plugin_memory.plugins, then restart Recursion. Only your own act "
+                         "widens what a plugin can do. No: nothing was saved.")
+
+    # A9: a core that cannot answer is not told to the person as a permission not given at install
+    def test_a_core_that_cannot_answer_is_not_called_a_missing_permission(self):
+        answer = self.ask(self.end(memory=self.store(), core=Garbled()), "memory.get", key="k")
+        self.assertEqual(answer["code"], "call_not_offered")
+        self.assertEqual(answer["detail"], "memory.get: demo.notes tried to keep saved data between runs. Recursion "
+                         "could not learn whether demo.notes holds the permission to keep saved data, so it allowed "
+                         "nothing. The plugin can ask again; if this goes on, restart Recursion. Only your own act "
+                         "widens what a plugin can do. No: nothing was saved.")
+
+    # A11: the place of the new permission is pinned, so one inserted before it turns this red
+    def test_the_place_of_the_memory_permission_is_pinned(self):
+        self.assertEqual((PERMISSIONS.index("schedule"), PERMISSIONS.index("memory"), len(PERMISSIONS)), (7, 8, 9))
+        manifest = json.loads((REPO / "schemas" / "plugin" / "v1" / "manifest.v1.json").read_text(encoding="utf-8"))
+        enum = manifest["$defs"]["permission"]["enum"]
+        self.assertEqual((enum.index("schedule"), enum.index("memory"), len(enum)), (12, 13, 14))
+
+    # A12: the summary row's sentence says what is lost if Recursion stops before the host's end
+    def test_the_summary_row_says_what_is_lost_if_recursion_stops_first(self):
+        says = settings.DECLARED["plugin_memory.record_each_write"].says
+        self.assertIn("if Recursion stops before that the summary of those writes is lost", says)
+        self.assertIn("the saved data itself is kept", says)
+
+    # A13: the largest revision names no row to raise; it says what the plugin can do
+    def test_the_largest_revision_says_what_the_plugin_can_do(self):
+        memory = self.store()
+        end = self.end(memory=memory)
+        self.put(end, "k")
+        memory._db.execute("UPDATE items SET revision = ? WHERE key = 'k'", (hc.MAX_ID,))
+        answer = self.value(self.put(end, "k", b"y", hc.MAX_ID))
+        self.assertEqual({key: answer[key] for key in ("code", "what", "why", "next", "changed")},
+                         {"code": "memory_full", "what": "demo.notes could not change this item of its saved data again.",
+                          "why": f"The item is at revision {hc.MAX_ID}, the largest number a message between Recursion "
+                                 "and a plugin carries.",
+                          "next": "The plugin can delete the item and save it anew, which starts it again at revision 1.",
+                          "changed": "No: nothing of this write was saved."})
 
     # The settings rows: declared once, each with its shipped default; the grant row's sentence as written
     def test_the_rows_are_settings_with_their_defaults(self):
@@ -489,7 +669,7 @@ class Words(unittest.TestCase):
                             "To allow it, add PLUGIN to plugin_memory.plugins and restart Recursion. Settings are read "
                             "when Recursion starts. Only your own act widens what a plugin can do.",
                             "No: nothing was saved."),
-        "memory_full": ("PLUGIN could not save more.", "Its saved data has reached SIZE, the limit in ROW.",
+        "memory_full": ("PLUGIN could not save more.", "With this write its saved data would pass SIZE, the limit in ROW.",
                         "Raise that row and restart Recursion, or set it to none for no limit.",
                         "No: nothing of this write was saved."),
         "memory_item_too_large": ("PLUGIN tried to save one item of SIZE.",
@@ -497,7 +677,12 @@ class Words(unittest.TestCase):
                                   "a plugin.", "The plugin can save it in smaller parts.", "No: nothing was saved."),
         "memory_unreadable": ("PLUGIN's saved data could not be read.",
                               "Its file is damaged, so Recursion set it aside and gave the plugin none.",
-                              "Nothing was deleted.", "The damaged file was moved aside."),
+                              DAMAGED_NEXT, "The damaged file was moved aside; nothing was deleted."),
+        "memory_unavailable": ("PLUGIN's saved data could not be opened just now.",
+                               "Recursion could not open its file because CAUSE; the file is not damaged as far as "
+                               "Recursion can tell.",
+                               "Recursion tries again at the plugin's next call; if this goes on, ACT.",
+                               "Nothing was moved or deleted: the file and its data stay where they were."),
     }
 
     def test_each_refusal_has_what_why_next_and_changed(self):
@@ -513,7 +698,8 @@ class Words(unittest.TestCase):
                     self.assertNotIn("/", part)
         full = table.render("memory_full", "demo.notes", size=table.size_text(67108864),
                             row="plugin_memory.max_bytes_per_plugin")
-        self.assertEqual(full["why"], "Its saved data has reached 64 MB, the limit in plugin_memory.max_bytes_per_plugin.")
+        self.assertEqual(full["why"], "With this write its saved data would pass 64 MB, the limit in "
+                                      "plugin_memory.max_bytes_per_plugin.")
 
 
 if __name__ == "__main__":

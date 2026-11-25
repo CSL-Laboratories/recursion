@@ -150,7 +150,7 @@
         "record_each_write": {
           "type": "boolean",
           "default": true,
-          "description": "Whether every write and delete of saved data leaves a record row; false leaves one summary when the plugin's host ends."
+          "description": "Whether every write and delete of saved data leaves a record row; false leaves one summary when the plugin's host ends, and if Recursion stops before that the summary of those writes is lost (the saved data itself is kept)."
         },
         "record_key_text": {
           "type": "boolean",

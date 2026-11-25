@@ -477,15 +477,20 @@ class DaemonEnd:
 
     def _granted(self, permission: str) -> bool:
         """Whether the core says this channel's plugin holds ``permission`` now (the ``plugin.permissions`` op)."""
+        return self._grant(permission) is True
+
+    def _grant(self, permission: str) -> bool | None:
+        """True or False as the core answers for ``permission`` now; None when its answer cannot be read, which
+        grants nothing and is never told to a person as a permission not given."""
         request = canonical({"protocol": PROTOCOL_VERSION, "op": "plugin.permissions",
                              "args": {"plugin_id": self.plugin_id}})
         try:
             answer = parse(self._core(request))
         except Exception:  # noqa: BLE001 - an answer that cannot be read grants nothing
-            return False
+            return None
         result = answer.get("result") if type(answer) is dict and answer.get("ok") is True else None
         granted = result.get("permissions") if type(result) is dict else None
-        return type(granted) is list and permission in granted
+        return permission in granted if type(granted) is list else None
 
     def _run_request(self, record_kind: str, record_id: str, revision: int, occurrence: str, tenant: str,
                      engine: str, prompt: str) -> dict:
@@ -511,10 +516,13 @@ class _DaemonOffers:
         if name == "run.request" and end._runs is not None and end._granted(RUN_REQUEST_PERMISSION):
             return end._run_request
         if name in MEMORY_CALL_NAMES:
-            if not end._granted(MEMORY_PERMISSION):
-                self._missing[name] = "permission"
+            grant = end._grant(MEMORY_PERMISSION)
+            if grant is False:
+                self._missing[name] = "permission" if end._memory is not None else "both"
             elif end._memory is None:
                 self._missing[name] = "row"
+            elif grant is None:
+                self._missing[name] = "unknown"
             else:
                 return {"memory.put": end._memory.put, "memory.get": end._memory.get,
                         "memory.list": end._memory.list_keys, "memory.delete": end._memory.delete}[name]

@@ -12,7 +12,9 @@ and answered by the daemon: `memory.put` (`key`, `value_b64`, `if_revision`), `m
 `x-memory` says their forms and answers: a key is 1 to 256 bytes of UTF-8 with no control character and
 never a file name; every answer is a result whose value is `{ok: true, ...}` or a refusal value with its
 code (`memory_key_unknown`, `memory_revision_moved`, `memory_item_too_large`, `memory_full`,
-`memory_unreadable`) and four parts of words; every answer fits one frame. The channel's own
+`memory_unreadable`, `memory_unavailable` for a store file that could not be opened now and was left in
+place, `memory_paced` for a plugin over its calls per minute) and four parts of words; every answer fits
+one frame. The channel's own
 `x-refusal-codes` are unchanged. The permission `memory` is appended to the permission list of
 `manifest.v1.json`, of `install.v1.json` and of `plugin_security/manifest.py`. What it breaks: a reader
 that assumed `x-call-names` held five names or that `schedule` was the last permission; a validator that

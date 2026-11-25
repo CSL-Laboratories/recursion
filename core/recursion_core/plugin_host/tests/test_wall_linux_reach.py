@@ -118,7 +118,7 @@ def status():  # by prctl, not /proc/self/status, which the wall's Landlock part
 
 def apply(paths):
     try:
-        w.apply_wall(paths)
+        w.apply_wall(paths, keep_descriptors=w._descriptors_now())
     except w.WallRefused as exc:
         return {"code": exc.code, "step": getattr(exc, "step", None)}
     except Exception as exc:
@@ -739,7 +739,7 @@ a = json.loads(sys.argv[1]); sys.path.insert(0, a["core"])
 from recursion_core.plugin_host import wall_linux as w
 out = {"host_pid": os.getpid()}
 if a["wall"]:
-    w.apply_wall(a["paths"])
+    w.apply_wall(a["paths"], keep_descriptors=w._descriptors_now())
     out["apply"] = "applied"
 pid = os.fork()
 if pid == 0:                                     # the leftover child: walled like its host
@@ -1051,7 +1051,8 @@ class LandlockScopeTests(unittest.TestCase):
             stand_ins = dict({fn: _refuse for fn in CHECK_FUNCTIONS.values()}, _write_outcomes=_writes_refused)
             with self.subTest(abi=abi), mock.patch.multiple(
                     wall_linux, _call=fake_call, _landlock_abi=lambda libc: abi, _thread_count=lambda: 1,
-                    _threads_now=lambda: 1, _descriptors_open_for_write=lambda: [], _descriptors_unaccounted=lambda: [],
+                    _threads_now=lambda: 1, _descriptors_open_for_write=lambda: [], _descriptors_unaccounted=lambda: [], _kept_and_not_closed=lambda: ([], []),
+                    _held_objects=lambda: ({k: "not_tried" if k in wall_linux.HELD_NOT_TRIED else "closed_by_wall" for k in wall_linux.HELD_KINDS}, dict(wall_linux.HELD_NOT_TRIED)), _plant_held=lambda: None,
                     _read_kernel_lists=lambda lists: {"descriptors": [], "maps": [], "numbers": []},
                     _no_new_privs=lambda libc: None, _load_seccomp_filter=lambda *a, **k: None,
                     _STATE={"applied": [], "failed": None, "scopes": []}, **stand_ins):
@@ -1141,7 +1142,8 @@ class ProvenNeedsEveryCheckTests(unittest.TestCase):
         stand_ins["_write_outcomes"] = _writes_refused
         stand_ins.update(_threads_now=lambda: 1, _descriptors_open_for_write=lambda: [],
                          _maps_open_for_write=lambda: [], _walled_here=lambda: True,
-                         _descriptors_unaccounted=lambda: [])  # the runner's own are not judged; as if walled here
+                         _descriptors_unaccounted=lambda: [], _kept_and_not_closed=lambda: ([], []),
+                    _held_objects=lambda: ({k: "not_tried" if k in wall_linux.HELD_NOT_TRIED else "closed_by_wall" for k in wall_linux.HELD_KINDS}, dict(wall_linux.HELD_NOT_TRIED)), _plant_held=lambda: None)  # the runner's own are not judged; as if walled here
         with mock.patch.multiple(wall_linux, create=True, **stand_ins, **patches):
             return wall_linux.probe_wall("/nonexistent/canary", 1)
 

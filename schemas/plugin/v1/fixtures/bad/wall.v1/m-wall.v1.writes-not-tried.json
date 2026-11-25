@@ -4,6 +4,25 @@
   "memory_maps_open_for_write": [],
   "descriptors_seen_by": "kernel_list_after_wall",
   "descriptors_unaccounted": [],
+  "descriptors_kept": [
+    {
+      "descriptor": 0,
+      "kind": "character_device"
+    },
+    {
+      "descriptor": 1,
+      "kind": "pipe"
+    },
+    {
+      "descriptor": 2,
+      "kind": "pipe"
+    },
+    {
+      "descriptor": 3,
+      "kind": "socket"
+    }
+  ],
+  "descriptors_not_closed": [],
   "reads_outside": true,
   "home_canary": true,
   "program_start": true,
@@ -29,5 +48,17 @@
   "landlock_abi": 3,
   "landlock_scopes": [],
   "arch": "x86_64",
-  "proven": true
+  "proven": true,
+  "held_objects": {
+    "ring": "closed_by_wall",
+    "datagram_socket": "closed_by_wall",
+    "stream_socket": "closed_by_wall",
+    "signal_owner": "closed_by_wall",
+    "shared_map": "not_tried",
+    "namespace": "not_tried"
+  },
+  "held_objects_not_tried": {
+    "shared_map": "a map is not a descriptor, so the close step cannot reach it",
+    "namespace": "entering a namespace changes the whole process the host runs in"
+  }
 }

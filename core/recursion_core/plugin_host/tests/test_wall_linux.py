@@ -50,7 +50,7 @@ chan = socket.socket(fileno=spec["chan"])
 if mode == "nowall":
     out["record"] = w.probe_wall(spec["canary"], spec["daemon"], write_file=spec["canary"], write_folder=spec["writes"])
 elif mode in ("wall", "wall_missing_canary"):
-    out["apply"] = attempt(lambda: w.apply_wall(spec["paths"]))
+    out["apply"] = attempt(lambda: w.apply_wall(spec["paths"], keep_descriptors=w._descriptors_now()))
     out["record"] = w.probe_wall(spec["canary"], spec["daemon"], write_file=spec["canary"], write_folder=spec["writes"])
     if mode == "wall":
         def denied(call):
@@ -89,7 +89,7 @@ elif mode == "thread_then_apply":
     gate = threading.Event()
     waiting = threading.Thread(target=gate.wait)
     waiting.start()
-    out["apply"] = attempt(lambda: w.apply_wall(spec["paths"]))
+    out["apply"] = attempt(lambda: w.apply_wall(spec["paths"], keep_descriptors=w._descriptors_now()))
     gate.set()
     waiting.join()
     out["status"] = status()
@@ -110,18 +110,18 @@ elif mode == "thread_then_filter":
     out["thread"] = seen.get("socket")
 elif mode == "no_landlock":
     w._landlock_abi = lambda libc: 0
-    out["apply"] = attempt(lambda: w.apply_wall(spec["paths"]))
+    out["apply"] = attempt(lambda: w.apply_wall(spec["paths"], keep_descriptors=w._descriptors_now()))
     out["status"] = status()
 elif mode == "other_arch":
     platform.machine = lambda: "riscv64"
-    out["apply"] = attempt(lambda: w.apply_wall(spec["paths"]))
+    out["apply"] = attempt(lambda: w.apply_wall(spec["paths"], keep_descriptors=w._descriptors_now()))
     out["status"] = status()
 elif mode == "not_linux":
     def no_library(*args, **kwargs):
         raise AssertionError("the C library was reached on a system without the two calls")
     w.ctypes.CDLL = no_library
     sys.platform = "darwin"
-    out["apply"] = attempt(lambda: w.apply_wall(spec["paths"]))
+    out["apply"] = attempt(lambda: w.apply_wall(spec["paths"], keep_descriptors=w._descriptors_now()))
     out["probe"] = attempt(lambda: w.probe_wall(spec["canary"], spec["daemon"], write_file=spec["canary"], write_folder=spec["writes"]))
     sys.platform = "linux"
     out["status"] = status()
@@ -306,7 +306,8 @@ class WallDefinitionTests(unittest.TestCase):
         fields = set(wall_linux.RECORD_CHECKS) | {"writes", "writes_not_tried", "landlock_abi", "landlock_scopes",
                                                   "arch", "proven"}
         later = {"threads", "descriptors_open_for_write", "memory_maps_open_for_write", "descriptors_seen_by",
-                 "descriptors_unaccounted"}  # required of a proven record only
+                 "descriptors_unaccounted", "descriptors_kept", "descriptors_not_closed", "held_objects",
+                 "held_objects_not_tried"}  # required of a proven record only
         self.assertEqual(set(schema["required"]), fields)
         self.assertEqual(set(schema["then"]["required"]), later)
         self.assertEqual(set(schema["properties"]), fields | later)

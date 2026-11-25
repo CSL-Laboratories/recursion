@@ -234,7 +234,8 @@ def keep(*a, **k):
     seen_lists.append(lists)
     return lists
 w._open_kernel_lists = keep
-w.apply_wall(spec["paths"])
+held_now = [int(name) for name in os.listdir("/proc/self/fd")]  # by the kernel's list: above any limit too
+w.apply_wall(spec["paths"], keep_descriptors=[n for n in held_now if w._identity(n)])
 closed = []
 for fd in seen_lists[0].values() if seen_lists else ():
     try:

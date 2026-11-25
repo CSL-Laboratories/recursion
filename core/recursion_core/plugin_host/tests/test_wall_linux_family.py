@@ -20,6 +20,95 @@ from recursion_core.plugin_host.tests.test_wall_linux_proof import _schema_error
 
 CHILD_TIMEOUT_S = 120  # a bound on one child process of this test; test-side only, not a product figure
 PLANTED_TEXT = b"a file of the test's own, planted for the hand-in\n"
+HELD_STAND_IN = lambda: ({k: "not_tried" if k in wall_linux.HELD_NOT_TRIED else "closed_by_wall"  # noqa: E731
+                          for k in wall_linux.HELD_KINDS}, dict(wall_linux.HELD_NOT_TRIED))
+
+KEEP_CHILD = r'''
+import fcntl, json, os, socket, sys
+spec = json.loads(sys.argv[1])
+sys.path.insert(0, spec["core"])
+from recursion_core.plugin_host import wall_linux as w
+mode, out = spec["mode"], {}
+has_keep = "keep_descriptors" in w.apply_wall.__code__.co_varnames
+held, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)  # the channel, kept
+keep = [1, 2, held.fileno(), peer.fileno()]
+if mode == "owner_kept":
+    read_end, write_end = os.pipe()
+    fcntl.fcntl(read_end, fcntl.F_SETOWN, spec["daemon"])  # a receiver of its signals, set before the wall
+    keep.append(read_end)
+if mode == "k1":
+    held_file = os.open(spec["planted"], os.O_RDONLY | os.O_CLOEXEC)  # held at the wall, closed after it
+    keep += w._descriptors_now() if has_keep else []  # no gap below it, so the kernel gives its number again
+    sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    socket.send_fds(peer, [b"x"], [sender.fileno()])  # in flight until it is received after the wall
+    sender.close()
+out["keep"] = sorted(set(keep) | {0, 1, 2})
+try:
+    if mode == "none" or not has_keep:
+        w.apply_wall(spec["paths"])
+    else:
+        w.apply_wall(spec["paths"], keep_descriptors=keep)
+    out["apply"] = "applied"
+except w.WallRefused as exc:
+    out["apply"], out["applied"] = exc.code, list(w._STATE["applied"])
+    print(json.dumps(out))
+    sys.exit(0)
+if mode == "k1":
+    os.close(held_file)
+    _, fds, _, _ = socket.recv_fds(held, 1, 1)  # the kernel gives it the lowest free number: the closed one's
+    out["closed"], out["received"] = held_file, fds[0]
+record = w.probe_wall(spec["canary"], spec["daemon"], write_folder=spec["folder"])
+out.update(record=record, words=w.why_not_proven(record))
+print(json.dumps(out))
+'''
+
+
+@unittest.skipIf(_why_not_here(), _why_not_here() or "")
+class TheWallClosesWhatIsNotKeptTests(unittest.TestCase):
+    """apply_wall closes every descriptor the host does not keep, after it made one object of each held kind; the
+    probe tries each after the wall, and a descriptor received at the number of one closed since is named."""
+
+    def test_everything_not_kept_is_closed_and_each_held_kind_is_named_with_its_outcome(self):
+        result, _ = run_child(KEEP_CHILD, "closed")
+        record = result["record"]
+        expected = dict.fromkeys(("ring", "datagram_socket", "stream_socket", "signal_owner"), "closed_by_wall")
+        if record["held_objects"]["ring"] == "not_tried":  # a kernel with rings turned off: named with its reason
+            expected["ring"] = "not_tried"
+            self.assertTrue(record["held_objects_not_tried"]["ring"])
+        expected.update(shared_map="not_tried", namespace="not_tried")
+        self.assertEqual(record["held_objects"], expected, result)
+        self.assertEqual(record["held_objects_not_tried"]["shared_map"], wall_linux.HELD_NOT_TRIED["shared_map"])
+        self.assertEqual(record["descriptors_not_closed"], [])
+        self.assertEqual([entry["descriptor"] for entry in record["descriptors_kept"]], result["keep"])
+        self.assertEqual(record["descriptors_kept"][0], {"descriptor": 0, "kind": "character_device"},
+                         "a standard number not kept points at /dev/null")
+        self.assertIs(record["proven"], True, result["words"])
+        self.assertEqual(_schema_errors(record), [])
+
+    def test_with_no_keep_list_a_connected_socket_and_a_preset_signal_still_act_and_nothing_is_proven(self):
+        result, _ = run_child(KEEP_CHILD, "none")
+        record = result["record"]
+        self.assertEqual((record["held_objects"]["stream_socket"], record["held_objects"]["signal_owner"]),
+                         ("acted", "acted"), "what the words say is true: both still act when nothing is closed")
+        self.assertEqual(record["held_objects"]["datagram_socket"], "refused_by_filter")
+        self.assertIsNone(record["descriptors_kept"])
+        self.assertIs(record["proven"], False)
+        self.assertIn(wall_linux.WORDS["keep_not_named"], result["words"])
+        self.assertIn(wall_linux.WORDS["held_acted"].format(what=wall_linux.WORDS["held_stream_socket"]),
+                      result["words"])
+        self.assertEqual(_schema_errors(record), [])
+
+    def test_a_kept_descriptor_with_a_receiver_of_its_signals_is_refused_before_any_change(self):
+        result, _ = run_child(KEEP_CHILD, "owner_kept")
+        self.assertEqual((result["apply"], result.get("applied")), ("wall_keep_refused", []), result)
+
+    def test_a_descriptor_received_at_the_number_of_one_closed_after_the_wall_is_named(self):
+        result, _ = run_child(KEEP_CHILD, "k1")
+        self.assertEqual(result["received"], result["closed"], "the case needs the same number")
+        record = result["record"]
+        self.assertIn({"descriptor": result["closed"], "kind": "socket"}, record["descriptors_unaccounted"] or [])
+        self.assertIs(record["proven"], False)
+        self.assertEqual(_schema_errors(record), [])
 
 HANDIN_CHILD = r'''
 import json, os, socket, sys
@@ -40,7 +129,8 @@ elif mode == "pipe":
     socket.send_fds(peer, [b"x"], [read_end])
     os.close(read_end)
     os.close(write_end)
-w.apply_wall(spec["paths"])
+KEEP = (1, 2, held.fileno()) if "keep_descriptors" in w.apply_wall.__code__.co_varnames else None
+w.apply_wall(spec["paths"], **({} if KEEP is None else {"keep_descriptors": KEEP}))
 if mode != "none":
     _, fds, _, _ = socket.recv_fds(held, 1, 1)
     out["received"] = fds[0]
@@ -91,12 +181,16 @@ elif mode == "datagram":
     unix_receiver.setblocking(False)
     inet_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     unix_sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    connected, connected_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)  # connected before the wall
 elif mode == "owner":
     read_end, write_end = os.pipe()
     folder = os.open(spec["top"], os.O_RDONLY | os.O_DIRECTORY)
     for fd in (read_end, folder):
         fcntl.fcntl(fd, fcntl.F_SETOWN, spec["daemon"])
-w.apply_wall(spec["paths"])
+if "keep_descriptors" in w.apply_wall.__code__.co_varnames:
+    w.apply_wall(spec["paths"], keep_descriptors=(1, 2))
+else:
+    w.apply_wall(spec["paths"])
 if mode == "ring":
     out["enter"] = call("io_uring_enter", ring, 0, 0, 0, 0, 0)
     out["register"] = call("io_uring_register", ring, 0, 0, 0)  # IORING_REGISTER_BUFFERS of nothing
@@ -104,6 +198,7 @@ elif mode == "datagram":
     out["inet_sendto"] = errno_of(lambda: inet_sender.sendto(b"after the wall", inet_receiver.getsockname()))
     out["unix_sendto"] = errno_of(lambda: unix_sender.sendto(b"after the wall", unix_path))
     out["inet_sendmsg"] = errno_of(lambda: inet_sender.sendmsg([b"after"], [], 0, inet_receiver.getsockname()))
+    out["connected_send"] = errno_of(lambda: connected.send(b"after the wall"))
     out["received"] = sum(errno_of(lambda: r.recv(64)) == 0 for r in (inet_receiver, unix_receiver))
 elif mode == "owner":
     out["setsig"] = errno_of(lambda: fcntl.fcntl(read_end, 10, 10))
@@ -118,26 +213,27 @@ print(json.dumps(out))
 
 @unittest.skipIf(_why_not_here(), _why_not_here() or "")
 class HeldObjectsCannotActTests(unittest.TestCase):
-    """An object the host held from before the wall: its use after the wall is refused by the filter (EPERM), and
-    the record, which probes each refusal after the wall, is proven only with them in force."""
+    """An object the host held from before the wall and did not keep: the wall closed it (EBADF), whether the filter
+    would refuse its use or not (a socket connected before the wall), and the record is proven."""
 
     def test_a_ring_made_before_the_wall_cannot_submit_or_register_after_it(self):
         result, _ = run_child(USE_CHILD, "ring")
         if not result["ring_made"]:
             self.skipTest("this kernel makes no ring for this process (io_uring disabled)")
-        self.assertEqual((result["enter"], result["register"]), (1, 1), result)
+        self.assertEqual((result["enter"], result["register"]), (1, 1), result)  # the filter answers first
         self.assertIs(result["record"]["proven"], True)
 
     def test_a_datagram_socket_made_before_the_wall_cannot_send_to_an_address_after_it(self):
         result, _ = run_child(USE_CHILD, "datagram")
-        self.assertEqual((result["inet_sendto"], result["unix_sendto"], result["inet_sendmsg"]), (1, 1, 1), result)
+        self.assertTrue({result["inet_sendto"], result["unix_sendto"], result["inet_sendmsg"]} <= {1, 9}, result)
+        self.assertEqual(result["connected_send"], 9, "a datagram socket connected before the wall is shut by it")
         self.assertEqual(result["received"], 0, "no datagram reached either receiver")
         self.assertIs(result["record"]["proven"], True)
 
     def test_a_signal_owner_set_before_the_wall_gets_no_signal_chosen_after_it(self):
         result, _ = run_child(USE_CHILD, "owner")
-        self.assertEqual((result["setsig"], result["async"], result["notify"]), (1, 1, 1), result)
-        self.assertEqual(result["nonblocking"], 0, "a descriptor's other flags stay the process's to set")
+        self.assertTrue({result["setsig"], result["async"], result["notify"]} <= {1, 9}, result)  # EPERM or EBADF
+        self.assertEqual(result["nonblocking"], 9, "the descriptor itself was shut by the wall")
         self.assertIs(result["record"]["proven"], True)
 
 
@@ -219,6 +315,9 @@ class NoWallInItsOwnProcessTests(unittest.TestCase):
                 mock.patch.object(wall_linux, "_threads_now", lambda: 1), \
                 mock.patch.object(wall_linux, "_descriptors_open_for_write", lambda: []), \
                 mock.patch.object(wall_linux, "_descriptors_now", lambda: [], create=True), \
+                mock.patch.object(wall_linux, "_descriptors_unaccounted", lambda: []), \
+                mock.patch.object(wall_linux, "_kept_and_not_closed", lambda: ([], []), create=True), \
+                mock.patch.object(wall_linux, "_held_objects", HELD_STAND_IN, create=True), \
                 mock.patch.object(wall_linux, "_maps_open_for_write", lambda: []):
             record = wall_linux.probe_wall("/nonexistent-canary", os.getppid())
         self.assertEqual(record["descriptors_seen_by"], "scan_by_number")

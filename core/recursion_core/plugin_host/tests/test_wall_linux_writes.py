@@ -57,7 +57,7 @@ def weaker(abi):  # the real ruleset with the rights of spec["drop"] left unhand
     return struct.pack("<Q", struct.unpack_from("<Q", data)[0] & ~spec["drop"]) + data[8:], scopes
 w._ruleset_attr = weaker
 if spec["wall"]:
-    w.apply_wall(spec["paths"])
+    w.apply_wall(spec["paths"], keep_descriptors=w._descriptors_now())
 record = w.probe_wall(spec["canary"], spec["daemon"], write_file=spec["file"], write_folder=spec["folder"])
 print(json.dumps({"record": record, "words": w.why_not_proven(record)}))
 '''
@@ -299,7 +299,9 @@ def _record(writes: dict) -> dict:
 # The process alone, holding nothing open for writing: stand-ins, for the probes run in this process (the runner's own
 # threads and log files are not the record's to judge).
 ALONE = {"_threads_now": lambda: 1, "_descriptors_open_for_write": lambda: [], "_maps_open_for_write": lambda: [],
-         "_walled_here": lambda: True, "_descriptors_unaccounted": lambda: []}  # as if apply_wall ran here
+         "_walled_here": lambda: True, "_descriptors_unaccounted": lambda: [],
+         "_kept_and_not_closed": lambda: ([], []),
+         "_held_objects": lambda: ({k: "not_tried" if k in wall_linux.HELD_NOT_TRIED else "closed_by_wall" for k in wall_linux.HELD_KINDS}, dict(wall_linux.HELD_NOT_TRIED))}  # as if apply_wall ran here
 
 
 def _refuse(*_args, **_kwargs):
@@ -446,7 +448,7 @@ elif mode == "thread_in_filter":    # a thread starts after Landlock, while the 
     w._filter = filter_then_thread
 held = os.open(spec["held"], os.O_WRONLY | os.O_CLOEXEC) if mode == "descriptor" else None
 try:
-    w.apply_wall(paths)
+    w.apply_wall(paths, keep_descriptors=w._descriptors_now())
     out["apply"] = {"code": "applied", "step": ""}
 except w.WallRefused as exc:
     out["apply"] = {"code": exc.code, "step": exc.step, "detail": exc.detail}

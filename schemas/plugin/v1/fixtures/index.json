@@ -1545,6 +1545,21 @@
       "shows": "The probe ran in a process where no wall was applied: it looked for the descriptors itself, nothing can be accounted against the wall's list, and the record is not proven."
     },
     {
+      "file": "good/wall.v1/h18-no-descriptors-named-to-keep-is-not-proven.json",
+      "schema": "wall.v1.json",
+      "shows": "The host named no descriptors to keep, so the wall closed nothing: a connected stream socket and a pipe signalling an owner, both held from before the wall, still acted after it, and the record is not proven."
+    },
+    {
+      "file": "good/wall.v1/h19-a-descriptor-the-wall-did-not-keep-is-not-proven.json",
+      "schema": "wall.v1.json",
+      "shows": "A descriptor the wall did not keep was still held after it: it is named by number and kind, and the record is not proven."
+    },
+    {
+      "file": "good/wall.v1/h20-a-kernel-without-rings-is-proven-with-the-ring-not-tried.json",
+      "schema": "wall.v1.json",
+      "shows": "Where the kernel makes no ring for the process, the ring is named as not tried with its reason, and the record can still be proven."
+    },
+    {
       "file": "bad/wall.v1/m-wall.v1.then.threads.json",
       "schema": "wall.v1.json",
       "rule": "A proven wall names its threads.",
@@ -1848,6 +1863,267 @@
       "expect": {
         "keyword": "enum",
         "at": "/descriptors_unaccounted/0/kind"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b17-proven-with-no-descriptors-named-to-keep.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall closed every descriptor the host did not keep.",
+      "expect": {
+        "keyword": "type",
+        "at": "/descriptors_kept"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b18-proven-with-a-descriptor-not-closed.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall held no descriptor it did not keep.",
+      "expect": {
+        "keyword": "maxItems",
+        "at": "/descriptors_not_closed"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b19-proven-with-a-held-object-that-acted.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall let no object held from before it act after it.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/held_objects/stream_socket"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b20-proven-with-a-held-kind-missing.json",
+      "schema": "wall.v1.json",
+      "rule": "A record names the outcome of every kind of held object; proven is never said over a kind not probed.",
+      "expect": {
+        "keyword": "required",
+        "at": "/held_objects"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b21-proven-with-a-kind-not-tried-and-no-reason.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names the reason of every kind it did not try.",
+      "expect": {
+        "keyword": "required",
+        "at": "/held_objects_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b22-proven-with-a-ring-not-made.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall made a ring and showed it could not act, or names the kernel's refusal of rings.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/held_objects/ring"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b23-proven-with-a-namespace-said-closed.json",
+      "schema": "wall.v1.json",
+      "rule": "A kind the wall does not make is named not tried, never covered by proven.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/held_objects/namespace"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.descriptors-kept.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names the descriptors it kept.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.descriptors-not-closed.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names the descriptors it did not close.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.held-objects.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names the outcome of each held object it tried.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.held-objects-not-tried.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names the reason of each kind it did not try.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.held-objects.json",
+      "schema": "wall.v1.json",
+      "rule": "The kinds of held objects are the wall's own list: a kind nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/held_objects"
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.held-objects.ring.json",
+      "schema": "wall.v1.json",
+      "rule": "A held object's outcome is one the probe gives.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/held_objects/ring"
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.held-objects-not-tried.json",
+      "schema": "wall.v1.json",
+      "rule": "The reasons name kinds of the wall's own list only.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/held_objects_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.held-objects.ring.json",
+      "schema": "wall.v1.json",
+      "rule": "A record names the outcome of every kind of held object.",
+      "expect": {
+        "keyword": "required",
+        "at": "/held_objects"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.held-objects.datagram-socket.json",
+      "schema": "wall.v1.json",
+      "rule": "A record names the outcome of every kind of held object.",
+      "expect": {
+        "keyword": "required",
+        "at": "/held_objects"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.held-objects.stream-socket.json",
+      "schema": "wall.v1.json",
+      "rule": "A record names the outcome of every kind of held object.",
+      "expect": {
+        "keyword": "required",
+        "at": "/held_objects"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.held-objects.signal-owner.json",
+      "schema": "wall.v1.json",
+      "rule": "A record names the outcome of every kind of held object.",
+      "expect": {
+        "keyword": "required",
+        "at": "/held_objects"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.held-objects.shared-map.json",
+      "schema": "wall.v1.json",
+      "rule": "A record names the outcome of every kind of held object.",
+      "expect": {
+        "keyword": "required",
+        "at": "/held_objects"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.held-objects.namespace.json",
+      "schema": "wall.v1.json",
+      "rule": "A record names the outcome of every kind of held object.",
+      "expect": {
+        "keyword": "required",
+        "at": "/held_objects"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.held-objects-not-tried.namespace.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names why it did not try a namespace.",
+      "expect": {
+        "keyword": "required",
+        "at": "/held_objects_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.descriptors-kept.0.json",
+      "schema": "wall.v1.json",
+      "rule": "A kept descriptor entry is closed: a field nobody defined (a file's name, say) is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/descriptors_kept/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.descriptors-kept.0.descriptor.json",
+      "schema": "wall.v1.json",
+      "rule": "A kept descriptor entry names its number.",
+      "expect": {
+        "keyword": "required",
+        "at": "/descriptors_kept/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.descriptors-kept.0.kind.json",
+      "schema": "wall.v1.json",
+      "rule": "A kept descriptor entry names its kind.",
+      "expect": {
+        "keyword": "required",
+        "at": "/descriptors_kept/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.descriptors-kept.0.kind.json",
+      "schema": "wall.v1.json",
+      "rule": "A kept descriptor's kind is one the kernel gives.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/descriptors_kept/0/kind"
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.descriptors-not-closed.0.json",
+      "schema": "wall.v1.json",
+      "rule": "A not closed descriptor entry is closed: a field nobody defined (a file's name, say) is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/descriptors_not_closed/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.descriptors-not-closed.0.descriptor.json",
+      "schema": "wall.v1.json",
+      "rule": "A not closed descriptor entry names its number.",
+      "expect": {
+        "keyword": "required",
+        "at": "/descriptors_not_closed/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.descriptors-not-closed.0.kind.json",
+      "schema": "wall.v1.json",
+      "rule": "A not closed descriptor entry names its kind.",
+      "expect": {
+        "keyword": "required",
+        "at": "/descriptors_not_closed/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.descriptors-not-closed.0.kind.json",
+      "schema": "wall.v1.json",
+      "rule": "A not closed descriptor's kind is one the kernel gives.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/descriptors_not_closed/0/kind"
       }
     }
   ]

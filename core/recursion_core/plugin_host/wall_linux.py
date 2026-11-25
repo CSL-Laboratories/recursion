@@ -1,7 +1,7 @@
 """The wall a plugin host puts around itself on Linux, before it loads any plugin byte.
 
 A host process makes a write folder of its own and calls ``prepare_write_folder(folder)`` on it, calls
-``apply_wall(read_only_paths)`` on itself while it has ONE thread, then
+``apply_wall(read_only_paths, keep_descriptors=(channel,))`` on itself while it has ONE thread, then
 ``probe_wall(canary_path, daemon_pid, write_file=..., write_folder=folder)``, and sends the record that the
 probe returns (``wall.v1``, ``schemas/plugin/v1/wall.v1.json``); when the record is not proven,
 ``why_not_proven(record)`` gives the sentences a person reads, every word from the one table ``WORDS``. The wall has two parts, both applied by the kernel to this process
@@ -59,6 +59,23 @@ and to everything it starts later, and neither can be lifted again from inside:
    install, threads, ``fork``, pipes, and ``recvmsg`` of a socket handed over on an already open
    channel all stay allowed.
 
+Before its first change ``apply_wall`` makes one object of its own of each kind a process can hold from before a
+wall and still use after it (``HELD_KINDS``: a ring of kernel calls, an unconnected datagram socket with a receiver
+of its own, a connected stream socket pair, a pipe that signals this process itself on every byte), and then CLOSES
+EVERY DESCRIPTOR of the process but the ones the caller keeps (``keep_descriptors``: the host's channel, nothing else),
+by the kernel's ``close_range`` over the gaps between the kept numbers (where the kernel has no ``close_range``, each
+number the kernel's own list names); the standard numbers 0, 1 and 2, where not kept, then point at ``/dev/null`` so
+that no file opened later takes one. A kept descriptor that is not open, or that has a receiver of its signals set (an
+owner, or ``O_ASYNC``), is refused ``wall_keep_refused`` before any change. So a socket connected before the wall, or a
+descriptor whose ``O_ASYNC`` was set before it, acts after the wall only when it is kept, and a kept one sends no
+signal. Where ``keep_descriptors`` is left out (None) nothing is closed and the record is never proven. The record names
+the kept descriptors by kind (``descriptors_kept``) and every other one the kernel's list held after the wall
+(``descriptors_not_closed``, which a proven record holds empty), and ``probe_wall`` tries one harmless act through each
+object the wall made (``held_objects``): proven only when each was closed by the wall or its act refused by the filter;
+a kind the wall does not make is named with its reason (``HELD_NOT_TRIED``), never covered by proven in silence. The
+kernel's list after the wall is kept with each descriptor's identity (device, inode and file type: two sockets differ
+by inode), so a descriptor received after the wall at the number of one closed since is named as one handed in.
+
 The deny list is the wall's own definition, not a setting: there is no row, flag or argument that
 shortens it. Landlock below ABI 4 does not limit TCP and below ABI 6 does not scope signals; the seccomp
 filter shuts both here (``socket``, ``connect`` and every way named above to signal, limit, slow or move
@@ -112,7 +129,7 @@ import threading
 
 __all__ = ["CALLER_ONLY_CALLS", "CALLER_ONLY_PRIORITY_CALLS", "DENIED_CALLS", "DENIED_FCNTL_COMMANDS",
            "DENIED_IOCTL_COMMANDS", "DENIED_IPC_CALLS", "DENIED_METADATA_CALLS", "DENIED_SIGNAL_CALLS",
-           "DENIED_TERMINAL_COMMANDS", "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WORDS",
+           "DENIED_TERMINAL_COMMANDS", "HELD_KINDS", "HELD_NOT_TRIED", "HELD_OUTCOMES", "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WORDS",
            "WRITES_NOT_TRIED", "WRITE_FILE_NAME", "WRITE_FOLDER_NAMES", "WRITE_KINDS", "WRITE_OUTCOMES", "WallRefused", "apply_wall",
            "prepare_write_folder", "probe_wall", "why_not_proven"]
 
@@ -157,6 +174,10 @@ DENIED_FCNTL_COMMANDS = {"F_SETOWN": 8, "F_SETOWN_EX": 15, "F_SETLEASE": 1024, "
 # fcntl F_SETFL is refused only when its argument asks O_ASYNC (signals on every change of the descriptor); the
 # other flags (O_NONBLOCK, which a socket's setblocking sets) stay allowed. The same values on x86_64 and aarch64.
 _F_SETFL, _O_ASYNC = 4, 0o20000
+_F_GETOWN_EX = 16             # struct f_owner_ex {int type; pid_t pid}: a pid of 0 is no owner
+_SIGURG = 23                  # the same on x86_64 and aarch64; ignored unless a process asks for it
+_RING_PARAMS = 120            # sizeof(struct io_uring_params): the kernel's interface
+_CLOSE_RANGE_TOP = 0xFFFFFFFF  # close_range's last number: every number above the last kept one
 # ioctl commands: another process as the receiver of a socket's signals; a file's attribute flags.
 DENIED_IOCTL_COMMANDS = {"FIOSETOWN": 0x8901, "SIOCSPGRP": 0x8902, "FS_IOC_SETFLAGS": 0x40086602,
                          "FS_IOC_FSSETXATTR": 0x401C5820}
@@ -213,7 +234,7 @@ _NR_MORE = {
         "mq_timedsend": 242, "mq_timedreceive": 243, "mq_notify": 244, "mq_getsetattr": 245,
         "prlimit64": 302, "sched_setaffinity": 203, "sched_setscheduler": 144, "sched_setparam": 142,
         "sched_setattr": 314, "migrate_pages": 256, "move_pages": 279, "setpriority": 141, "ioprio_set": 251,
-        "fcntl": 72, "ioctl": 16, "clone": 56, "clone3": 435, "sendto": 44,
+        "fcntl": 72, "ioctl": 16, "clone": 56, "clone3": 435, "sendto": 44, "close_range": 436,
         "truncate": 76, "ftruncate": 77, "openat2": 437, "open": 2, "openat": 257,
     },
     "aarch64": {
@@ -226,7 +247,7 @@ _NR_MORE = {
         "mq_timedsend": 182, "mq_timedreceive": 183, "mq_notify": 184, "mq_getsetattr": 185,
         "prlimit64": 261, "sched_setaffinity": 122, "sched_setscheduler": 119, "sched_setparam": 118,
         "sched_setattr": 274, "migrate_pages": 238, "move_pages": 239, "setpriority": 140, "ioprio_set": 30,
-        "fcntl": 25, "ioctl": 29, "clone": 220, "clone3": 435, "sendto": 206,
+        "fcntl": 25, "ioctl": 29, "clone": 220, "clone3": 435, "sendto": 206, "close_range": 436,
         "truncate": 45, "ftruncate": 46, "openat2": 437, "openat": 56,
     },
 }
@@ -302,6 +323,25 @@ WRITES_NOT_TRIED = {
                                   "rights beneath another folder would not show here; apply_wall adds rules with "
                                   "read and execute rights only",
 }
+# The kinds of object a process can hold from before a wall and still use after it, of which apply_wall makes one of
+# its own before it closes every descriptor not kept; probe_wall tries one harmless act through each (the record's
+# field ``held_objects``). The wall's own definition, not a setting.
+HELD_KINDS = ("ring", "datagram_socket", "stream_socket", "signal_owner", "shared_map", "namespace")
+# The outcome of one kind: a proven record holds only the first two, or not_tried with its reason.
+HELD_OUTCOMES = ("closed_by_wall", "refused_by_filter", "acted", "error", "not_made", "not_tried")
+_HELD_HELD = HELD_OUTCOMES[:2]
+# The kinds the wall does not make, each with the reason (the record's field ``held_objects_not_tried``).
+HELD_NOT_TRIED = {
+    "shared_map": "a map is not a descriptor, so the close step cannot reach it: the record names every map of a file "
+                  "held shared and writable (memory_maps_open_for_write) and is never proven with one, so the wall "
+                  "makes none of its own",
+    "namespace": "entering a namespace changes the whole process the host runs in, so the wall enters none of its "
+                 "own; in a namespace entered before the wall the filter refuses unshare, setns, clone with a "
+                 "namespace flag, mount and umount2, and the newer mount calls are not refused by name",
+}
+_RING_OFF = ("the kernel made no ring of kernel calls for this process before the wall (rings turned off), so there "
+             "was none to try")
+
 # The file the probe opens for writing and cuts to its own length: made by prepare_write_folder itself in the write
 # folder, with a mode only the user holds, and reached by the probe only through a descriptor opened without
 # following a link. A file name, not a figure.
@@ -393,6 +433,25 @@ WORDS = {
     "no_wall_here": "The plugin host did not shut itself in within this process, so this test shows nothing of a "
                     "sandbox of its own, and nothing was loaded. What you can do: start the plugin host as its own "
                     "program, as the daemon does, so that it shuts itself in before it tests itself.",
+    "keep_not_named": "The plugin host did not say which of its open files and connections to keep when it shut "
+                      "itself in, so the sandbox closed none of them, and one opened before could still act after "
+                      "it. What you can do: start the plugin host as the daemon does, keeping its channel only.",
+    "descriptor_not_closed": "A {kind} was still open after the plugin host shut itself in, though the host had not "
+                             "kept it, so something opened before could still act after it.",
+    "held_acted": "Something opened before the plugin host shut itself in could still act after it: {what}. The "
+                  "sandbox is not shown to hold while it can.",
+    "held_not_made": "Not tested, because the sandbox could not make one of its own before it shut itself in: {what}.",
+    "keep_not_open": "A descriptor given to the sandbox to keep ({descriptor}) is not an open descriptor. What you can "
+                     "do: keep only the plugin host's channel, by its descriptor number.",
+    "keep_signal_owner": "A descriptor given to the sandbox to keep ({descriptor}) has a receiver of its signals set "
+                         "(an owner, or signals on every change), so a signal could reach a process outside the sandbox. What you can "
+                         "do: keep only the channel, with no receiver of its signals set.",
+    "held_ring": "a queue of kernel calls opened before",
+    "held_datagram_socket": "a connection that sends to an address of its choosing (a datagram socket)",
+    "held_stream_socket": "a connection connected before (a stream socket)",
+    "held_signal_owner": "a pipe set before to signal a process on every change",
+    "held_shared_map": "a file mapped shared and writable",
+    "held_namespace": "a namespace entered before",
     "regular_file": "file",
     "block_device": "disk or other block device",
     "character_device": "terminal or other character device",
@@ -414,6 +473,9 @@ _STATE: dict = {"applied": [], "failed": None, "scopes": [], "landlock_handled":
 # The folder and the file that prepare_write_folder made in THIS process, each as (device, inode): the probe
 # refuses a folder or a file that is not the one it made.
 _MADE: dict = {}
+# The objects apply_wall made of each kind of HELD_KINDS before its close step, in THIS process: per kind the
+# descriptor numbers and their identities at the making (or the reason a kind was not made).
+_PLANTED: dict = {}
 
 
 class WallRefused(Exception):
@@ -658,7 +720,7 @@ def _apply_landlock(libc, abi: int, opened: list[tuple[int, int]]) -> None:
         os.close(ruleset)
 
 
-def apply_wall(read_only_paths) -> None:
+def apply_wall(read_only_paths, keep_descriptors=None) -> None:
     """Wall this process in: Landlock (read and map only ``read_only_paths``), then the one seccomp filter.
 
     ``read_only_paths`` is read whole into a list before the threads are counted, so that reading it cannot
@@ -668,6 +730,11 @@ def apply_wall(read_only_paths) -> None:
     ``OSError`` before any change as well. A kernel failure at any step, more than one thread immediately before
     ``landlock_restrict_self`` (``threads_before_landlock``) or after the filter (``threads_after_filter``), and a
     second call in a process walled already in whole or in part, is refused ``wall_partial`` with ``step`` set.
+
+    ``keep_descriptors`` names the descriptors the process keeps through the wall (its channel; empty keeps none):
+    each must be open with no receiver of its signals set, else ``wall_keep_refused`` before any change. Before the
+    first change of the wall every other descriptor is closed (step ``close_descriptors``), after one object of each
+    kind of ``HELD_KINDS`` is made for the probe to try. None (left out) closes nothing, and the record is never proven.
     """
     libc = _libc()
     arch = _arch()
@@ -684,6 +751,11 @@ def apply_wall(read_only_paths) -> None:
     abi = _landlock_abi(libc)
     if abi < _MIN_LANDLOCK_ABI:
         raise WallRefused("landlock_unavailable", "this kernel gives this process no Landlock (ABI 1, Linux 5.13, at least)")
+    kept = None if keep_descriptors is None else _kept(keep_descriptors)  # refused before any change
+    _plant_held()
+    if kept is not None:
+        _step("close_descriptors", lambda: _close_all_but(kept))
+    _STATE["kept"] = kept
     lists = _open_kernel_lists()  # for reading, before the wall; both are closed before this call returns
     try:
         opened = _open_paths(paths)
@@ -700,6 +772,108 @@ def apply_wall(read_only_paths) -> None:
         for fd in lists.values():
             if fd is not None:
                 os.close(fd)
+
+
+def _identity(number: int):
+    """What tells the object of descriptor ``number`` apart from any other: (device, inode, file type), as the kernel
+    gives them (two sockets, two pipes differ by inode); None when the number is not open."""
+    try:
+        found = os.fstat(number)
+    except OSError:
+        return None
+    return [found.st_dev, found.st_ino, stat.S_IFMT(found.st_mode)]
+
+
+def _kept(keep_descriptors) -> list:
+    """The descriptors the caller keeps through the wall, sorted, each open and with no receiver of its signals set (no
+    owner, no O_ASYNC); else ``wall_keep_refused``, before any change."""
+    import fcntl
+    kept = []
+    for number in list(keep_descriptors):
+        if not isinstance(number, int) or isinstance(number, bool) or number < 0:
+            raise WallRefused("wall_keep_refused", WORDS["keep_not_open"].format(descriptor=repr(number)[:32]))
+        try:
+            flags = fcntl.fcntl(number, fcntl.F_GETFL)
+            owner = struct.unpack("<ii", fcntl.fcntl(number, _F_GETOWN_EX, bytes(8)))[1]
+        except OSError:
+            raise WallRefused("wall_keep_refused", WORDS["keep_not_open"].format(descriptor=number)) from None
+        if owner != 0 or flags & _O_ASYNC:
+            raise WallRefused("wall_keep_refused", WORDS["keep_signal_owner"].format(descriptor=number))
+        kept.append(number)
+    return sorted(set(kept))
+
+
+def _plant_held() -> None:
+    """One object of the wall's own of each kind of ``HELD_KINDS`` that it can make, before the close step: a ring
+    with one entry; an unconnected datagram socket and a receiver bound to an address the kernel picks (no file);
+    a connected stream socket pair; a pipe whose read end signals this process itself with SIGURG (ignored unless
+    asked for) on every byte. A kind that cannot be made is passed over (not_made); a ring the kernel does not make
+    for this process is named with its reason."""
+    import fcntl
+    _PLANTED.clear()
+    libc = _libc()
+
+    def made(kind, numbers, **extra):
+        _PLANTED[kind] = dict(extra, numbers=list(numbers), ids=[_identity(n) for n in numbers])
+    params = ctypes.create_string_buffer(_RING_PARAMS)
+    ring, err = _call(libc, _NR[_arch()]["io_uring_setup"], 1, ctypes.addressof(params))
+    if ring >= 0:
+        made("ring", [ring])
+    elif err in (errno.EPERM, errno.ENOSYS):
+        _PLANTED["ring"] = {"not_tried": _RING_OFF}
+    try:
+        receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        receiver.bind("")  # an address the kernel picks, in no folder
+        address = receiver.getsockname()
+        sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        made("datagram_socket", [sender.detach(), receiver.detach()],
+             address=address if isinstance(address, bytes) else address.encode())
+    except OSError:
+        pass
+    try:
+        one, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        made("stream_socket", [one.detach(), other.detach()])
+    except OSError:
+        pass
+    try:
+        read_end, write_end = os.pipe()
+        fcntl.fcntl(read_end, fcntl.F_SETOWN, os.getpid())
+        fcntl.fcntl(read_end, DENIED_FCNTL_COMMANDS["F_SETSIG"], _SIGURG)
+        fcntl.fcntl(read_end, fcntl.F_SETFL, fcntl.fcntl(read_end, fcntl.F_GETFL) | _O_ASYNC)
+        made("signal_owner", [write_end, read_end])
+    except OSError:
+        pass
+
+
+def _close_all_but(kept) -> None:
+    """Close every descriptor of this process but ``kept`` (sorted): close_range over each gap between the kept numbers
+    and above the last (where the kernel has no close_range, each number its list names); then each of 0, 1 and 2 that
+    is not kept points at /dev/null, so that no file opened later takes a standard number."""
+    libc, arch = _libc(), _arch()
+    number = _NR_MORE[arch]["close_range"]
+    edges = [-1] + list(kept)
+    gaps = [(low + 1, high - 1) for low, high in zip(edges, edges[1:]) if high - low > 1]
+    gaps.append((edges[-1] + 1, _CLOSE_RANGE_TOP))
+    result, err = _call(libc, number, gaps[0][0], gaps[0][1], 0)
+    if result < 0 and err == errno.ENOSYS:
+        for name in os.listdir("/proc/self/fd"):
+            if int(name) not in kept:
+                try:
+                    os.close(int(name))
+                except OSError:
+                    pass
+    else:
+        _kernel("close_range", result, err)
+        for low, high in gaps[1:]:
+            _kernel("close_range", *_call(libc, number, low, high, 0))
+    standard = [n for n in range(3) if n not in kept]
+    if standard:
+        null = os.open("/dev/null", os.O_RDWR)
+        for n in standard:
+            if n != null:
+                os.dup2(null, n)
+        if null not in standard:
+            os.close(null)
 
 
 def _open_kernel_lists() -> dict:
@@ -726,6 +900,7 @@ def _read_kernel_lists(lists: dict) -> dict:
         if numbers is not None:
             ours = {fd for fd in lists.values() if fd is not None}
             seen["numbers"] = [number for number in numbers if number not in ours]
+            seen["identities"] = {number: _identity(number) for number in seen["numbers"]}
             seen["descriptors"] = _named_for_write(seen["numbers"])
     if lists.get("maps") is not None:
         try:
@@ -1126,14 +1301,77 @@ def _walled_here() -> bool:
 
 
 def _descriptors_unaccounted():
-    """Each descriptor held now that the kernel's list read after the wall did not hold (one handed in since), as
-    ``_named_kinds`` names it; None where apply_wall did not run in this process or not every one could be seen."""
+    """Each descriptor held now that the kernel's list read after the wall did not hold (one handed in since), or that
+    it held as another object (received at the number of one closed since: its identity differs), as ``_named_kinds``
+    names it; None where apply_wall did not run in this process or not every one could be seen."""
     seen = _STATE.get("seen_at_wall")
     at_wall = seen.get("numbers") if seen else None
     numbers = None if at_wall is None else _descriptors_now()
     if numbers is None:
         return None
-    return _named_kinds(number for number in numbers if number not in set(at_wall))
+    identities = seen.get("identities") or {}
+    return _named_kinds(number for number in numbers
+                        if number not in set(at_wall) or identities.get(number) != _identity(number))
+
+
+def _kept_and_not_closed():
+    """(descriptors_kept, descriptors_not_closed): the descriptors apply_wall kept (the caller's, and 0, 1 and 2, which
+    it points at /dev/null where not kept), by kind, and each other descriptor the kernel's list held after the wall;
+    (None, None) where no keep list was given or the list could not be read."""
+    kept, seen = _STATE.get("kept"), _STATE.get("seen_at_wall")
+    at_wall = seen.get("numbers") if seen else None
+    if kept is None or at_wall is None:
+        return None, None
+    held = sorted(set(kept) | set(range(3)))
+    return _named_kinds(held), _named_kinds(number for number in at_wall if number not in held)
+
+
+def _held_act(libc, kind: str, made: dict) -> None:
+    """One harmless act through an object apply_wall made: a submission of nothing to the ring, one byte sent to the
+    wall's own receiver by address, one byte on the stream, one byte into the pipe (its signal goes to this process
+    itself and is ignored)."""
+    numbers = made["numbers"]
+    if kind == "ring":
+        _sys(libc, "io_uring_enter", numbers[0], 0, 0, 0, 0, 0)
+    elif kind == "datagram_socket":
+        address = struct.pack("<H", socket.AF_UNIX) + made["address"]
+        data, target = ctypes.create_string_buffer(b"x", 1), ctypes.create_string_buffer(address, len(address))
+        _sys(libc, "sendto", numbers[0], ctypes.addressof(data), 1, 0, ctypes.addressof(target), len(address))
+    else:
+        os.write(numbers[0], b"x")
+
+
+def _held_objects() -> tuple:
+    """(held_objects, held_objects_not_tried): per kind of ``HELD_KINDS`` its outcome after the wall, and the reason of
+    each kind not tried. An object whose every descriptor is no longer the one apply_wall made was closed by the wall;
+    else one act is tried through it (refused EPERM: refused_by_filter; done: acted) and the probe closes it."""
+    outcomes, reasons = dict.fromkeys(HELD_KINDS, "not_made"), {}
+    for kind, reason in HELD_NOT_TRIED.items():
+        outcomes[kind], reasons[kind] = "not_tried", reason
+    libc = _libc()
+    for kind, made in list(_PLANTED.items()):
+        if "not_tried" in made:
+            outcomes[kind], reasons[kind] = "not_tried", made["not_tried"]
+            continue
+        still = [n for n, i in zip(made["numbers"], made["ids"]) if _identity(n) == i]
+        if not still:
+            outcomes[kind] = "closed_by_wall"
+            continue
+        try:
+            _held_act(libc, kind, made)
+        except PermissionError:
+            outcomes[kind] = "refused_by_filter"
+        except OSError:
+            outcomes[kind] = "error"
+        else:
+            outcomes[kind] = "acted"
+        for number in still:
+            try:
+                os.close(number)
+            except OSError:
+                pass
+    _PLANTED.clear()
+    return outcomes, reasons
 
 
 def _descriptors_now():
@@ -1229,6 +1467,23 @@ def why_not_proven(record: dict) -> list:
     elif ("descriptors_unaccounted" in record and record.get("descriptors_seen_by") != "scan_by_number"
           and isinstance(record.get("descriptors_open_for_write"), list)):
         lines.append(WORDS["descriptors_unknown"])
+    if ("descriptors_kept" in record and not isinstance(record["descriptors_kept"], list)
+            and record.get("descriptors_seen_by") == "kernel_list_after_wall"):
+        lines.append(WORDS["keep_not_named"])
+    if isinstance(record.get("descriptors_not_closed"), list):
+        for entry in record["descriptors_not_closed"]:
+            kind = entry.get("kind") if isinstance(entry, dict) else None
+            known = kind in _FILE_KINDS.values() or kind == _OTHER_KIND
+            lines.append(WORDS["descriptor_not_closed"].format(kind=WORDS[kind] if known else WORDS[_OTHER_KIND]))
+    if "held_objects" in record:
+        held = record["held_objects"] if isinstance(record["held_objects"], dict) else {}
+        reasons = record.get("held_objects_not_tried") if isinstance(record.get("held_objects_not_tried"), dict) else {}
+        for kind in HELD_KINDS:
+            outcome = held.get(kind, "not_made")
+            if outcome in _HELD_HELD or (outcome == "not_tried" and reasons.get(kind)):
+                continue
+            key = {"acted": "held_acted", "error": "error"}.get(outcome, "held_not_made")
+            lines.append(WORDS[key].format(what=WORDS["held_" + kind]))
     if "memory_maps_open_for_write" in record:
         maps = record["memory_maps_open_for_write"]
         if not isinstance(maps, list):
@@ -1268,7 +1523,10 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
     ``prepare_write_folder`` before the wall); ``writes`` holds the outcome of each, and ``writes_not_tried``
     names every kind the probe does not try, with its reason: ``proven`` covers the kinds in ``writes`` only.
     ``proven`` is True only when ``apply_wall`` ran in this process (``descriptors_seen_by`` is
-    ``kernel_list_after_wall``), no descriptor is held that the wall's list did not hold, the process has one
+    ``kernel_list_after_wall``) with a keep list, closing every descriptor it did not keep (``descriptors_kept``,
+    ``descriptors_not_closed`` empty), each object of ``HELD_KINDS`` it made could not act after the wall
+    (``held_objects``: closed by the wall or refused by the filter; a kind not tried named with its reason in
+    ``held_objects_not_tried``), no descriptor is held that the wall's list did not hold, the process has one
     thread, no descriptor open for writing, all eight checks
     are refused, every write kind is refused by the part of the wall that holds it, on a supported arch with
     Landlock ABI 1 or above, and no step of ``apply_wall`` failed in this process; without a write file and
@@ -1285,6 +1543,8 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
     # wall did not hold (handed in since), and the ones open for writing, now or at the wall
     unaccounted, held, seen = _descriptors_unaccounted(), _descriptors_open_for_write(), _STATE.get("seen_at_wall")
     seen_by = "kernel_list_after_wall" if _walled_here() else "scan_by_number"
+    kept, not_closed = _kept_and_not_closed()
+    held_objects, held_not_tried = _held_objects()
     maps = seen["maps"] if seen else _maps_open_for_write()
     record = {
         "threads": threads,
@@ -1292,6 +1552,8 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
         "memory_maps_open_for_write": maps,
         "descriptors_seen_by": seen_by,
         "descriptors_unaccounted": unaccounted,
+        "descriptors_kept": kept,
+        "descriptors_not_closed": not_closed,
         "reads_outside": _refused(_read_root),
         "home_canary": _refused(lambda: _read_canary(canary)),
         "program_start": _refused(_start_program),
@@ -1302,11 +1564,17 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
         "kernel_surface": _refused(_kernel_surface),
         "writes": _write_outcomes(write_file, write_folder),
         "writes_not_tried": dict(WRITES_NOT_TRIED),
+        "held_objects": held_objects,
+        "held_objects_not_tried": held_not_tried,
         "landlock_abi": _landlock_abi(libc),
         "landlock_scopes": list(_STATE["scopes"]),
         "arch": platform.machine() or "unknown",
     }
     record["proven"] = (seen_by == "kernel_list_after_wall" and unaccounted == []
+                        and isinstance(kept, list) and not_closed == []
+                        and all(held_objects[kind] in _HELD_HELD
+                                or (held_objects[kind] == "not_tried" and held_not_tried.get(kind))
+                                for kind in HELD_KINDS)
                         and threads == 1 and held == [] and maps == []
                         and all(record[name] for name in RECORD_CHECKS) and record["landlock_abi"] >= _MIN_LANDLOCK_ABI
                         and all(record["writes"][kind] in _WRITE_REFUSED for kind in WRITE_KINDS)

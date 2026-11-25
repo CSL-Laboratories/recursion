@@ -4,6 +4,20 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `wall.v1.json` is `1.0-draft.8` (Nov 24, 2026)
+
+An additive step: every field and value of draft 7 keeps its meaning, and a record that is not proven still
+validates. A record gains `descriptors_kept` (the descriptors the wall kept when it closed every other one before its
+first change: the host's channel, and 0, 1 and 2 pointed at /dev/null; null where the host named nothing to keep),
+`descriptors_not_closed` (every other descriptor the kernel's list held after the wall), `held_objects` (per kind of
+object a process can hold from before a wall, `ring`, `datagram_socket`, `stream_socket`, `signal_owner`,
+`shared_map` and `namespace`, the outcome of one act tried after the wall: `closed_by_wall`, `refused_by_filter`,
+`acted`, `error`, `not_made` or `not_tried`) and `held_objects_not_tried` (the reason of each kind not tried). A proven
+record needs all four: a keep list, nothing not closed, every kind closed or refused, `shared_map` and `namespace`
+not tried with their reasons, and the ring not tried only where the kernel made none. What it breaks: a draft 7 record
+that says proven does not validate at draft 8. 3 good fixtures (`h18` to `h20`) and 29 bad ones
+are added; every proven fixture of draft 7 gains the four fields, so that each still fails for its own reason only.
+
 ## `wall.v1.json` is `1.0-draft.7` (Nov 24, 2026)
 
 An additive step: every field and value of draft 6 keeps its meaning, and a record that is not proven still

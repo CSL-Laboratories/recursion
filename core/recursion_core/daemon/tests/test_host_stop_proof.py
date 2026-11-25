@@ -7,6 +7,7 @@ Stand-in user managers only: no unit is started and no process but this test's t
 from __future__ import annotations
 
 import logging
+import random
 import socket
 import subprocess
 import sys
@@ -502,6 +503,201 @@ class AHostOfAnEarlierLifeIsStoppedAndReported(_Folder):
         self.assertIn('Do not trust that host', found[1])  # the stand-in still shows it restarting
         self.assertEqual(units.status()['strays'], found)
         self.assertNotIn(ours, system.stops)
+
+
+RACE_ROUNDS = 2000  # rounds of each race of a start inside the making of its unit with the daemon's Stop (a test figure)
+RACE_HOLD_S = 0.004  # the longest the stand-in's making of a unit takes in those races (a test figure)
+RACE_LEAD_S = 0.003  # the longest the race waits before its Stop begins (a test figure)
+
+
+class RacingSystem(FakeSystem):
+    """A stand-in user manager whose making of a unit takes a random while, up to ``hold``, after the host exists, so a
+    Stop can begin while a start is inside it. A host is a thread that lives until the kill or the end of its channel,
+    as a real host does; ``inside`` is set once a host exists."""
+
+    def __init__(self, test, **options):
+        super().__init__(test, limit=10 ** 6, **options)
+        self.hold, self.inside, self.lock, self.threads = 0.0, threading.Event(), threading.Lock(), {}
+
+    def start_piped(self, unit, argv, channel, **options):
+        end = channel.dup()
+        with self.lock:
+            self.started.append(unit)
+            self.ends.append((unit, end))
+
+        def host():
+            try:
+                end.sendall(hc.encode(hs.HELLO))
+                while end.recv(1 << 16):
+                    pass
+            except OSError:
+                pass
+            end.close()
+
+        thread = threading.Thread(target=host, daemon=True)
+        self.threads[unit] = thread
+        thread.start()
+        self.inside.set()
+        if self.hold:
+            time.sleep(random.uniform(0, self.hold))
+        return hs.StandInProcess()
+
+    def own_fault(self, unit):
+        """The host of ``unit`` ends by its own fault: its end of the channel shuts, with no kill."""
+        for name, end in list(self.ends):
+            if name == unit:
+                try:
+                    end.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def alive(self, unit):
+        thread = self.threads.get(unit)
+        return thread is not None and thread.is_alive()
+
+
+@unittest.skipUnless(LINUX, 'the launcher is Linux only')
+class AStartInsideTheMakingOfItsUnitIsSeenByTheStop(_Folder):
+    """A start whose unit the system is making as a Stop begins: the Stop waits for it within its bound and proves the
+    host it records, or names it; never a host alive when the Stop returns that the Stop neither ended nor named."""
+
+    def units(self, system, **options):
+        options.setdefault('stop_confirm_s', SHORT)
+        options.setdefault('stop_confirm_poll_s', POLL)
+        units = host_units.PluginHostUnits(system, self.state, hs.StandInCore(), python='/stand-in/python', **options)
+        self.addCleanup(units.close)
+        return units
+
+    def race(self, through_a_call):
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        system = RacingSystem(self)
+        unseen, handed = [], []
+        for number in range(RACE_ROUNDS):
+            system.hold = 0.0
+            units = host_units.PluginHostUnits(system, self.state, hs.StandInCore(), python='/stand-in/python',
+                                               stop_confirm_s=SHORT, stop_confirm_poll_s=POLL)
+            first = len(system.started)
+            units.start('stand.run', *hs.package(hs.POLITE, 'stand.run'))
+            system.inside.clear()
+            if through_a_call:  # its host ends by its own fault, and the next call starts a new one
+                system.own_fault(units.unit_of('stand.run').unit)
+                with self.assertRaises(host_units.HostUnavailable):
+                    units.call('stand.run', 'operator', {'command': 'one'})
+                system.inside.clear()
+                system.hold = RACE_HOLD_S
+                work = hs.in_thread(lambda: units.call('stand.run', 'operator', {'command': 'two'}))
+            else:
+                system.hold = RACE_HOLD_S
+                work = hs.in_thread(lambda: units.start('stand.late', *hs.package(hs.POLITE, 'stand.late')))
+            if number % 2:
+                system.inside.wait(hs.JOIN_S)
+            time.sleep(random.uniform(0, RACE_LEAD_S))
+            named = units.close()
+            made = system.started[first:]
+            for unit in made:
+                if system.alive(unit) and unit not in system.killed and not named:
+                    unseen.append(unit)  # alive when the Stop returned, neither ended by it nor named
+            thread, box = work
+            thread.join(hs.JOIN_S)
+            self.assertFalse(thread.is_alive())
+            if 'value' in box and not through_a_call and box['value'].unit not in system.killed:
+                handed.append(box['value'].unit)  # a host given to its caller that the Stop did not end
+            system.hang_up_all()
+            system.ends.clear()
+        return unseen, handed
+
+    def test_the_plain_race_of_a_start_with_the_daemons_stop_leaves_no_host_alive_and_unnamed(self):
+        unseen, handed = self.race(through_a_call=False)
+        print(f'\nRACE start rounds={RACE_ROUNDS} alive and unnamed at the Stop\'s return: {len(unseen)}; '
+              f'handed to a caller: {len(handed)}')
+        self.assertEqual(unseen, [])
+        self.assertEqual(handed, [])
+
+    def test_the_race_of_a_calls_new_host_with_the_daemons_stop_leaves_no_host_alive_and_unnamed(self):
+        unseen, _ = self.race(through_a_call=True)
+        print(f'\nRACE call rounds={RACE_ROUNDS} alive and unnamed at the Stop\'s return: {len(unseen)}')
+        self.assertEqual(unseen, [])
+
+    def test_a_start_that_records_its_host_within_the_bound_is_ended_and_proven_by_the_stop(self):
+        system = HeldLaunch(self)
+        units = self.units(system)
+        thread, box = hs.in_thread(lambda: units.start('stand.in', *hs.package(hs.POLITE)))
+        self.assertTrue(system.inside.wait(hs.CHILD_LIMIT_S))
+        letting_go = hs.in_thread(lambda: (time.sleep(SHORT / 3), system.go.set()))
+        began = time.monotonic()
+        named = units.close()
+        took = time.monotonic() - began
+        (unit,) = system.started
+        self.assertEqual(named, [])
+        self.assertIn(unit, system.killed)  # ended before the Stop returned
+        self.assertEqual(units.status()['plugins']['stand.in']['life'], 'ended')  # and proven by it
+        self.assertEqual(units.status()['starts_still_making'], [])
+        self.assertLess(took, SHORT + POLL + HANG_SLACK)
+        letting_go[0].join(hs.JOIN_S)
+        thread.join(hs.JOIN_S)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn('value', box)
+        self.assertEqual(box['error'].reason, 'stopped')
+        self.assertIsNone(units.unit_of('stand.in'))
+
+    def test_a_start_that_reaches_the_making_of_its_unit_after_the_daemons_stop_began_makes_no_unit(self):
+        system = FakeSystem(self)
+        units = self.units(system)
+        inside, go = threading.Event(), threading.Event()
+        self.addCleanup(go.set)
+        real = host_units.secrets.token_hex
+
+        def held(size):  # the start is past its first look at the Stop and has not reached the making of its unit
+            inside.set()
+            go.wait(hs.CHILD_LIMIT_S)
+            return real(size)
+        with unittest.mock.patch.object(host_units.secrets, 'token_hex', held):
+            thread, box = hs.in_thread(lambda: units.start('stand.in', *hs.package(hs.POLITE)))
+            self.assertTrue(inside.wait(hs.CHILD_LIMIT_S))
+            self.assertEqual(units.close(), [])  # no start was making a unit
+            go.set()
+            thread.join(hs.CHILD_LIMIT_S)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual((box['error'].reason, box['error'].detail), ('stopped', 'the daemon is closing'))
+        self.assertEqual(system.started, [])  # no unit was made
+
+    def assert_named_then_ended(self, stop):
+        system = HeldLaunch(self)
+        units = self.units(system)
+        thread, box = hs.in_thread(lambda: units.start('stand.in', *hs.package(hs.POLITE)))
+        self.assertTrue(system.inside.wait(hs.CHILD_LIMIT_S))
+        began = time.monotonic()
+        with self.assertLogs(host_units.log, logging.ERROR) as logged:
+            named = stop(units)
+        took = time.monotonic() - began
+        self.assertGreaterEqual(took, SHORT)  # it waited for the start, within its bound
+        self.assertLess(took, 3 * SHORT + POLL + HANG_SLACK)  # and never past its promised bounds
+        (words,) = named
+        self.assertIn('a start of stand.in was making its unit as a Stop began and had not recorded its host within '
+                      '0.3 s (plugin_host.stop_confirm_s), so that Stop could not end it: its host may still appear, '
+                      'and that start ends it and proves it as soon as it records it. Do not take it as stopped until '
+                      'the status shows that host ended', words)
+        self.assertIn(words, logged.output[0])
+        self.assertEqual(units.status()['starts_still_making'], [{'plugin': 'stand.in', 'words': words}])
+        (unit,) = system.started
+        self.assertNotIn(unit, system.killed)  # not seen by the Stop: named, not called stopped
+        system.go.set()
+        thread.join(hs.CHILD_LIMIT_S)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn('value', box)  # the host it made is handed to no caller
+        self.assertEqual(box['error'].reason, 'stopped')
+        self.assertEqual(system.killed, [unit])  # its own start ended it, by the kill
+        self.assertIsNone(units.unit_of('stand.in'))
+        shown = units.status()
+        self.assertEqual(shown['plugins']['stand.in']['life'], 'ended')  # and proved it
+        self.assertEqual(shown['starts_still_making'], [])  # the name goes once the host's own record says ended
+
+    def test_a_start_still_making_its_unit_when_the_daemons_stop_bound_ends_is_named_and_ends_its_host(self):
+        self.assert_named_then_ended(lambda units: units.close())
+
+    def test_a_start_still_making_its_unit_when_a_plugins_stop_bound_ends_is_named_and_ends_its_host(self):
+        self.assert_named_then_ended(lambda units: units.stop('stand.in'))
 
 
 if __name__ == '__main__':

@@ -47,9 +47,13 @@ argument: by default the folder this daemon's own code was imported from.
   begun at that bound's end is given one poll (plugin_host.stop_confirm_poll_s). The hosts it did not confirm get ONE
   system stop together, within a second bound, and ONE more read of all of them, within a third. So the daemon's
   Stop waits at most three Stop bounds and one poll, whatever the count of hosts; both are rows of the settings. A
-  start that begins after the daemon's Stop has begun is refused (``stopped``, 'the daemon is closing'). A start whose
-  unit the system was making as that Stop began ends that host itself, by the same kill and proof, as soon as it
-  records it, and ends ``stopped``; the daemon's Stop does not wait for it.
+  start that begins after the daemon's Stop has begun, or that reaches the making of its unit after it, is refused
+  (``stopped``, 'the daemon is closing') and makes no unit. A start whose unit the system was making as a Stop began
+  is waited for, within the proof's bound and no longer: the host it records is ended and proven with the rest. A
+  start still making its unit when that bound ends is NAMED, in the Stop's answer, in the log and in ``status``
+  (``starts_still_making``): its host may still appear, its own start ends it and proves it as soon as it records it,
+  and that start ends ``stopped`` and hands the host to no caller. The name stays in ``status`` until that host's own
+  record says what the system showed of it, so nothing is called stopped that the system has not shown ended.
 * A start inside a call is held to what is left of the call's deadline in the read of the unit's control group and
   in the wait for the host's hello, or to the start deadline where the call has none (the launcher's one read of
   systemd-run's version, made once per manager, keeps the manager's own wait).
@@ -425,10 +429,14 @@ class PluginHostUnits:
         self._restarts_window_s = _deadline('restarts_window_s', restarts_window_s)
         self._properties = check_piped_properties(properties)
         self._lock = threading.Lock()
+        self._made_or_failed = threading.Condition(self._lock)  # a start's making of its unit has ended, either way
         self._turns = {}       # plugin id -> lock: one call at a time on a host's channel
         self._packages = {}    # plugin id -> (manifest, files): what a restart loads again
         self._units = {}       # plugin id -> the running HostUnit
         self._starting = {}    # plugin id -> the HostUnit whose start is under way
+        self._making = {}      # token -> plugin id: a start inside the making of its unit, its host not yet recorded
+        self._watched = {}     # token -> the HostUnit that start recorded (None until then): starts a Stop waits for
+        self.starts_still_making = {}  # token -> what a Stop says of a start it could not see record its host in time
         self._replacements = {}  # plugin id -> how many starts have replaced its host: a start begun before is late
         self._stopped = set()  # plugin ids whose host was stopped: not started again by a call
         self._waiting_starts = {}  # plugin id -> starts entered and not yet holding the turn: a call starts no host
@@ -559,12 +567,15 @@ class PluginHostUnits:
         """End the host of ``plugin_id`` by the system's kill of its unit, then prove it within the Stop bound
         (plugin_host.stop_confirm_s): the host is recorded ended only when the system shows its unit ended and not
         about to start again, else its Stop is recorded unconfirmed and said so. Sends the host nothing and waits on
-        nothing it does."""
+        nothing it does. A start of the plugin that was making its unit as this Stop began is waited for within the
+        same bound, and the host it records is ended and proven with the rest. Returns the words of each start still
+        making its unit when that bound ended (named in the log and in ``status`` too), or an empty list."""
         with self._lock:
             self._stopped.add(plugin_id)
             host = self._units.pop(plugin_id, None)
             starting = self._starting.get(plugin_id)
-        self._end_all([host] if host is not None else [], [starting] if starting is not None else [])
+            making = self._watch(lambda making_id: making_id == plugin_id)
+        return self._end_all([host] if host is not None else [], [starting] if starting is not None else [], making)
 
     def close(self):
         """The daemon's own Stop: every host is ended by the system's kill, then proven ended as ``stop`` does. Each
@@ -572,13 +583,18 @@ class PluginHostUnits:
         (plugin_host.stop_confirm_s, a read begun at its end given one poll, plugin_host.stop_confirm_poll_s); the
         hosts it did not confirm get one system stop together and one more read of all of them, each within one more
         bound. So the whole set waits at most three Stop bounds and one poll, whatever its count; no host is waited
-        on. A start that begins after this is refused; one whose unit was being made ends that host itself."""
+        on. A start that begins after this, or reaches the making of its unit after it, is refused and makes no unit.
+        A start whose unit was being made as this began is waited for within the first bound, and the host it records
+        is ended and proven with the rest. Returns the words of each start still making its unit when that bound ended
+        (named in the log and in ``status`` too: its own start ends that host as soon as it records it), or an empty
+        list."""
         with self._lock:
             self._closed = True
             hosts = list(self._units.values())
             self._units.clear()
             starting = list(self._starting.values())
-        self._end_all(hosts, starting)
+            making = self._watch(lambda making_id: True)
+        named = self._end_all(hosts, starting, making)
         with self._lock:
             ended, self._ended = self._ended, []
         for host in ended:
@@ -592,12 +608,14 @@ class PluginHostUnits:
             else:
                 with self._lock:
                     self._ended.append(host)  # a call still holds it; that call closes it
+        return named
 
     def status(self):
         """What a person reads of the plugin hosts: each plugin's latest host by its life (starting, running, ending,
         ended or unconfirmed) and its unit, the calls with no answer since its last answer, how many of its hosts'
         Stops the system did not confirm in time; every host whose Stop is still unconfirmed, with the words that say
-        so; the strays ``sweep_strays`` found; and the bounds by the rows they come from. A host whose Stop is
+        so; every start a Stop named because it was still making its unit (``starts_still_making``); the strays
+        ``sweep_strays`` found; and the bounds by the rows they come from. A host whose Stop is
         unconfirmed is read again here first: it is said to be ended only once the system shows it so."""
         with self._lock:
             pending = list(self.unconfirmed.values())
@@ -618,6 +636,7 @@ class PluginHostUnits:
                     'plugins': plugins,
                     'stop_unconfirmed': [{'plugin': host.plugin_id, 'unit': host.unit, 'words': host.stop_words}
                                          for host in self.unconfirmed.values()],
+                    'starts_still_making': [dict(entry) for entry in self.starts_still_making.values()],
                     'strays': list(self.strays)}
 
     def bounds(self):
@@ -671,20 +690,36 @@ class PluginHostUnits:
         unit = f'recursion-host-{token}.service'
         if not HOST_UNIT.fullmatch(unit):
             raise HostUnavailable(plugin_id, NOT_STARTED, 'unit name')
-        folder = private_dir(self._state / 'plugin-hosts' / token)  # the host's empty working folder
-        if not _unit_path_ok(folder):
-            raise HostUnavailable(plugin_id, NOT_STARTED, 'state_path_not_unit_safe')
-        ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            process = self._manager.start_piped(unit, host_argv(self._python, self._core_folder), theirs,
-                                                properties=self._properties, working_directory=folder)
-        except BaseException:
-            ours.close()
-            raise
-        finally:
-            theirs.close()  # the daemon keeps no copy of the host's end
-        host = HostUnit(plugin_id, unit, ours, process, end)
+        making = object()  # this start inside the making of its unit, until it records the host or fails
         with self._lock:
+            if self._closed:  # the daemon's Stop has begun: no unit is made
+                raise HostUnavailable(plugin_id, STOPPED, 'the daemon is closing')
+            self._making[making] = plugin_id  # from here a Stop that begins waits for this start, within its bound
+        try:
+            folder = private_dir(self._state / 'plugin-hosts' / token)  # the host's empty working folder
+            if not _unit_path_ok(folder):
+                raise HostUnavailable(plugin_id, NOT_STARTED, 'state_path_not_unit_safe')
+            ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                process = self._manager.start_piped(unit, host_argv(self._python, self._core_folder), theirs,
+                                                    properties=self._properties, working_directory=folder)
+            except BaseException:
+                ours.close()
+                raise
+            finally:
+                theirs.close()  # the daemon keeps no copy of the host's end
+            host = HostUnit(plugin_id, unit, ours, process, end)
+        except BaseException:
+            with self._lock:
+                del self._making[making]  # no host recorded: a name a Stop gave it stays, as nothing was proven
+                self._made_or_failed.notify_all()
+            raise
+        with self._lock:
+            del self._making[making]
+            if making in self._watched:
+                self._watched[making] = host  # a Stop waits for this start: it ends and proves this host too
+            named = making in self.starts_still_making
+            self._made_or_failed.notify_all()
             self._starting[plugin_id] = host  # from here stop and close see this host
             self._lives[plugin_id] = host
             self._made.add(unit)
@@ -693,6 +728,9 @@ class PluginHostUnits:
                 host.replaced = late = True
         if late:
             self._end_start(host)
+        if named:  # a Stop named this start: the host's own record now says what the system showed of it
+            with self._lock:
+                self.starts_still_making.pop(making, None)
         deadline = None if self._start_deadline_s is None else time.monotonic() + self._start_deadline_s
         row = ROWS['start_deadline_s']  # the row of the bound this start is held to
         if limit is not None and (deadline is None or limit < deadline):
@@ -845,26 +883,71 @@ class PluginHostUnits:
         if first:
             self._confirm(host, deadline)
 
-    def _end_all(self, hosts, starting):
+    def _watch(self, mine):
+        """The starts inside the making of a unit, of the plugins ``mine`` takes, that a Stop now beginning waits
+        for. The caller holds the lock."""
+        tokens = [token for token, plugin_id in self._making.items() if mine(plugin_id)]
+        for token in tokens:
+            self._watched.setdefault(token, None)
+        return tokens
+
+    def _end_all(self, hosts, starting, making=()):
         """``stop`` and ``close``: kill every host first, then prove them ended together (``_confirm_all``). The
         control groups of the hosts still starting that the system had not yet shown are read in ONE read, after the
-        running hosts are killed and within the same bound as the proof: at most three Stop bounds and one poll for
-        the whole set, whatever its count."""
+        running hosts are killed and within the same bound as the proof. Then the starts of ``making`` (inside the
+        making of their units as the Stop began) are waited for within that bound, and each host they recorded is
+        killed (its control group read in one more read, if the bound has time left) and proven with the rest,
+        whichever of the Stop and its own start gave the kill. At most three Stop bounds and one poll for the whole
+        set, whatever its count. Returns the words of each start still making its unit at the bound."""
         deadline = time.monotonic() + self._stop_confirm_s
         killed = []
         for host in hosts:
             host.stopped = True
             if self._kill(host):
                 killed.append(host)
-        unknown = [host.unit for host in starting if not host.group]
-        shown = self._unit_states(unknown, deadline) if unknown else {}
-        for host in starting:
-            host.stopped = True
-            if self._kill(host, shown.get(host.unit)):
-                killed.append(host)
-            host.wake()
+        self._kill_starting(starting, deadline, killed)
+        named = []
+        if making:
+            with self._lock:
+                self._made_or_failed.wait_for(lambda: not any(token in self._making for token in making),
+                                              timeout=max(deadline - time.monotonic(), 0.0))
+                made = []
+                for token in making:
+                    host = self._watched.pop(token, None)
+                    if token in self._making:
+                        plugin_id = self._making[token]
+                        words = (f'a start of {plugin_id} was making its unit as a Stop began and had not recorded '
+                                 f'its host within {self._stop_confirm_s:g} s (plugin_host.stop_confirm_s), so that '
+                                 'Stop could not end it: its host may still appear, and that start ends it and proves '
+                                 'it as soon as it records it. Do not take it as stopped until the status shows that '
+                                 'host ended')
+                        self.starts_still_making[token] = {'plugin': plugin_id, 'words': words}
+                        named.append(words)
+                    elif host is not None:
+                        made.append(host)
+            for words in named:
+                log.error('%s', words)
+            self._kill_starting(made, deadline, killed, proven_here=True)
         if killed:
             self._confirm_all(killed, deadline)
+        return named
+
+    def _kill_starting(self, starting, deadline, killed, *, proven_here=False):
+        """Kill each host of ``starting`` and wake its start; the control groups the system had not yet shown are
+        read in ONE read by ``deadline`` (none once it has passed: nothing shown). A host this gave the kill to, or
+        every one with ``proven_here``, joins ``killed``, the hosts the Stop proves."""
+        unknown = [host.unit for host in starting if not host.group]
+        if not unknown:
+            shown = {}
+        elif deadline > time.monotonic():
+            shown = self._unit_states(unknown, deadline)
+        else:
+            shown = {unit: {} for unit in unknown}
+        for host in starting:
+            host.stopped = True
+            if self._kill(host, shown.get(host.unit)) or proven_here:
+                killed.append(host)
+            host.wake()
 
     def _end(self, host, deadline=None):
         """SIGKILL the unit's whole cgroup now, once, then prove it ended (``_confirm``). Waits on nothing the host
@@ -939,9 +1022,11 @@ class PluginHostUnits:
                      f'the system showed {_shown(shown[host.unit])}. The daemon then {did} ({host.unit}), and the system '
                      f'now shows {_shown(after)}. Do not trust this host until the status shows it ended')
             with self._lock:
+                once = host.unit not in self.unconfirmed  # a Stop and the host's own start may both prove it
                 host.life, host.stop_words = UNCONFIRMED, words
                 self.unconfirmed[host.unit] = host
-                self.stops_unconfirmed[host.plugin_id] = self.stops_unconfirmed.get(host.plugin_id, 0) + 1
+                if once:
+                    self.stops_unconfirmed[host.plugin_id] = self.stops_unconfirmed.get(host.plugin_id, 0) + 1
             log.error('plugin %s: %s', host.plugin_id, words)
         return False
 

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 import unittest.mock
 import venv
@@ -525,6 +526,16 @@ class HostProgramTests(unittest.TestCase):
                 self.assertEqual(replies, [])
                 self.assertEqual(reads, 0)
 
+    def test_a_bye_before_hello_ends_the_channel(self):
+        # A bye ends the channel at any time, also as the first message: the host has sent only its
+        # own hello, takes no later frame (no load, no call, no GIL reading) and ends with status 0.
+        for messages in ((BYE,), (BYE, HELLO, load(), call(7, command={}))):
+            with self.subTest(messages=messages):
+                replies, status, reads, _ = self.exchange(*messages)
+                self.assertEqual(replies, [])
+                self.assertEqual(reads, 0)
+                self.assertTrue(status["accepting_work"])
+
     def test_a_truncated_frame_is_refused_before_eof(self):
         for truncated in (b"\x00", HEADER.pack(2) + b"{"):
             with self.subTest(truncated=truncated):
@@ -857,3 +868,75 @@ class HostProgramTests(unittest.TestCase):
             standin="dirty+norecord", code=EXIT_ENVIRONMENT_NOT_CLEAN)
         self.assert_refusal(replies[0], None, "host_start_refused", "environment_not_clean")
         self.assertEqual(self.starts, 2)
+
+
+class _StandInChannel:
+    """The host program's channel without a process: the real codec, and the frames sent kept in a list.
+
+    With a lock, receive holds it the way a channel end that guards its own state would, and a second
+    receive while the first one holds it is recorded as a wait (a real non-reentrant lock would hang)."""
+
+    def __init__(self, incoming, lock=None):
+        self.incoming, self.sent, self.lock = list(incoming), [], lock
+        self.hook, self.waited = None, False
+
+    def receive(self):
+        if self.lock is not None and not self.lock.acquire(blocking=False):
+            self.waited = True
+            return None
+        try:
+            if self.hook is not None:
+                hook, self.hook = self.hook, None
+                hook()
+            return self.incoming.pop(0) if self.incoming else None
+        finally:
+            if self.lock is not None:
+                self.lock.release()
+
+    def send(self, message):
+        hc.encode(hc.check_message(message, receiver="daemon"))
+        self.sent.append(message)
+
+
+class CoreRequestNestingTests(unittest.TestCase):
+    """A core request made inside another one's wait, on the same thread (a trace function or a signal
+    handler running plugin code), is refused at once and the outer request keeps its answer."""
+
+    def nested(self, lock=None):
+        from recursion_core.plugin_host import _Program
+
+        channel = _StandInChannel([core(0, b"outer-answer"), core(1, b"next-answer")], lock)
+        program = _Program(channel, FakeGilProbe((False,)))
+        program._greeted = True
+        seen = {}
+
+        def inner():
+            try:
+                seen["inner"] = program._relay_core(b"inner")
+            except RuntimeError as exc:
+                seen["inner"] = str(exc)
+
+        channel.hook = inner
+        seen["outer"] = program._relay_core(b"outer")
+        return program, channel, seen
+
+    def assert_refused_inner(self, channel, seen):
+        self.assertEqual(seen["outer"], b"outer-answer")
+        self.assertIn("core requests do not nest", seen["inner"])
+        self.assertIn("make this request after that one returns", seen["inner"])
+        self.assertEqual(channel.sent, [core(0, b"outer")])
+        self.assertEqual(channel.incoming, [core(1, b"next-answer")])
+
+    def test_a_nested_core_request_is_refused_and_the_outer_one_gets_its_answer(self):
+        _, channel, seen = self.nested()
+        self.assert_refused_inner(channel, seen)
+
+    def test_a_nested_core_request_never_waits_while_a_lock_below_is_held(self):
+        _, channel, seen = self.nested(threading.Lock())
+        self.assertFalse(channel.waited)
+        self.assert_refused_inner(channel, seen)
+
+    def test_after_a_refused_nested_request_the_next_core_request_is_sent_with_the_next_id(self):
+        program, channel, _ = self.nested()
+        self.assertEqual(program._relay_core(b"next"), b"next-answer")
+        self.assertEqual(channel.sent, [core(0, b"outer"), core(1, b"next")])

@@ -32,6 +32,10 @@ POSIX = os.name != "nt"
 INTERRUPT = {"command_id": "cmd-int-1", "session_id": "ses-1", "expected_turn_id": "turn-1"}
 # A bound of the tests' own, short so that a test waits little; the first value is the relay's.
 SHORT_S = 0.3
+# How much longer than its bound a frame may take in these tests (a loaded machine, the stand-in daemon).
+MARGIN_S = 2.0
+# The key's own sessions at once: how many, and how many frames each sends.
+SESSIONS, FRAMES_EACH = 12, 100
 
 
 def control(method, n, params=None) -> dict:
@@ -53,15 +57,16 @@ def held(test: unittest.TestCase, path: str) -> None:
     fcntl.flock(holder, fcntl.LOCK_EX)
 
 
-def serve_within(test: unittest.TestCase, relay: Relay, frames: list[dict]) -> tuple[list[dict], float]:
-    """One SSH session: ``frames`` on stdin, served by ``relay.serve`` in a thread, failed (not hung) past
-    the watchdog. Returns the replies in order and the seconds the session took."""
-    stdin = io.BytesIO(b"".join(encode_frame(frame) for frame in frames))
+def serve_within(test: unittest.TestCase, relay: Relay, frames: list[dict], *, within: float = support.WATCHDOG_S,
+                 raw: bytes = b"") -> tuple[list[dict], float]:
+    """One SSH session: ``frames`` (then ``raw`` bytes) on stdin, served by ``relay.serve`` in a thread,
+    failed (not hung) past ``within`` seconds. Returns the replies in order and the seconds it took."""
+    stdin = io.BytesIO(b"".join(encode_frame(frame) for frame in frames) + raw)
     stdout, done, out = io.BytesIO(), threading.Event(), []
     began = time.monotonic()
     threading.Thread(target=lambda: (out.append(relay.serve(stdin, stdout)), done.set()), daemon=True).start()
-    if not done.wait(support.WATCHDOG_S):
-        test.fail("the session did not come back: a frame waited without end")
+    if not done.wait(within):
+        test.fail(f"the session did not come back within {within:g} seconds: a frame waited past its bound")
     return read_replies(stdout.getvalue()), time.monotonic() - began
 
 
@@ -82,7 +87,8 @@ class AStopInTheSameSessionIsReachedTests(unittest.TestCase):
                          ("rate_limited", False, f"window_busy:lock_wait_s:{relay_module.RELAY_LOCK_WAIT_S:g}"))
         self.assertIn("--lock-wait-s", error["message"])
         self.assertIn("never waits longer on a file", error["message"])
-        self.assertIn("still goes", error["message"])
+        self.assertIn("each time it asked", error["message"])
+        self.assertIn("is still sent to the daemon at once and is never counted here", error["message"])
         self.assertIsNone(error["retry_after_s"])
         self.assertEqual([reply["result"]["method"] for reply in replies[1:]], ["session.interrupt", "run.stop"])
         self.assertEqual([m["method"] for m in daemon.seen], ["session.interrupt", "run.stop"])
@@ -113,9 +119,9 @@ class AStopInTheSameSessionIsReachedTests(unittest.TestCase):
         waits: list[float] = []
         real = relay_store._flock_within
 
-        def counted(fd, path, wait_s):
+        def counted(fd, path, wait_s, **ceiling):
             waits.append(wait_s)
-            return real(fd, path, wait_s)
+            return real(fd, path, wait_s, **ceiling)
 
         with mock.patch.object(relay_store, "_flock_within", counted):
             replies, _ = serve_within(self, relay, [control("run.status", 1)])
@@ -169,6 +175,117 @@ class TheBoundIsASettingTests(unittest.TestCase):
                   stdin=io.BytesIO(encode_frame(control("run.status", 1))), stdout=out, stderr=io.StringIO())
         self.assertEqual(rc, 0)
         self.assertEqual(read_replies(out.getvalue())[0]["result"]["method"], "run.status")
+
+    def test_a_bound_no_person_means_is_refused_at_the_start_with_the_relays_words(self) -> None:
+        daemon = support.SocketDaemon(self)
+        most = relay_module.RELAY_LOCK_WAIT_MOST_S
+        for bad, words in ((most * 2, f"to {most:g}"), (1e9, f"to {most:g}"), (1e300, f"to {most:g}"),
+                           (2 ** 1100, "characters"), (-0.0, "negative zero")):
+            with self.subTest(lock_wait_s=bad), self.assertRaises(ValueError) as caught:
+                Relay(environ=daemon.environ, lock_wait_s=bad)
+            self.assertIn("lock_wait_s (--lock-wait-s)", str(caught.exception))
+            self.assertIn(words, str(caught.exception))
+            self.assertIn("no person means", str(caught.exception))
+        self.assertEqual(Relay(environ=daemon.environ, lock_wait_s=most).lock_wait_s, most)
+        for bad in (0, 0.0, -0.0, -1, math.inf, math.nan, most * 2, 2 ** 1100, True, None, "0.005"):
+            with self.subTest(lock_try_s=bad), self.assertRaises(ValueError) as caught:
+                Relay(environ=daemon.environ, lock_try_s=bad)
+            self.assertIn("lock_try_s (--lock-try-s)", str(caught.exception))
+            self.assertIn("pause between two tries", str(caught.exception))
+        self.assertEqual(Relay(environ=daemon.environ).lock_try_s, relay_module.RELAY_LOCK_TRY_S)
+
+    def test_the_forced_command_refuses_them_too(self) -> None:
+        daemon = support.SocketDaemon(self)
+        most = f"{relay_module.RELAY_LOCK_WAIT_MOST_S:g}"
+        for option, text, words in (("--lock-wait-s", "7200", f"to {most}"), ("--lock-wait-s", "1e300", f"to {most}"),
+                                    ("--lock-wait-s", "-0", "negative zero"), ("--lock-try-s", "0", "above 0"),
+                                    ("--lock-try-s", "inf", "above 0"), ("--lock-try-s", "soon", "--lock-try-s is a")):
+            with self.subTest(option=option, text=text):
+                err = io.StringIO()
+                rc = main(["relay", option, text], environ=daemon.environ, stdin=io.BytesIO(),
+                          stdout=io.BytesIO(), stderr=err)
+                self.assertEqual(rc, 2)
+                self.assertIn(words, err.getvalue())
+        out = io.BytesIO()
+        rc = main(["relay", "--key-label", "laptop", "--lock-try-s", "0.001"], environ=daemon.environ,
+                  stdin=io.BytesIO(encode_frame(control("run.status", 1))), stdout=out, stderr=io.StringIO())
+        self.assertEqual(rc, 0)
+        self.assertEqual(read_replies(out.getvalue())[0]["result"]["method"], "run.status")
+
+
+@unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
+class TheKeysOwnSessionsTests(unittest.TestCase):
+    def test_sessions_of_one_key_at_once_neither_refuse_nor_hold_each_other(self) -> None:
+        # No other program holds anything: only the key's own sessions, each its own Relay with its own open
+        # files, taking the key's window at once, with the relay's first values.
+        daemon = support.SocketDaemon(self)
+        relays = [Relay(environ=daemon.environ, key_label="laptop", max_frames=10 ** 7) for _ in range(SESSIONS)]
+        refused, slowest, guard, start = [], [0.0], threading.Lock(), threading.Barrier(SESSIONS)
+
+        def session(relay: Relay) -> None:
+            start.wait()
+            for n in range(FRAMES_EACH):
+                began = time.monotonic()
+                reply = relay.handle(control("run.status", n))
+                took = time.monotonic() - began
+                with guard:
+                    slowest[0] = max(slowest[0], took)
+                    if "error" in reply:
+                        refused.append(reply["error"].get("detail"))
+
+        threads = [threading.Thread(target=session, args=(relay,), daemon=True) for relay in relays]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(support.WATCHDOG_S)
+        self.assertFalse(any(thread.is_alive() for thread in threads), "a session did not come back")
+        self.assertEqual(refused, [])  # no frame answered window_busy (or anything else)
+        self.assertLess(slowest[0], relay_module.RELAY_LOCK_WAIT_S / 2,
+                        "a frame waited near the bound for a lock only the key's own sessions held")
+
+
+@unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
+class EveryRoadOfARefusalIsBoundedTests(unittest.TestCase):
+    """An ordinary frame refused for another reason, with the RECORD held by another open file: answered
+    within the bound plus a margin, and the Stop behind it taken by the daemon."""
+
+    def relay_with_the_record_held(self, **caps) -> tuple[support.SocketDaemon, Relay]:
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ, key_label="laptop", rights=["read", "run"], lock_wait_s=SHORT_S,
+                      **caps)
+        held(self, os.path.join(relay.state_folder, relay_store.RECORD_FILE))
+        return daemon, relay
+
+    def a_stop_follows(self, daemon, relay, frames, detail_starts: str) -> None:
+        replies, took = serve_within(self, relay, frames + [control("run.stop", 9, {"run_id": "r-1"})],
+                                     within=SHORT_S + MARGIN_S)
+        error = replies[0]["error"]
+        self.assertEqual((error["code"], error["delivered"]), ("rate_limited", False))
+        self.assertTrue(error["detail"].startswith(detail_starts), error["detail"])
+        self.assertEqual(replies[1]["result"]["method"], "run.stop")
+        self.assertEqual([m["method"] for m in daemon.seen], ["run.stop"])
+        self.assertLess(took, SHORT_S + MARGIN_S)
+        self.assertEqual(relay_store.read_refusals(relay.state_folder), [])  # left out; its line still went
+
+    def test_a_full_window(self) -> None:
+        daemon, relay = self.relay_with_the_record_held(max_frames=0)
+        self.a_stop_follows(daemon, relay, [control("run.status", 1)], "max_frames:0:")
+
+    def test_an_unreadable_window(self) -> None:
+        daemon, relay = self.relay_with_the_record_held()
+        os.mkdir(os.path.join(relay.state_folder, "window-label-laptop.json"))  # a folder at the file's name
+        self.a_stop_follows(daemon, relay, [control("run.status", 1)], "window_unreadable:")
+
+    def test_a_frame_too_large_to_read(self) -> None:
+        daemon, relay = self.relay_with_the_record_held(max_frame_bytes=4096)
+        big = encode_frame(control("run.status", 1, {"pad": "x" * 8192}))
+        replies, took = serve_within(self, relay, [], raw=big + encode_frame(control("run.stop", 2, {"run_id": "r"})),
+                                     within=SHORT_S + MARGIN_S)
+        self.assertEqual([(r["error"]["code"], r["error"]["detail"]) for r in replies],
+                         [("bad_frame", "frame_too_large")])  # answered once; the session then ends
+        self.assertLess(took, SHORT_S + MARGIN_S)
+        self.assertEqual(daemon.seen, [])
+        self.assertEqual(relay_store.read_refusals(relay.state_folder), [])
 
 
 if __name__ == "__main__":

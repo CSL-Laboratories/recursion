@@ -161,9 +161,13 @@ window, the scope and `retry_after_s`, the seconds until the next ordinary frame
 another owner) starts for no request, a Stop included, until the folder is put right.
 
 No session waits without end on a file: an ordinary frame waits for the lock of its key's window and of
-the record at most `--lock-wait-s S` seconds in all (first value 2; `0` asks once; a value with no end is
-refused at the start). A lock another session or program still holds then refuses the frame
-(`rate_limited`, detail `window_busy`, not delivered, with a sentence that says so) or leaves its refusal
+the record at most `--lock-wait-s S` seconds in all (first value 2; `0` asks once), and asks for each lock
+again at least every `--lock-try-s S` seconds (first value 0.001), so that the sessions of one key at once,
+each holding a lock for one read and write, never hold each other near the bound. Either one above 3600
+seconds (a wait no person means: a Stop behind that frame in the same session would wait as long), not a
+number, or a negative zero is refused at the start, as is a `--lock-try-s` of 0. A lock another session
+or program held each time it was asked for then refuses the frame (`rate_limited`, detail `window_busy`,
+not delivered, with a sentence that says so) or leaves its refusal
 out of the record (its stderr line still goes), and the session reads its next frame. Frames of one
 session are served in order, so a request of the ending kind sent behind ordinary frames in the same
 session waits for each of them at most `--lock-wait-s` on files, plus the daemon's reply when that frame

@@ -213,8 +213,11 @@ class Authority:
         if type(caller_profile.get("actions")) is not list:
             raise Refused("profile_actions")
         actions = profile["actions"]
-        if (type(actions) is not list or not actions or actions != sorted(set(actions))
-                or any(type(a) is not str or not _KIND.fullmatch(a) for a in actions)):
+        # Every member's type is checked before the set and the sort, which raise TypeError for an
+        # unhashable member or one that does not order with a string (PS4).
+        if (type(actions) is not list or not actions
+                or any(type(a) is not str or not _KIND.fullmatch(a) for a in actions)
+                or actions != sorted(set(actions))):
             raise Refused("profile_actions")
         budgets = profile["budgets"]
         if (type(budgets) is not dict or set(budgets) != _BUDGETS

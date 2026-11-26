@@ -1,10 +1,19 @@
 """The control API's authorizer: one decision per client call, from the method table's scope column.
 
-Lane CONTROL, frontier plan v3.3, step 3, built in phase c0 against a stand-in for seam S5. This module
-is a registrant that ``control/hooks.py`` imports by name once lane SPINE's seams land (its ``REGISTRANTS``
-list names ``recursion_core.control.scopes``). In THIS pull request ``register(hooks)`` registers
-nothing, so no daemon behaviour changes; the authorizer is registered into S5 in the next one, together
-with the method table it reads and the tests through every entry point.
+Lane CONTROL, frontier plan v3.3, step 3. This module is a registrant that ``control/hooks.py`` imports
+by name (its ``REGISTRANTS`` list names ``recursion_core.control.scopes``). ``register(hooks)`` registers
+the authorizer into S5, reading every method's scope from the method table (``control.methods.METHODS``).
+It holds no credentials and reads no run record, so only owner, internal and the page's device principal
+hold scopes: the stricter state, and today's callers (the owner-only socket, in-process calls made for
+the owner, the page) keep every answer they have.
+
+``ScopesService`` (seam S13, ``control.scopes``) is built and tested here but NOT registered: once
+started it hands the authorizer the credential store (``<state_dir>/control/credentials.json``) and the
+control registry's run records, which any principal backed by a grant needs: a plugin, a session, a
+paired device other than the page, an agent. No entry point makes such a principal yet, and registering
+a service turns the composition's admission gate on for every daemon, so it is registered by the change
+that brings the first such principal (``questions.md``). A store that cannot be used (malformed
+included) is logged and leaves token principals holding nothing; it never stops the daemon.
 
 S5's contract (``control/hooks.py``, SPINE): ``authorize(principal, method, params)`` is called for every
 client call, before the method runs, and answers None (go on), a refusal code, or ``(code, detail)``. A
@@ -62,10 +71,13 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import types
 from collections.abc import Callable
 
-from recursion_core.control.credentials import ALL_SCOPES, PAGE_DEVICE_ID, SCOPE_REFUSED, CredentialStore, ceiling
+from recursion_core.control.credentials import (ALL_SCOPES, PAGE_DEVICE_ID, SCOPE_REFUSED, CredentialStore,
+                                                CredentialStoreError, ceiling)
+from recursion_core.control.methods import METHODS
 
 log = logging.getLogger(__name__)
 
@@ -74,18 +86,70 @@ PAGE_PRINCIPAL_ID = PAGE_DEVICE_ID   # control/hooks.py DEVICE: the page's door;
 PAGE_SCOPES = frozenset({"read", "run", "approve"})
 STOP_METHOD = "run.stop"
 HOST_OWNER = "host"          # launch.owner of a run the host started (control/hooks.py launch_snapshot)
+SERVICE_NAME = "control.scopes"
+CREDENTIALS_PATH = ("control", "credentials.json")   # under the daemon's state directory
 
 Verdict = tuple[str, str] | None
 
 
-def register(hooks) -> None:
-    """The registrant entry ``control/hooks.py`` calls once at composition. Registers nothing yet.
+def table_scope(method: str) -> str | None:
+    """The method's scope in the method table this daemon runs (``control.methods.METHODS``), or None."""
 
-    The authorizer goes into S5 with ``hooks.set("authorize", ...)`` in the next pull request, which is
-    stacked on the seams. Until then this module changes no answer of any daemon.
+    row = METHODS.get(method) if isinstance(method, str) else None   # a list asked directly is no method
+    return row.scope if row is not None else None
+
+
+def register(hooks) -> None:
+    """The registrant entry ``control/hooks.py`` calls once at composition: the authorizer into S5.
+
+    ``ScopesService`` is not registered yet (see the module text): ``hooks.service(ScopesService(a))``
+    is the one line that does it, for the change that brings the first plugin or session principal."""
+
+    hooks.set("authorize", Authorizer(scope_of=table_scope))
+
+
+class ScopesService:
+    """Seam S13 service ``control.scopes``: attaches the credential store and the run records to the authorizer.
+
+    ``start`` opens ``CredentialStore(<state_dir>/control/credentials.json)`` and reads run records with
+    the control registry's ``get``. It never raises: a store that cannot be opened, no state directory, or
+    a state directory or registry that cannot be read is logged and leaves token principals holding
+    nothing (or no run record read), and the daemon still starts. It is ready once it has attached. ``stop`` detaches, so a call after it holds only what owner, internal and the page hold.
     """
 
-    return None
+    name = SERVICE_NAME
+
+    def __init__(self, authorizer: Authorizer) -> None:
+        self._authorizer = authorizer
+        self.ready = False
+
+    def start(self, context) -> None:
+        store = None
+        try:
+            state_dir = getattr(context, "state_dir", None)
+            if state_dir is None:
+                log.error("control.scopes: no state directory; no credential is honoured")
+            else:
+                store = CredentialStore(os.path.join(os.fspath(state_dir), *CREDENTIALS_PATH))
+        except CredentialStoreError as exc:
+            log.error("control.scopes: the credential store cannot be used (%s); no credential is honoured", exc)
+        except Exception as exc:  # noqa: BLE001 - a state_dir that is not a path, or cannot be read, honours nothing
+            # (the reads of #385 by DeepSeek: round 1 F3, a state_dir of 5; round 4 F2, a raising __fspath__ or
+            # state_dir property)
+            log.error("control.scopes: the state directory is not a usable path (%s); no credential is honoured",
+                      type(exc).__name__)
+        try:
+            reader = getattr(getattr(context, "control_registry", None), "get", None)
+        except Exception as exc:  # noqa: BLE001 - a registry that cannot be read reads no record (round 4, DeepSeek F2)
+            log.error("control.scopes: the control registry cannot be read (%s); no run record is read",
+                      type(exc).__name__)
+            reader = None
+        self._authorizer.attach(credentials=store, run_record=reader if callable(reader) else None)
+        self.ready = True
+
+    def stop(self, context) -> None:
+        self.ready = False
+        self._authorizer.attach(credentials=None, run_record=None)
 
 
 def _same_session(run_session: str, principal_session: str) -> bool:
@@ -103,10 +167,11 @@ _ABSENT = object()   # nothing named grant declared, told apart from a declared 
 
 
 def _get(mapping, key):
-    """``mapping.get(key)`` for a dict; None for anything else, and None when the read raises (a dict subclass
-    can): a target that cannot be read is not shown to be owned."""
+    """``mapping.get(key)`` for a mapping that is exactly a ``dict``; None for anything else, a ``dict`` subclass
+    included (an ``OrderedDict`` too), so a run reader must answer plain dicts, as the control registry's
+    ``get`` does. A target that cannot be read is not shown to be owned."""
 
-    if not isinstance(mapping, dict):
+    if type(mapping) is not dict:   # exactly a dict: no get of a subclass picks the target (round 6, DeepSeek F2)
         return None
     try:
         return mapping.get(key)
@@ -121,6 +186,14 @@ def _exact(value):
     comparing equal to ``page`` held the page's)."""
 
     return value if type(value) is str else None
+
+
+def _identity(principal) -> tuple[str | None, str | None]:
+    """The principal's kind and id, each read ONCE, as exact text. One call decides everything from these two
+    values: read twice, a principal answering ``plugin`` to the scope check and ``device`` or ``owner`` to the
+    Stop fence stopped runs no plugin may stop (the round-6 read of #385 by DeepSeek, F1)."""
+
+    return _exact(_attr(principal, "kind", None)), _exact(_attr(principal, "id", None))
 
 
 def _attr(principal, name: str, default):
@@ -181,7 +254,11 @@ def _read_declared_grant(principal):
 
 
 class Authorizer:
-    """``authorizer(principal, method, params) -> None | ("scope_refused", detail)``. See the module text."""
+    """``authorizer(principal, method, params) -> None | ("scope_refused", detail)``. See the module text.
+
+    Not meant to be subclassed. A call reads the principal's kind and id once and decides through ``_held`` and
+    ``_stop`` from those two values (round 6 of #385, DeepSeek F1), so overriding ``held`` changes only what
+    ``held`` answers to a caller that asks it, never what a call decides (round 7, DeepSeek F2)."""
 
     def __init__(self, *, scope_of: Callable[[str], str | None], credentials: CredentialStore | None = None,
                  run_record: Callable[[str], dict | None] | None = None,
@@ -193,19 +270,23 @@ class Authorizer:
         self._in_subtree = in_subtree
         self._page_scopes = frozenset(page_scopes)   # cut to the device ceiling by held(), like every set
 
+    def attach(self, *, credentials: CredentialStore | None, run_record: Callable[[str], dict | None] | None) -> None:
+        """What the service hands over at start (and takes back at stop). A call in flight reads each of the two
+        once, so it sees the old one or the new one, never a store that vanished between two reads (the read of
+        #385 by DeepSeek V4.1 Flash, F4: on 3.14t a stop landing between them raised AttributeError)."""
+
+        self._credentials, self._run_record = credentials, run_record
+
     def held(self, principal) -> frozenset[str]:
         """The scopes ``principal`` holds now, within its kind's ceiling.
 
         A credential store that cannot be read raises here (``CredentialStoreError``, or whatever the store
-        raised); a call of the authorizer itself turns that into the refusal ``credentials_unavailable``.
-        One direct call reads kind and id once. ``__call__`` does that read itself and shares the pair,
-        so the Stop rule cannot see a later pair."""
+        raised); a call of the authorizer itself turns that into the refusal ``credentials_unavailable``."""
 
-        kind, pid = _exact(_attr(principal, "kind", None)), _exact(_attr(principal, "id", None))
-        return self._held_for(principal, kind, pid)
+        return self._held(principal, *_identity(principal))
 
-    def _held_for(self, principal, kind, pid) -> frozenset[str]:
-        """Scopes for a kind and id already read by the caller. Does not read them again."""
+    def _held(self, principal, kind: str | None, pid: str | None) -> frozenset[str]:
+        """``held`` for a kind and id already read once by the caller."""
 
         try:
             # Each class's own dictionary first, read past any metaclass: a metaclass answering __dict__ hid a
@@ -233,16 +314,17 @@ class Authorizer:
             # Owner and internal come from how a request arrives, never from a token: a principal naming a grant
             # is a token principal, and one that also claims those kinds holds nothing (round 5, DeepSeek F5).
             return frozenset()
+        credentials = self._credentials   # read once: attach may replace it while this call runs
         if kind in ("owner", "internal"):
             held = ALL_SCOPES
         elif grant is not None:
             # A token principal: its one verified grant, while it is live, and only if it is this identity's.
-            held = (self._credentials.grant_scopes(grant, kind, pid)
-                    if self._credentials is not None and isinstance(grant, str) else frozenset())
+            held = (credentials.grant_scopes(grant, kind, pid)
+                    if credentials is not None and isinstance(grant, str) else frozenset())
         elif kind == "device" and pid == PAGE_PRINCIPAL_ID:
             held = self._page_scopes
-        elif kind == "plugin" and self._credentials is not None and isinstance(pid, str):
-            held = self._credentials.held(kind, pid)   # host-attributed: the identity's live grants
+        elif kind == "plugin" and credentials is not None and isinstance(pid, str):
+            held = credentials.held(kind, pid)   # host-attributed: the identity's live grants
         else:
             held = frozenset()   # a device, session or agent principal holds only what its own grant gives
         return held & ceiling(kind)
@@ -250,11 +332,9 @@ class Authorizer:
     def __call__(self, principal, method, params) -> Verdict:
         if _attr(principal, "in_run_unit", True) is not False:
             return (SCOPE_REFUSED, "peer is inside a run unit")
-        # One pair for the scope calculation and for Stop. A second read let a principal answer plugin
-        # to the first and device to the second, and Stop then allowed another plugin's run.
-        kind, pid = _exact(_attr(principal, "kind", None)), _exact(_attr(principal, "id", None))
+        kind, pid = _identity(principal)   # read once; the whole decision below uses only these (round 6, F1)
         try:
-            held = self._held_for(principal, kind, pid)
+            held = self._held(principal, kind, pid)
         except Exception:  # noqa: BLE001 - a credential store that cannot be read refuses; it never lets through
             log.exception("the credential store could not be read; the call is refused")
             return (SCOPE_REFUSED, "credentials_unavailable")
@@ -267,7 +347,7 @@ class Authorizer:
         scope = self._scope_of(method) if type(method) is str else None
         if scope is None:
             return None if held >= ALL_SCOPES else (SCOPE_REFUSED, "method_not_in_table")
-        if not isinstance(scope, str) or scope not in ALL_SCOPES:
+        if type(scope) is not str or scope not in ALL_SCOPES:   # exactly a str (round 5 of #385, DeepSeek F3)
             return (SCOPE_REFUSED, "scope_unknown")   # a table row naming no known scope opens nothing
         if scope not in held:
             return (SCOPE_REFUSED, f"needs_{scope}")
@@ -275,31 +355,36 @@ class Authorizer:
             if "run" not in held:
                 # The Stop row's own rule, whatever the table's scope column says for run.stop.
                 return (SCOPE_REFUSED, "needs_run")
-            return self._stop(principal, params, kind, pid)
+            return self._stop(kind, pid, params)
         return None
 
-    def _stop(self, principal, params, kind, pid) -> Verdict:
+    def _stop(self, kind: str | None, pid: str | None, params) -> Verdict:
         if kind in ("owner", "device"):
             return None    # with run: any run, including one whose record names no principal
         if kind not in ("session", "plugin"):
             return (SCOPE_REFUSED, "stop_not_granted_to_kind")
-        run_id = _get(params, "run_id")   # each read of params, record and launch is guarded (round 5, DeepSeek F1)
-        record = None
-        if isinstance(run_id, str) and self._run_record is not None:
+        # Each read of params, record and launch is guarded (round 5, DeepSeek F1), and the run named is exactly
+        # the text sent (round 6 of #385, DeepSeek F2: a str subclass or a dict subclass chose another record).
+        run_id = _exact(_get(params, "run_id"))
+        record, run_record = None, self._run_record   # read once, like the store in held()
+        if isinstance(run_id, str) and run_record is not None:
             try:
-                record = self._run_record(run_id)
+                record = run_record(run_id)
             except Exception:  # noqa: BLE001 - a target that cannot be read is not shown to be owned
                 record = None
         launch = _get(record, "launch")
-        if not isinstance(launch, dict) or not isinstance(pid, str) or not pid:
+        # pid is exact text or None (_identity), and every record field the rule decides from is read once as
+        # exact text: a str subclass in the record cannot answer host, a plugin's id or another session as it
+        # pleases (round 7 of #385, DeepSeek F1).
+        if type(launch) is not dict or not pid:
             return (SCOPE_REFUSED, "run_not_owned")
         if kind == "plugin":
-            owner = _get(launch, "owner")
-            if isinstance(owner, str) and owner and owner != HOST_OWNER and owner == pid:
+            owner = _exact(_get(launch, "owner"))
+            if owner and owner != HOST_OWNER and owner == pid:
                 return None
             return (SCOPE_REFUSED, "run_not_owned")
-        session = _get(launch, "session_id")
-        if isinstance(session, str) and session:
+        session = _exact(_get(launch, "session_id"))
+        if session:
             try:
                 if self._in_subtree(session, pid) is True:
                     return None

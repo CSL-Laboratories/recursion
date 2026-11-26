@@ -187,11 +187,17 @@ recorded on F60, CSL-762).
 
 No host composes or starts this server yet; that belongs to the daemon adapter below.
 
-## Credentials and scopes (built; not registered yet)
+## Credentials and scopes (registered into seam S5)
 
 `credentials.py` and `scopes.py` are the control API's caller scopes (`read`, `run`, `approve`,
-`manage`, the method table's scope column). Nothing in the daemon calls them yet: the authorizer is
-registered into seam S5 (`control/hooks.py`, lane SPINE) by a later pull request, after the seams land.
+`manage`, the method table's scope column). `scopes.register(hooks)` registers the authorizer into seam
+S5 (`control/hooks.py`, lane SPINE), reading each method's scope from `control.methods.METHODS`. As
+registered it holds no credentials and reads no run record, so only owner, internal and the page's
+device principal hold scopes, and today's callers keep every answer. `ScopesService` (S13,
+`control.scopes`) is built and tested but not registered: started, it opens the credential store at
+`<state_dir>/control/credentials.json` and reads run records through the control registry's `get`, for
+plugin and session principals, which no entry point makes yet. Every client call reaches the
+authorizer once the seams' daemon edits call S5.
 
 - **Credentials.** Each principal kind has a ceiling: `owner` and `internal` hold all four and are never
   tokens; `device` (the page and paired devices) never holds `manage`; `plugin`, `session` and `agent`
@@ -218,7 +224,7 @@ registered into seam S5 (`control/hooks.py`, lane SPINE) by a later pull request
   (`credentials_unavailable`). `run.stop` follows the method table's row "Who may Stop", and needs a held
   `run` scope whatever the row's scope column says: an owner or device with `run` may stop any run; a session principal only its own
   session's runs (and its descendants' once the session lineage is passed in); a plugin principal only a
-  run whose `launch.owner` is that plugin. `register(hooks)` registers nothing in this phase.
+  run whose `launch.owner` is that plugin. Internal and agent principals are not in the Stop row.
 
 ## Candidate and unwired
 
@@ -232,7 +238,8 @@ daemon's cleanup layer and serves it on the owner-only Unix socket. `python -m r
 is the packaged CLI entry point; its API factory is `control/client.py` `SocketAPI`, and with the daemon
 down it answers `control_api_unavailable` (exit 1). A request the transport cannot frame (over its 1 MiB
 cap, or not JSON) is refused before anything is connected: `delivered: false`, detail
-`not_sent:<reason>`. See `daemon/README.md`, "Composition". The Control
+`not_sent:<reason>`. On Windows every call answers `platform_unsupported` before any path or connector
+is looked at, an explicit path included (D9). See `daemon/README.md`, "Composition". The Control
 MCP transport is still not implemented. The paragraph below is the state before that composition.
 
 **Not built here, owner not assigned: the daemon adapter.** This PR does not build the production

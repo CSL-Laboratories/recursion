@@ -1,7 +1,8 @@
 """Control API credentials: principal kinds, the scopes each may hold, and tokens the daemon mints.
 
-Lane CONTROL, frontier plan v3.3, step 2. Nothing in the daemon reads this module yet: the authorizer
-in ``scopes.py`` takes a ``CredentialStore`` when it is registered into seam S5 (a later pull request).
+Lane CONTROL, frontier plan v3.3, step 2. The authorizer in ``scopes.py``, registered into seam S5, holds
+every principal to ``CEILING``. The store itself is read only by the scopes service (seam S13), which is
+built but not registered yet, so the daemon honours no token today.
 
 SCOPES are the four of the method table (``schemas/control/v1/methods.v1.json``, ``$defs/scope``):
 ``read`` looks, ``run`` starts, steers and stops work, ``approve`` shows and answers approvals, and
@@ -294,6 +295,9 @@ class CredentialStore:
     def __init__(self, path: str, *, emit: Callable[[str, dict], None] | None = None,
                  wall: Callable[[], float] = time.time, limit: FailedAuthLimit | None = None,
                  lock_timeout_s: float = 10.0) -> None:
+        """``wall`` is called with the store lock held. It must return promptly: a slow clock stalls every
+        operation that holds that lock."""
+
         if os.name == "nt" or not hasattr(os, "getuid") or not hasattr(os, "O_NOFOLLOW") or fcntl is None:
             raise CredentialStoreError("platform_unsupported: the credential store needs uids and O_NOFOLLOW")
         if not isinstance(path, str):
@@ -304,6 +308,18 @@ class CredentialStore:
             raise CredentialStoreError("the store path holds a NUL character")
         if type(lock_timeout_s) not in (int, float) or not 0 < lock_timeout_s < float("inf"):
             raise CredentialStoreError("lock_timeout_s must be a positive number of seconds")
+        # Refused here, not later as an untyped error out of verify or mint (round 5 of #385, DeepSeek F4).
+        if not callable(wall) or (emit is not None and not callable(emit)):
+            raise CredentialStoreError("wall and emit must be callable")
+        if limit is not None:
+            # Each method is required, and one that raises when it is read is refused here too, typed (round 6 of
+            # #385: Codex GPT-6 Astra 1 pins each check; DeepSeek F5, a raising property escaped untyped).
+            try:
+                usable = callable(getattr(limit, "blocked", None)) and callable(getattr(limit, "failed", None))
+            except Exception:  # noqa: BLE001 - a limiter that cannot be read cannot count failed checks
+                usable = False
+            if not usable:
+                raise CredentialStoreError("limit must have blocked and failed, like FailedAuthLimit")
         self._path, self._emit, self._wall = path, emit, wall
         self._lock_path = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.lock")
         self._lock_timeout_s = float(lock_timeout_s)
@@ -665,9 +681,9 @@ class CredentialStore:
     def _revoke_here(self, record: dict) -> None:
         """Refused from here on, whatever the file write does. Never dated before the grant's issue: after a wall
         clock that stepped back, the store this writes must still load (the round-2 reads of #377, Astra 1 and
-        Sol 1). A retry keeps this first time. A wall clock that cannot be read does not undo the revocation: it
-        is dated at the grant's issue and kept pending like any other (round 9 of #377: DeepSeek F2, Codex GPT-6
-        Astra 2 and GPT-6.1 Sol 2). Lock held."""
+        Sol 1). A retry keeps this first time. A wall clock that raises ``CredentialStoreError`` does not undo
+        the revocation: it is dated at the grant's issue and kept pending like any other (round 9 of #377:
+        DeepSeek F2, Codex GPT-6 Astra 2 and GPT-6.1 Sol 2). Lock held."""
 
         try:
             stamp = self._now()
@@ -729,12 +745,13 @@ class CredentialStore:
     def grant_scopes(self, token_id: object, kind: object, principal_id: object) -> frozenset[str]:
         """The scopes of the one grant ``token_id``, NOW: nothing unless it exists, is live (not revoked, not
         expired) and was minted for exactly ``(kind, principal_id)``. What a principal made from a verified
-        token holds: another grant of the same identity never widens it."""
+        token holds: another grant of the same identity never widens it. A wall clock that cannot be read
+        raises ``CredentialStoreError`` instead of answering nothing."""
 
         token_id, kind, principal_id = _text(token_id), _text(kind), _text(principal_id)   # round 6, DeepSeek 2
-        now = self._now()
         with self._lock:
             self._refresh()
+            now = self._now()   # after the reload, still under the lock, as verify does
             record = self._grants.get(token_id) if isinstance(token_id, str) else None
             if (record is None or record["kind"] != kind or record["id"] != principal_id
                     or record["revoked_at"] is not None
@@ -746,13 +763,14 @@ class CredentialStore:
         """The scopes ``(kind, principal_id)`` holds NOW: the union of its live grants. For a principal the
         host attributes by identity (a plugin); a principal made from a token holds ``grant_scopes`` of its
         own grant instead. Every grant is within its kind's ceiling (checked at mint and when the file is
-        read); the authorizer cuts to it again."""
+        read); the authorizer cuts to it again. A wall clock that cannot be read raises
+        ``CredentialStoreError`` instead of answering nothing."""
 
         kind, principal_id = _text(kind), _text(principal_id)   # compared as their text (round 6, DeepSeek 2)
-        now = self._now()
         out: set[str] = set()
         with self._lock:
             self._refresh()
+            now = self._now()   # after the reload, still under the lock
             for record in self._grants.values():
                 if (record["kind"] == kind and record["id"] == principal_id and record["revoked_at"] is None
                         and (record["expires_at"] is None or now < record["expires_at"])):

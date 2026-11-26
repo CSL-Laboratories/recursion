@@ -50,6 +50,8 @@ other_files = []
 # any of them. A message names the file, the line and a count, and none of the words.
 run_words = 6
 # Files or folders, as paths from the repository root; "." is the whole tree. One entry that matches nothing is red.
+# Each entry is read in its normal form (./a, a/, a//b and a/b/.. all name a). An empty scan, an absolute entry, one
+# that leaves the repository and one written twice are red, and so is a leave_out entry that holds a whole scan entry.
 scan = ["core/CORE-PACKAGES.toml", "core/tests"]
 # Files or folders of the scan that it leaves out. None today.
 leave_out = []

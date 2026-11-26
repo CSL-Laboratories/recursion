@@ -36,6 +36,7 @@ import datetime
 import hashlib
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -392,17 +393,8 @@ def check_form(data):
     if unknown:
         problems.append((4, f"{LIST_FILE}: unknown table {unknown}. The file holds {', '.join(sorted(TOP_TABLES))} "
                             "only. Remove it."))
-    sweep = data.get("sweep")
-    if sweep is not None:
-        ok = isinstance(sweep, dict) and not set(sweep) - set(SWEEP_KEYS)
-        words = sweep.get("run_words", SWEEP_RUN_WORDS) if ok else None
-        paths = [sweep.get("scan", [SWEEP_ROOT]), sweep.get("leave_out", [])] if ok else [None]
-        plain = lambda v: isinstance(v, str) and v and not v.startswith("/") and ".." not in v.split("/")
-        if isinstance(words, bool) or not isinstance(words, int) or words < 2 \
-                or not all(isinstance(group, list) and all(plain(v) for v in group) for group in paths):
-            problems.append((4, f"{LIST_FILE}: [sweep] holds run_words (a whole number, 2 or more), scan and "
-                                "leave_out (lists of paths from the repository root, none starting with / or "
-                                "holding ..) only. Correct it."))
+    if data.get("sweep") is not None:
+        problems += sweep_form(data)[3]
     table = data.get("rules")
     if table is not None:
         if not isinstance(table, dict) or set(table) - set(RULE_KEYS):
@@ -607,13 +599,18 @@ def analyse(root: Path, today=None):
             problems.append((7, f"{LIST_FILE}: {name} is both a row and a test folder of the [rules] table. "
                                 "Keep one."))
     problems += check_rows(entries, data, registrant_tops(registrants), today)
-    sweep = data.get("sweep")
-    if isinstance(sweep, dict):
-        for key, entries_of in (("scan", sweep_settings(data)[1]), ("leave_out", sweep_settings(data)[2])):
+    if isinstance(data.get("sweep"), dict):
+        _, scan, leave_out, _ = sweep_form(data)
+        for key, entries_of in (("scan", scan), ("leave_out", leave_out)):
             for left in entries_of:
-                if isinstance(left, str) and not (root / left).exists():
+                if not (root / left).exists():
                     problems.append((2, f"{LIST_FILE}: sweep.{key} names {left}, but nothing of that name stands in "
                                         "the tree. Remove it from the table."))
+                elif not holds_a_swept_file(root, left):
+                    problems.append((2, f"{LIST_FILE}: sweep.{key} names {left}, but no file the sweep reads stands "
+                                        "there (an empty folder, a link to a folder, or a folder the sweep always "
+                                        f"skips: {', '.join(SWEEP_SKIPPED_FOLDERS)}). Name a file, or a folder that "
+                                        "holds one."))
     return problems, state_line(entries, data, test_folders, today)
 
 
@@ -878,26 +875,138 @@ def contract_marks(text: str, run_words: int = SWEEP_RUN_WORDS):
     return headings, runs
 
 
-def sweep_settings(data):
-    """(run_words, scan, leave_out) from the [sweep] table of the list, with the defaults: the whole tree."""
+SWEEP_FORM = ("[sweep] holds run_words (a whole number, 2 or more), scan and leave_out (lists of paths inside the "
+              "repository, written from its root) only.")
+
+
+def kind_of(value) -> str:
+    """The kind of a value read from the list, in the words a message uses."""
+    if isinstance(value, bool):
+        return "a truth value"
+    if isinstance(value, (int, float)):
+        return "a number"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, (list, tuple)):
+        return "a list"
+    if isinstance(value, dict):
+        return "a table"
+    if isinstance(value, (datetime.date, datetime.time)):
+        return "a date or a time"
+    return f"a value of the kind {type(value).__name__}"
+
+
+def within(where: str, entry: str) -> bool:
+    """Whether a path stands at or under an entry; both are in their normal form, and "." is the whole tree."""
+    return entry == SWEEP_ROOT or where == entry or where.startswith(entry + "/")
+
+
+def sweep_entries(key: str, value):
+    """(entries, problems) of scan or leave_out: each entry in its one normal form, the POSIX normal form of the path
+    (./a, a/, a//b and a/b/.. all name a), and a check 4 problem for each value the sweep cannot use. Entries are
+    checked and compared only in this form, so no spelling of an entry makes the sweep read less than it names.
+    entries is None when the value is not a list at all."""
+    def bad(why):
+        return (4, f"{LIST_FILE}: [sweep] {key} {why}. {SWEEP_FORM} Correct it.")
+    if not isinstance(value, (list, tuple)):
+        return None, [bad(f"is {kind_of(value)}, and it must be a list of paths, such as [\"core/tests\"]")]
+    entries, first, problems = [], {}, []
+    for entry in value:
+        if not isinstance(entry, str):
+            problems.append(bad(f"holds {kind_of(entry)}, and every entry must be a path written as a string"))
+        elif not entry.strip():
+            problems.append(bad('holds an empty entry; name a file or a folder, or "." for the whole tree'))
+        elif entry.startswith("/"):
+            problems.append(bad(f"holds {entry}, an absolute path; write it from the repository root"))
+        elif posixpath.normpath(entry) == ".." or posixpath.normpath(entry).startswith("../"):
+            problems.append(bad(f"holds {entry}, which leaves the repository; name a file or a folder inside it"))
+        elif posixpath.normpath(entry) in first:
+            normal = posixpath.normpath(entry)
+            problems.append(bad(f"names {normal} twice (as {first[normal]} and as {entry}); keep one"))
+        else:
+            first[posixpath.normpath(entry)] = entry
+            entries.append(posixpath.normpath(entry))
+    if key == "scan" and not value:
+        problems.append(bad('is empty, so the sweep would read no file; name the files or folders it reads, or "." '
+                            "for the whole tree"))
+    return entries, problems
+
+
+def sweep_form(data):
+    """(run_words, scan, leave_out, problems) of the [sweep] table of the list: every entry in its normal form, the
+    defaults (the whole tree) for a value that is missing or of the wrong kind, and a check 4 problem for every value
+    the sweep cannot use, naming the key and the kind it must be. A wrong value never raises."""
     table = data.get("sweep") if isinstance(data, dict) else None
-    table = table if isinstance(table, dict) else {}
-    return (table.get("run_words", SWEEP_RUN_WORDS), list(table.get("scan", [SWEEP_ROOT])),
-            list(table.get("leave_out", [])))
+    if table is None:
+        return SWEEP_RUN_WORDS, [SWEEP_ROOT], [], []
+    if not isinstance(table, dict):
+        return SWEEP_RUN_WORDS, [SWEEP_ROOT], [], [
+            (4, f"{LIST_FILE}: [sweep] is {kind_of(table)}, and it must be a table. {SWEEP_FORM} Correct it.")]
+    problems = [(4, f"{LIST_FILE}: [sweep] holds {key}, which is no key of it. {SWEEP_FORM} Remove it.")
+                for key in sorted(set(table) - set(SWEEP_KEYS))]
+    words = table.get("run_words", SWEEP_RUN_WORDS)
+    if isinstance(words, bool) or not isinstance(words, int) or words < 2:
+        what = str(words) if isinstance(words, int) and not isinstance(words, bool) else kind_of(words)
+        problems.append((4, f"{LIST_FILE}: [sweep] run_words is {what}, and it must be a whole number, 2 or more. "
+                            f"{SWEEP_FORM} Correct it."))
+        words = SWEEP_RUN_WORDS
+    scan, found = sweep_entries("scan", table.get("scan", [SWEEP_ROOT]))
+    problems += found
+    leave_out, found = sweep_entries("leave_out", table.get("leave_out", []))
+    problems += found
+    scan = [SWEEP_ROOT] if scan is None else scan
+    leave_out = [] if leave_out is None else leave_out
+    for entry in leave_out:
+        for whole in scan:
+            if within(whole, entry):
+                problems.append((4, f"{LIST_FILE}: [sweep] leave_out names {entry}, which leaves out the whole of "
+                                    f"the scan entry {whole}, so the sweep would read nothing of it. {SWEEP_FORM} "
+                                    "Take one of the two out."))
+    return words, scan, leave_out, problems
+
+
+def sweep_settings(data):
+    """(run_words, scan, leave_out) from the [sweep] table of the list, each entry in its normal form, with the
+    defaults (the whole tree) for a value that is missing or of the wrong kind; check 4 names a wrong value."""
+    return sweep_form(data)[:3]
+
+
+def holds_a_swept_file(root: Path, entry: str) -> bool:
+    """Whether the sweep reads at least one file at or under an entry in its normal form. The sweep never enters
+    the folders it always skips or a link to a folder, so an entry there, or an empty folder, holds none."""
+    parts = [] if entry == SWEEP_ROOT else entry.split("/")
+    if any(part in SWEEP_SKIPPED_FOLDERS for part in parts) \
+            or any(root.joinpath(*parts[:depth]).is_symlink() for depth in range(1, len(parts))):
+        return False
+    target = root.joinpath(*parts)
+    if target.is_file():
+        return True
+    if target.is_symlink() or not target.is_dir():
+        return False
+    for _, names, files in os.walk(target):
+        names[:] = [name for name in names if name not in SWEEP_SKIPPED_FOLDERS]
+        if files:
+            return True
+    return False
 
 
 def sweep_public_tree(root: Path, contract: str, skip=(), run_words: int = SWEEP_RUN_WORDS, scan=(SWEEP_ROOT,),
                       leave_out=()):
     """Check 8 on one tree. The contract is given as text; no message holds a word of it. scan names the files or
-    folders (paths from the root; "." is the whole tree) that are read, leave_out those of them that are not."""
-    inside = lambda where, entry: entry == SWEEP_ROOT or where == entry or where.startswith(entry.rstrip("/") + "/")
+    folders (paths from the root; "." is the whole tree) that are read, leave_out those of them that are not. Each
+    entry is brought to its normal form first; an entry the sweep cannot use is a check 4 problem, and then nothing
+    is read."""
+    run_words, scan, leave_out, refused = sweep_form({"sweep": {"run_words": run_words, "scan": scan,
+                                                               "leave_out": leave_out}})
+    if refused:
+        return refused
     headings, runs = contract_marks(contract, run_words)
     pattern = re.compile("|".join(r"(?<![#\w])" + re.escape(h) + r"(?!\w)"
                                   for h in sorted(headings, key=len, reverse=True))) if headings else None
     problems = []
     for path, text in public_text_files(root, skip):
         where = path.relative_to(root).as_posix()
-        if not any(inside(where, entry) for entry in scan) or any(inside(where, entry) for entry in leave_out):
+        if not any(within(where, entry) for entry in scan) or any(within(where, entry) for entry in leave_out):
             continue
         for number, line in enumerate(text.splitlines(), 1):
             found = pattern.search(fold(line)) if pattern else None
@@ -1522,6 +1631,67 @@ class TestsOfTheTest(unittest.TestCase):
         self.assertEqual(analyse(tree)[0], [])
         tree = self.tree(list_body=list_text(extra='\n[sweep]\nscan = ["docs"]\n'))
         self.red(2, tree, "sweep.scan names docs, but nothing of that name stands")
+
+    LEAK = "### 3.3 Quillfern section\n"
+
+    def test_8_a_sweep_entry_is_compared_in_its_normal_form(self):
+        files = {"core/tests/leak.txt": self.LEAK, "notes/leak.md": self.LEAK, "core/CORE-PACKAGES.toml": "# x\n"}
+        for scan, where in ((["./core/tests"], "core/tests/leak.txt"), (["core/tests/"], "core/tests/leak.txt"),
+                            (["core/../core/tests"], "core/tests/leak.txt"), (["core//tests"], "core/tests/leak.txt"),
+                            (["./notes/leak.md"], "notes/leak.md"), (["notes/leak.md/"], "notes/leak.md"),
+                            (["notes//leak.md"], "notes/leak.md"), (["notes/x/../leak.md"], "notes/leak.md")):
+            self.assertEqual([text.split(" line")[0] for _, text in self.sweep(files, scan=scan)], [where], scan)
+        self.assertEqual(self.sweep(files, scan=["core"], leave_out=["./core/tests/leak.txt/"]), [])
+        self.assertEqual(sweep_settings({"sweep": {"scan": ["./core/tests/", "a//b"], "leave_out": ["c/d/.."]}}),
+                         (SWEEP_RUN_WORDS, ["core/tests", "a/b"], ["c"]))
+
+    def test_4_a_sweep_entry_that_cannot_be_compared_is_refused_by_its_name(self):
+        for table, needle in (('scan = []', "[sweep] scan is empty, so the sweep would read no file"),
+                              ('scan = ["../elsewhere"]', "[sweep] scan holds ../elsewhere, which leaves the repository"),
+                              ('scan = ["core/../../x"]', "[sweep] scan holds core/../../x, which leaves the repository"),
+                              ('leave_out = ["../x"]', "[sweep] leave_out holds ../x, which leaves the repository"),
+                              ('scan = ["/etc"]', "[sweep] scan holds /etc, an absolute path"),
+                              ('leave_out = ["/core"]', "[sweep] leave_out holds /core, an absolute path"),
+                              ('scan = ["core", "./core/"]', "[sweep] scan names core twice (as core and as ./core/)"),
+                              ('scan = ["core"]\nleave_out = ["core/x", "core//x"]', "[sweep] leave_out names core/x twice"),
+                              ('leave_out = ["./"]', "[sweep] leave_out names ., which leaves out the whole of the scan "
+                                                     "entry ."),
+                              ('scan = ["core/tests"]\nleave_out = ["core/"]', "leaves out the whole of the scan entry "
+                                                                              "core/tests")):
+            self.red(4, self.tree(list_body=list_text(extra=f"\n[sweep]\n{table}\n")), needle)
+        # The sweep itself refuses such an entry and reads nothing.
+        for scan in ([], ["../x"], ["/etc"], ["a", "./a"]):
+            problems = self.sweep({"a/leak.md": self.LEAK}, scan=scan)
+            self.assertTrue(problems, scan)
+            self.assertEqual({code for code, _ in problems}, {4}, scan)
+
+    def test_2_a_sweep_entry_that_matches_no_file_is_red(self):
+        tree = self.tree(list_body=list_text(extra='\n[sweep]\nscan = ["./docs/"]\n'))
+        self.red(2, tree, "sweep.scan names docs, but nothing of that name stands")
+        (tree / "docs" / "__pycache__").mkdir(parents=True)
+        self.red(2, tree, "sweep.scan names docs, but no file the sweep reads stands there")
+        (tree / "docs" / "__pycache__" / "a.txt").write_text("x\n", encoding="utf-8")
+        self.red(2, tree, "sweep.scan names docs, but no file the sweep reads stands there")
+        (tree / "docs" / "a.md").write_text("x\n", encoding="utf-8")
+        self.assertEqual(analyse(tree)[0], [])
+
+    def test_4_a_value_of_the_wrong_kind_in_the_sweep_table_is_refused_in_words(self):
+        for table, needle in (('scan = true', "[sweep] scan is a truth value, and it must be a list of paths"),
+                              ('scan = 1', "[sweep] scan is a number, and it must be a list of paths"),
+                              ('scan = "core"', "[sweep] scan is a string, and it must be a list of paths"),
+                              ('scan = 2026-11-26', "[sweep] scan is a date or a time, and it must be a list of paths"),
+                              ('leave_out = 2.5', "[sweep] leave_out is a number, and it must be a list of paths"),
+                              ('leave_out = false', "[sweep] leave_out is a truth value, and it must be a list"),
+                              ('scan = ["core", true]', "[sweep] scan holds a truth value, and every entry must be a "
+                                                        "path written as a string"),
+                              ('leave_out = [1]', "[sweep] leave_out holds a number, and every entry must be a path"),
+                              ('scan = [["core"]]', "[sweep] scan holds a list, and every entry must be a path"),
+                              ('run_words = "six"', "[sweep] run_words is a string, and it must be a whole number, 2 "
+                                                    "or more"),
+                              ('run_words = true', "[sweep] run_words is a truth value, and it must be a whole number"),
+                              ('run_words = 1', "[sweep] run_words is 1, and it must be a whole number, 2 or more")):
+            self.red(4, self.tree(list_body=list_text(extra=f"\n[sweep]\n{table}\n")), needle)
+            self.assertEqual(len(sweep_settings(tomllib.loads(f"[sweep]\n{table}\n"))), 3, table)
 
     def test_8_a_number_or_a_cite_field_breaks_a_run(self):
         self.assertEqual(self.sweep({"n.txt": "the quillfern core 7 drives the snarfles\n"}), [])

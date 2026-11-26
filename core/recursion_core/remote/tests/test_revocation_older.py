@@ -1,4 +1,6 @@
-"""An older copy of the record of revocations (lane REMOTE): a copy put back never lets a later revoked phone in.
+"""An older copy of the record of revocations (lane REMOTE): an older copy of the record alone, put back while the
+count beside it stands, is refused, so it lets no later revoked phone in. A copy of the whole relay folder put back
+together, or an older record with the count taken away, is not seen by the count (the module text says so).
 
 Each test makes its own temporary state folder; a "restart" is a new ``DeviceBook`` on a new store of the same
 folder. Clocks are moved by hand (``support.FakeClock``).

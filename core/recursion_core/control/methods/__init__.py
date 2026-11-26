@@ -100,7 +100,15 @@ WHO OWNS THE TRANSACTION. For a method keyed by ``command_id`` the dispatcher do
 A handler that RETURNS an answer has accepted the command: the answer is stored and replayed for that id
 for good. A handler that must not leave a receipt (the refusal is about this moment, not about the
 command: ``busy``, ``unavailable``) raises ``NotAccepted(answer)``: the transaction is rolled back,
-nothing is stored, no callback runs, and the caller gets ``answer``; the same id may be sent again. A
+nothing is stored, no callback runs, and the same id may be sent again. ``NotAccepted`` keeps
+``dict(answer)``. When its ``code`` is non-empty text and ``copy.deepcopy`` can copy it, the caller gets
+a copy of it as given: a dict, another mapping, or a list of ``(key, value)`` pairs, which reaches the
+caller as a dict. When its ``code`` is anything else, or it cannot be copied, the caller gets
+``{'code': 'unavailable', 'detail': 'handler:NotAccepted'}`` and a log line names the method. When
+``NotAccepted(answer)`` itself raises, as it does for an ``answer`` that ``dict()`` refuses, no
+``NotAccepted`` is raised at all: the handler has failed with that error, and the caller gets
+``unavailable`` with ``handler:`` and its type, as for any other failure (``NotAccepted('busy')`` gives
+``handler:ValueError``; ``NotAccepted(None)`` and ``NotAccepted(7)`` give ``handler:TypeError``). A
 handler that raises anything else is rolled back the same way and the caller gets ``unavailable``.
 
 The payload digest is the SHA-256 of the UTF-8 bytes of the params AS SUPPLIED without ``command_id``,
@@ -118,7 +126,12 @@ keyed by ``command_id`` is therefore registered with one of two things as ``tena
 ``tenant_of(principal, params) -> tenant`` that names the tenant the target belongs to (the session's
 tenant, say), or the constant ``INSTALL_TENANT``, the explicitly named fixed namespace of a method whose
 target is the whole install. ``tenant_of`` runs before the transaction is opened; it raises
-``NotAccepted(answer)`` when there is no such target (``session_unknown``, say).
+``NotAccepted(answer)`` when there is no such target (``session_unknown``, say). The handler then does
+not run, and the caller gets what a handler's ``NotAccepted(answer)`` gives, with ``tenant:`` in place
+of ``handler:``: a copy of ``dict(answer)`` when its ``code`` is non-empty text and it can be copied;
+otherwise ``{'code': 'unavailable', 'detail': 'tenant:NotAccepted'}`` and a log line names the method;
+and when ``NotAccepted(answer)`` itself raises (``'busy'``, ``None``, ``7``), ``unavailable`` with
+``tenant:`` and that error's type, as for any other error of ``tenant_of``.
 
 AFTER THE COMMIT. ``ctx.after_commit(fn)`` is a callback of THIS PROCESS and nothing more. After a
 confirmed commit the dispatcher calls each ``fn`` once, in the order they were scheduled, outside every

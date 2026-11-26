@@ -319,7 +319,10 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
     The release chosen (by ``version``, or the newest active one) passes ``_installable`` on every call,
     and no keyword turns that off. A withdrawn release goes on only as ``_WITHDRAWN_RULE`` says for the way
     it was chosen, or when ``allow_withdrawn`` names that same version (the person's own step for this one
-    install); an ``allow_withdrawn`` that names any other release is refused ``allow_withdrawn_unmatched``.
+    install); an ``allow_withdrawn`` that names another release than the one chosen is refused
+    ``allow_withdrawn_unmatched``. One that names the release chosen when that release is not withdrawn lets
+    nothing through: the install goes on as it would without it, and the words that it was not needed go to
+    ``report_kept`` when it is given and into the result as ``allow_withdrawn_not_needed``.
     A withdrawn release that goes on is said to be withdrawn before the install goes on: the words go to
     ``report_kept`` when it is given and into the result as ``withdrawn``. ``registry_name`` is the registry
     as the person named it, for those words (without it they name ``registry_root``); ``registry_kind`` is
@@ -363,12 +366,13 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
         raise InstallRefused("plugin_not_in_registry")
     if version is not None and type(version) is not str:
         raise InstallRefused("release_not_in_registry")
-    chosen, said = _installable(_select(report, plugin_id, version), report, _Road(
+    chosen, said, not_needed = _installable(_select(report, plugin_id, version), report, _Road(
         version, allow_withdrawn, registry_kind, os.fspath(registry_root) if registry_name is None else registry_name,
         config_path, state, git_repository))
-    if said is not None and report_kept is not None:
+    told = said if said is not None else not_needed
+    if told is not None and report_kept is not None:
         # Said before anything is fetched or written, in words that cannot be missed.
-        report_kept(said)
+        report_kept(told)
     artifact = chosen.artifact
     fetched = False
     if git_repository is not None or artifact is None:
@@ -389,6 +393,8 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
         # A withdrawn release went on: the result says so, installed or held, and how it was let through.
         result.update(status=chosen.status, status_reason=chosen.status_reason, withdrawn=said,
                       withdrawn_by=("allow_withdrawn" if allow_withdrawn is not None else "named_version"))
+    if not_needed is not None:
+        result["allow_withdrawn_not_needed"] = not_needed
     return result
 
 
@@ -811,25 +817,28 @@ _WITHDRAWN_RULE = {
 
 
 def _installable(chosen, report, road: _Road):
-    """The one decision whether the release ``chosen`` may be installed: ``(chosen, words)`` or a refusal.
+    """The one decision whether ``chosen`` may be installed: ``(chosen, words, not_needed)`` or a refusal.
 
     ``install_plugin`` calls it on what ``_select`` returns, on every road (an id alone, a named version, a
     registry folder, a registry at a commit, ``--git``, a direct call), before any source is fetched and
     before the profile lock, so before a release can be written or held. No keyword skips it. ``words`` is
     None for a release that is not withdrawn, else what the person is told before the install goes on. A
-    step that names any other release than the withdrawn one chosen is refused, never silently ignored.
+    step that names another release than the one chosen is refused, never silently ignored. A step that
+    names the release chosen when that release is not withdrawn lets nothing through that would not go on
+    without it: the install goes on as it did before the one decision, and ``not_needed`` (else None) tells
+    the person so.
     """
     withdrawn = chosen.status == "withdrawn"
     allow = road.allow_withdrawn
-    if allow is not None and not (withdrawn and allow == chosen.version):
+    if allow is not None and allow != chosen.version:
         codes = ["release_withdrawn", "allow_withdrawn_unmatched"] if withdrawn else ["allow_withdrawn_unmatched"]
         raise InstallRefused(codes[0], codes, detail=_unmatched_words(chosen, report, road), show_detail=True)
     if not withdrawn:
-        return chosen, None
+        return chosen, None, (None if allow is None else _not_needed_words(chosen))
     if allow is None and _WITHDRAWN_RULE[road.way()] == "refuse":
         raise InstallRefused("release_withdrawn", detail=_withdrawn_words(chosen, report, road, installed=False),
                              show_detail=True)
-    return chosen, _withdrawn_words(chosen, report, road, installed=True)
+    return chosen, _withdrawn_words(chosen, report, road, installed=True), None
 
 
 def _install_command(road: _Road, plugin_id: str, version: str | None, allow: str | None = None) -> str:
@@ -851,10 +860,10 @@ def _install_command(road: _Road, plugin_id: str, version: str | None, allow: st
 
 def _withdrawn_words(chosen, report, road: _Road, *, installed: bool) -> str:
     """That the release is withdrawn, by whom and why, what is newer, and what the person can do next."""
-    from .registry_source import printable
+    from .registry_source import _reason_sentence, printable
 
     plugin_id, version = printable(chosen.plugin_id), printable(chosen.version)
-    reason = printable(chosen.status_reason or "no reason given").rstrip(".")
+    reason = _reason_sentence(chosen.status_reason)
     newest = _newest_active(_releases(report, chosen.plugin_id))
     if newest is None:
         instead = f"No release of {plugin_id} in that registry is active, so none can be taken in its place."
@@ -862,7 +871,7 @@ def _withdrawn_words(chosen, report, road: _Road, *, installed: bool) -> str:
         instead = (f"The newest release of {plugin_id} there that is not withdrawn is {printable(newest.version)}; "
                    f"to install it run: {_install_command(road, chosen.plugin_id, newest.version)}")
     head = (f"WITHDRAWN: the release {version} of {plugin_id} was withdrawn by the keepers of the registry "
-            f"{printable(road.registry)}, who give this reason: {reason}.")
+            f"{printable(road.registry)}, who give this reason: {reason}")
     if installed:
         how = ("you allowed it for this one install with --allow-withdrawn" if road.allow_withdrawn is not None
                else "you named it by its version")
@@ -873,7 +882,7 @@ def _withdrawn_words(chosen, report, road: _Road, *, installed: bool) -> str:
 
 
 def _unmatched_words(chosen, report, road: _Road) -> str:
-    """The words of a step that names another release than the withdrawn one chosen for this install."""
+    """The words of a step that names another release than the one chosen for this install."""
     from .registry_source import printable
 
     head = (f"The step --allow-withdrawn {printable(road.allow_withdrawn)} does not match this install: it lets "
@@ -883,6 +892,16 @@ def _unmatched_words(chosen, report, road: _Road) -> str:
         return head + _withdrawn_words(chosen, report, road, installed=False)
     return head + ("Nothing was installed. Run the install again without --allow-withdrawn; to install a "
                    "withdrawn release, name it with --version and with --allow-withdrawn, both with its version.")
+
+
+def _not_needed_words(chosen) -> str:
+    """The words of a step that names the release chosen for this install when it is not withdrawn."""
+    from .registry_source import printable
+
+    version = printable(chosen.version)
+    return (f"The step --allow-withdrawn {version} is not needed: the release {version} of "
+            f"{printable(chosen.plugin_id)} is {printable(chosen.status)}, not withdrawn, so the install goes on "
+            f"as it would without the step, which you can leave out.")
 
 
 def _install_locked(config: Path, chosen, plugin_id: str, state, artifact: bytes, fetched: bool,

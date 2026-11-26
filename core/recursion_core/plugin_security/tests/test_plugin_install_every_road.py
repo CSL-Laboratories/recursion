@@ -113,6 +113,21 @@ class EveryRoadTests(RegistryCase):
         self.assertIn("Nothing was installed.", caught.exception.detail)
         self.assertEqual(([], before), (seen, self.listing()))
 
+    # plain_folder reads a folder as it is only when it is True itself; any other value is the registry folder's way
+    def test_d_plain_folder_is_taken_only_when_it_is_true(self):
+        from recursion_core.plugin_security.install import InstallRefused
+        from recursion_core.plugin_security.registry_source import install_from_registry
+
+        registry = self.two()
+        before = self.listing()
+        for value in (1, "yes", [True]):
+            with self.subTest(value=value):
+                with self.assertRaises(InstallRefused) as caught:
+                    install_from_registry(self.config, _PLUGIN, registry=registry, version="0.9.0", state=self.state,
+                                          plain_folder=value)
+                self.assertEqual("release_withdrawn", caught.exception.code)
+                self.assertEqual(before, self.listing())
+
     # (e) an id alone never takes a withdrawn release
     def test_e_id_alone_takes_the_newest_active_and_nothing_withdrawn(self):
         registry = self.two(first=("1.0.0", "active", None), second=("1.1.0", "withdrawn", _REASON))
@@ -151,9 +166,34 @@ class EveryRoadTests(RegistryCase):
                                   "--allow-withdrawn", "1.0.0", words=("does not match this install",))
         self.assertIn("refused: release_withdrawn\n", err)
         self.assert_refused("allow_withdrawn_unmatched", _PLUGIN, "--registry", registry, "--version", "1.0.0",
-                            "--allow-withdrawn", "1.0.0", words=("which is active",))
+                            "--allow-withdrawn", "0.9.0", words=("which is active",))
         self.assert_refused("allow_withdrawn_unmatched", _PLUGIN, "--registry", registry,
                             "--allow-withdrawn", "0.9.0", words=("the release chosen here is 1.0.0",))
+
+    # A step that names the release chosen when it is not withdrawn: installed as without it, and said.
+    def test_h_a_step_naming_the_chosen_active_release_is_not_needed(self):
+        registry = self.two()
+        status, out, err = self.run_cli(_PLUGIN, "--registry", registry, "--version", "1.0.0",
+                                        "--allow-withdrawn", "1.0.0")
+        self.assertEqual(status, 0, err)
+        line = (f"The step --allow-withdrawn 1.0.0 is not needed: the release 1.0.0 of {_PLUGIN} is active, not "
+                "withdrawn, so the install goes on as it would without the step, which you can leave out.")
+        self.assertEqual(line, err.splitlines()[0])
+        result = json.loads(out)
+        self.assertEqual(("1.0.0", "active", line),
+                         (result["version"], result["status"], result["allow_withdrawn_not_needed"]))
+        self.assertNotIn("withdrawn_by", result)
+        self.assertEqual(0, assert_stops(self, err))
+
+    def test_h_a_step_naming_the_chosen_deprecated_release_is_not_needed_and_its_status_is_printed(self):
+        self.two(first=("0.8.0", "deprecated", "A made-up reason."))
+        bare, commit = self.commit_registry()
+        status, _out, err = self.run_cli(_PLUGIN, "--registry", f"{bare}@{commit}", "--version", "0.8.0",
+                                         "--allow-withdrawn", "0.8.0")
+        self.assertEqual(status, 0, err)
+        self.assertTrue(err.startswith(f"The step --allow-withdrawn 0.8.0 is not needed: the release 0.8.0 of "
+                                       f"{_PLUGIN} is deprecated, not withdrawn, so the install goes on"), err)
+        self.assertIn("This release is deprecated: A made-up reason.\n", err)
 
     # (i) a deprecated release from a folder: its status line is printed
     def test_i_cli_folder_deprecated_prints_its_status_line(self):
@@ -298,10 +338,12 @@ class StructureTests(unittest.TestCase):
 # printed it) and what this head does. "installed V, no word" is an install that carries no status of a
 # withdrawn release; "status in result" is one whose result (the command's stdout) carries the status and
 # that says nothing on stderr or to report_kept; "status line" is the line printed on stderr after an install
-# from a registry at a commit; "WITHDRAWN" is the line said before the install goes on.
+# from a registry at a commit; "WITHDRAWN" is the line said before the install goes on; "step not needed" is
+# an install that says, before it goes on and in its result, that the person's --allow-withdrawn was not needed.
+# Each fixture is its first release; "two", "newest" and "deprecated" hold 1.0.0 active beside it.
 _FIXTURES = {
     "two": ("0.9.0", "withdrawn", _REASON), "newest": ("1.1.0", "withdrawn", _REASON),
-    "lone": ("0.9.0", "withdrawn", _REASON),
+    "lone": ("0.9.0", "withdrawn", _REASON), "deprecated": ("0.8.0", "deprecated", _REASON),
 }
 _NAMINGS = {
     "id alone": ("two", None, None),
@@ -314,7 +356,19 @@ _NAMINGS = {
     "named the newest, withdrawn": ("newest", "1.1.0", None),
     "id alone, none active": ("lone", None, None),
     "named withdrawn, none active": ("lone", "0.9.0", None),
+    "named active, itself allowed": ("two", "1.0.0", "1.0.0"),
+    "named active, a withdrawn allowed": ("two", "1.0.0", "0.9.0"),
+    "id alone, the chosen allowed": ("two", None, "1.0.0"),
+    "named deprecated": ("deprecated", "0.8.0", None),
+    "named deprecated, itself allowed": ("deprecated", "0.8.0", "0.8.0"),
+    "named deprecated, another allowed": ("deprecated", "0.8.0", "1.0.0"),
 }
+
+
+def _chosen(naming):
+    """The version a naming chooses: the one it names, or for an id alone the newest active (None if none)."""
+    fixture, version, _allow = _NAMINGS[naming]
+    return version if version is not None else None if fixture == "lone" else "1.0.0"
 _FORMS = {
     # road, registry form, namings tried (every naming, or the two that reach a registry at all)
     "command, registry at a commit": ("command", "commit", tuple(_NAMINGS)),
@@ -353,6 +407,18 @@ ROAD_TABLE = {
         ('refused release_not_active', 'refused release_not_active'),
     ('command, registry at a commit', 'named withdrawn, none active'):
         ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('command, registry at a commit', 'named active, itself allowed'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, step not needed'),
+    ('command, registry at a commit', 'named active, a withdrawn allowed'):
+        ('installed 1.0.0, no word', 'refused allow_withdrawn_unmatched'),
+    ('command, registry at a commit', 'id alone, the chosen allowed'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, step not needed'),
+    ('command, registry at a commit', 'named deprecated'):
+        ('installed 0.8.0, no word', 'installed 0.8.0, no word'),
+    ('command, registry at a commit', 'named deprecated, itself allowed'):
+        ('installed 0.8.0, no word', 'installed 0.8.0, step not needed'),
+    ('command, registry at a commit', 'named deprecated, another allowed'):
+        ('installed 0.8.0, no word', 'refused allow_withdrawn_unmatched'),
     ('command, registry folder', 'id alone'):
         ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
     ('command, registry folder', 'named withdrawn'):
@@ -373,6 +439,18 @@ ROAD_TABLE = {
         ('refused release_not_active', 'refused release_not_active'),
     ('command, registry folder', 'named withdrawn, none active'):
         ('installed 0.9.0, status in result', 'installed 0.9.0, WITHDRAWN'),
+    ('command, registry folder', 'named active, itself allowed'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, step not needed'),
+    ('command, registry folder', 'named active, a withdrawn allowed'):
+        ('installed 1.0.0, no word', 'refused allow_withdrawn_unmatched'),
+    ('command, registry folder', 'id alone, the chosen allowed'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, step not needed'),
+    ('command, registry folder', 'named deprecated'):
+        ('installed 0.8.0, no word', 'installed 0.8.0, no word'),
+    ('command, registry folder', 'named deprecated, itself allowed'):
+        ('installed 0.8.0, no word', 'installed 0.8.0, step not needed'),
+    ('command, registry folder', 'named deprecated, another allowed'):
+        ('installed 0.8.0, no word', 'refused allow_withdrawn_unmatched'),
     ('command, a file', 'id alone'):
         ('refused root_unavailable', 'refused root_unavailable'),
     ('command, a file', 'named withdrawn'):
@@ -401,6 +479,18 @@ ROAD_TABLE = {
         ('refused release_not_active', 'refused release_not_active'),
     ('install_from_registry, registry at a commit', 'named withdrawn, none active'):
         ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('install_from_registry, registry at a commit', 'named active, itself allowed'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, step not needed'),
+    ('install_from_registry, registry at a commit', 'named active, a withdrawn allowed'):
+        ('installed 1.0.0, no word', 'refused allow_withdrawn_unmatched'),
+    ('install_from_registry, registry at a commit', 'id alone, the chosen allowed'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, step not needed'),
+    ('install_from_registry, registry at a commit', 'named deprecated'):
+        ('installed 0.8.0, no word', 'installed 0.8.0, no word'),
+    ('install_from_registry, registry at a commit', 'named deprecated, itself allowed'):
+        ('installed 0.8.0, no word', 'installed 0.8.0, step not needed'),
+    ('install_from_registry, registry at a commit', 'named deprecated, another allowed'):
+        ('installed 0.8.0, no word', 'refused allow_withdrawn_unmatched'),
     ('install_from_registry, registry folder', 'id alone'):
         ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
     ('install_from_registry, registry folder', 'named withdrawn'):
@@ -421,6 +511,18 @@ ROAD_TABLE = {
         ('refused release_not_active', 'refused release_not_active'),
     ('install_from_registry, registry folder', 'named withdrawn, none active'):
         ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('install_from_registry, registry folder', 'named active, itself allowed'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, step not needed'),
+    ('install_from_registry, registry folder', 'named active, a withdrawn allowed'):
+        ('installed 1.0.0, no word', 'refused allow_withdrawn_unmatched'),
+    ('install_from_registry, registry folder', 'id alone, the chosen allowed'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, step not needed'),
+    ('install_from_registry, registry folder', 'named deprecated'):
+        ('installed 0.8.0, no word', 'installed 0.8.0, no word'),
+    ('install_from_registry, registry folder', 'named deprecated, itself allowed'):
+        ('installed 0.8.0, no word', 'installed 0.8.0, step not needed'),
+    ('install_from_registry, registry folder', 'named deprecated, another allowed'):
+        ('installed 0.8.0, no word', 'refused allow_withdrawn_unmatched'),
     ('install_from_registry, a file', 'id alone'):
         ('refused root_unavailable', 'refused root_unavailable'),
     ('install_from_registry, a file', 'named withdrawn'):
@@ -449,6 +551,18 @@ ROAD_TABLE = {
         ('refused release_not_active', 'refused release_not_active'),
     ('install_plugin, plain folder', 'named withdrawn, none active'):
         ('installed 0.9.0, status in result', 'installed 0.9.0, WITHDRAWN'),
+    ('install_plugin, plain folder', 'named active, itself allowed'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, step not needed'),
+    ('install_plugin, plain folder', 'named active, a withdrawn allowed'):
+        ('installed 1.0.0, no word', 'refused allow_withdrawn_unmatched'),
+    ('install_plugin, plain folder', 'id alone, the chosen allowed'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, step not needed'),
+    ('install_plugin, plain folder', 'named deprecated'):
+        ('installed 0.8.0, no word', 'installed 0.8.0, no word'),
+    ('install_plugin, plain folder', 'named deprecated, itself allowed'):
+        ('installed 0.8.0, no word', 'installed 0.8.0, step not needed'),
+    ('install_plugin, plain folder', 'named deprecated, another allowed'):
+        ('installed 0.8.0, no word', 'refused allow_withdrawn_unmatched'),
     ('install_plugin, a file', 'id alone'):
         ('refused root_unavailable', 'refused root_unavailable'),
     ('install_plugin, a file', 'named withdrawn'):
@@ -477,6 +591,8 @@ class RoadTableCase(RegistryCase):
             self.two()
         elif fixture == "newest":
             self.two(first=("1.0.0", "active", None), second=("1.1.0", "withdrawn", _REASON))
+        elif fixture == "deprecated":
+            self.two(first=_FIXTURES["deprecated"])
         else:
             self.write_registry(_PLUGIN, version="0.9.0", release_over=_over("withdrawn", _REASON))
         if where == "commit":
@@ -499,7 +615,9 @@ class RoadTableCase(RegistryCase):
                 result = json.loads(out)
                 word = ("WITHDRAWN" if "WITHDRAWN:" in err else
                         "status line" if "This release is withdrawn" in err else
-                        "status in result" if result.get("status") == "withdrawn" else "no word")
+                        "status in result" if result.get("status") == "withdrawn" else
+                        "step not needed" if "is not needed" in err and result.get("allow_withdrawn_not_needed") else
+                        "no word")
                 return f"installed {result['version']}, {word}"
             self.assertEqual(self.listing(), before, err)
             codes = [line[len("refused: "):] for line in err.splitlines() if line.startswith("refused: ")]
@@ -517,7 +635,9 @@ class RoadTableCase(RegistryCase):
             self.assertEqual(self.listing(), before)
             return "refused " + " ".join(getattr(exc, "codes", None) or [exc.code])
         word = ("WITHDRAWN" if any(str(line).startswith("WITHDRAWN:") for line in seen) else
-                "status in result" if result.get("status") == "withdrawn" else "no word")
+                "status in result" if result.get("status") == "withdrawn" else
+                "step not needed" if any("is not needed" in str(line) for line in seen)
+                and result.get("allow_withdrawn_not_needed") else "no word")
         return f"installed {result['version']}, {word}"
 
 
@@ -540,6 +660,25 @@ class RoadTableRuleTests(unittest.TestCase):
                  if base.startswith("refused") and head.startswith("installed")]
         self.assertEqual([], moved)
 
+    def test_a_row_goes_from_installed_to_refused_only_for_a_step_naming_another_release_than_the_chosen(self):
+        moved = [row for row, (base, head) in ROAD_TABLE.items()
+                 if base.startswith("installed") and head.startswith("refused")]
+        self.assertNotEqual([], moved)
+        other = [row for row in moved if _NAMINGS[row[1]][2] in (None, _chosen(row[1]))]
+        self.assertEqual([], other)
+
+    def test_a_step_naming_the_chosen_release_that_is_not_withdrawn_installs_as_the_base_did(self):
+        rows = []
+        for row in ROAD_TABLE:
+            fixture, _version, allow = _NAMINGS[row[1]]
+            if allow is not None and allow == _chosen(row[1]) and _FIXTURES[fixture][:2] != (allow, "withdrawn"):
+                rows.append(row)
+        self.assertEqual(15, len(rows), rows)
+        for row in rows:
+            base, head = ROAD_TABLE[row]
+            self.assertTrue(base.startswith("installed "), row)
+            self.assertEqual(base.split(",")[0] + ", step not needed", head, row)
+
     def test_every_withdrawn_release_installed_here_is_said_before_the_install(self):
         withdrawn = {version for version, status, _reason in _FIXTURES.values() if status == "withdrawn"}
         silent = [row for row, (_base, head) in ROAD_TABLE.items() if head.startswith("installed")
@@ -554,6 +693,7 @@ def assert_stops(case, text):
     """No stop after white space, no doubled stop, and nothing after a printed command on its line."""
     case.assertNotRegex(text, r"\s\.", text)
     case.assertNotRegex(text, r"\.\s*\.", text)
+    case.assertNotRegex(text, "[!?\u2026]\\.", text)
     commands = 0
     for line in text.splitlines():
         at = line.find(_COMMAND)
@@ -622,10 +762,40 @@ class WordsTests(RegistryCase):
             "a doubled stop": "who give this reason: A made-up reason to withdraw..",
             "a stop glued to a command": f"To install it run: {command}.",
             "words after a command": f"To install it run: {command} and then",
+            "a stop after an exclamation mark": "who give this reason: Do not use this one!.",
+            "a stop after a question mark": "who give this reason: Is it safe?.",
+            "a stop after an ellipsis": "who give this reason: Wait\u2026.",
         }.items():
             with self.subTest(label):
                 with self.assertRaises(AssertionError):
                     assert_stops(self, text)
+
+    # A reason of the registry that ends in its own mark gets no full stop after it, in the words and the status.
+    def test_a_reason_ending_in_an_exclamation_mark_gets_no_stop_after_it(self):
+        self.two(first=("0.9.0", "withdrawn", "Do not use this one!"))
+        bare, commit = self.commit_registry()
+        registry = f"{bare}@{commit}"
+        err = self.assert_refused("release_withdrawn", _PLUGIN, "--registry", registry, "--version", "0.9.0")
+        self.assertIn("who give this reason: Do not use this one! Nothing was installed.", err)
+        self.assertEqual(2, assert_stops(self, err))
+        status, _out, err = self.run_cli(_PLUGIN, "--registry", registry, "--version", "0.9.0",
+                                         "--allow-withdrawn", "0.9.0")
+        self.assertEqual(status, 0, err)
+        self.assertIn("who give this reason: Do not use this one! It is installed because", err)
+        self.assertIn("This release is withdrawn: Do not use this one!\n", err)
+        self.assertEqual(1, assert_stops(self, err))
+
+    def test_a_reason_ending_in_a_question_mark_or_an_ellipsis_gets_no_stop_after_it(self):
+        from recursion_core.plugin_security.registry_source import _reason_sentence
+
+        self.two(first=("0.9.0", "withdrawn", "Is it safe?"))
+        status, _out, err = self.run_cli(_PLUGIN, "--registry", str(self.registry), "--version", "0.9.0")
+        self.assertEqual(status, 0, err)
+        self.assertIn("who give this reason: Is it safe? It is installed because", err)
+        self.assertIn("This release is withdrawn: Is it safe?\n", err)
+        self.assertEqual(1, assert_stops(self, err))
+        self.assertEqual(("Wait\u2026", "Stop.", "Stop.", "no reason given.", "no reason given."),
+                         tuple(_reason_sentence(text) for text in ("Wait\u2026", "Stop", "Stop..", "...", None)))
 
     # The newest release that is not withdrawn, when the withdrawn one named is itself the newest of all.
     def test_the_newest_not_withdrawn_is_named_when_the_withdrawn_one_is_the_newest_of_all(self):

@@ -106,6 +106,16 @@ def printable(text: str) -> str:
                    (f"\\x{ord(char):02x}" if ord(char) < 0x100 else f"\\u{ord(char):04x}") for char in str(text))
 
 
+# The marks a sentence of the registry's own reason may already end with; a full stop is added after no other.
+_END_MARKS = ("!", "?", "\u2026")
+
+
+def _reason_sentence(reason: object) -> str:
+    """A registry's reason through ``printable``, ending in one mark: its own, or one full stop added."""
+    text = printable(reason or "").rstrip(".") or "no reason given"
+    return text if text.endswith(_END_MARKS) else text + "."
+
+
 def shown_lines(result: dict, *, status_only: bool = False) -> list:
     """What a person reads after an install by registry: the label, the requested permissions, the status.
 
@@ -116,8 +126,7 @@ def shown_lines(result: dict, *, status_only: bool = False) -> list:
         "Requested permissions (requested by the release, not enforced by this install): "
         + (", ".join(result.get("requested_permissions") or ()) or "none") + "."]
     if result.get("status") in ("deprecated", "withdrawn"):
-        reason = printable(result.get("status_reason") or "no reason given").rstrip(".")
-        lines.append(f"This release is {result['status']}: {reason}.")
+        lines.append(f"This release is {result['status']}: {_reason_sentence(result.get('status_reason'))}")
     return lines
 
 

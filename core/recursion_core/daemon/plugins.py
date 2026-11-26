@@ -70,7 +70,7 @@ from recursion_core.gui.client import ACTIONS, READS
 from recursion_core.gui.panels import panel_registry
 from recursion_core.plugin_security import (ApprovalGate, Authority, CoreHealth, CoreService, GilProbe, Grant,
                                             PERMISSIONS, PluginLoader, Refused, ReservedEffects, TrustStore,
-                                            create_revocation_store)
+                                            create_revocation_store, parse_manifest)
 from recursion_core.plugin_security.signing import backend_available
 
 from .breaker import STORE_DIR
@@ -98,6 +98,8 @@ _GRANT_KEYS = frozenset({'plugin_id', 'artifact_sha256', 'signer_key_id', 'permi
 # before a newline, and a value that is not this whole text is refused.
 _INSTALL_KEY_ID = re.compile(r'ed25519:[0-9a-f]{32}')
 _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
+# The request's plugin_id (schemas/control/v1/methods.v1.json), the manifest's own grammar.
+_PLUGIN_ID = re.compile(r'[a-z][a-z0-9_.-]{1,63}')
 # O7 reads (ADV2-3). Uncalibrated defaults: a plugin call that has not answered by its deadline is
 # answered 504 and the plugin is marked degraded; a read that finds another one running waits this
 # long for its turn, then answers busy. A timed-out call cannot be stopped in-process, so while it
@@ -369,13 +371,27 @@ class PluginHost:
             label = self._labels.get(hashlib.sha256(manifest).hexdigest())
             loaded = self.loader.load(manifest, signature, artifact, registry_label=label)
         except (PluginRefused, Refused) as exc:
-            findings = list(self.loader.last_findings) if isinstance(exc, Refused) else []
+            # After a poison the loader refuses before it reads this manifest, and last_findings
+            # still holds the poisoning plugin's: they are not this directory's id or label.
+            own = isinstance(exc, Refused) and exc.code != 'core_poisoned_restart_required'
+            findings = list(self.loader.last_findings) if own else []
             record.update(code=exc.code, detail=exc.detail,
                           findings=findings + self._import_findings(before)
                           + [_finding(exc.code, 'refuse', exc.detail)])
             manifest_ok = next((f for f in findings if f.get('code') == 'manifest_ok'), None)
             if manifest_ok is not None:
                 record['plugin_id'] = manifest_ok.get('detail')
+            elif isinstance(exc, Refused) and exc.code == 'core_poisoned_restart_required':
+                # This directory's own id, and the label recorded for its bytes, from its manifest
+                # alone: parsed, never loaded, so no plugin code runs. A manifest that does not parse
+                # (an id outside the grammar included) leaves the row without an id.
+                try:
+                    record['plugin_id'] = parse_manifest(manifest).plugin_id
+                except (Refused, ValueError, RecursionError):
+                    pass
+                else:
+                    if label in _LABELS:
+                        record['registry_label'] = label
             log.error('plugin at %s refused: %s; the daemon runs without it', source, exc)
             return record
         record.update(plugin_id=loaded.plugin_id, state='loaded', code=None, trust=loaded.trust,
@@ -460,7 +476,7 @@ class PluginHost:
         The registry label on that row is what the installer recorded for this manifest.
         On a loaded row it is ``unlisted`` when the install recorded none, or one for other bytes.
         """
-        if not isinstance(plugin_id, str) or not plugin_id:
+        if not isinstance(plugin_id, str) or _PLUGIN_ID.fullmatch(plugin_id) is None:
             return {'code': 'request_invalid', 'detail': 'plugin_id'}
         rows = [item for item in self.inventory()['plugins'] if item.get('plugin_id') == plugin_id]
         if not rows:

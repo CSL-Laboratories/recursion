@@ -18,8 +18,9 @@ schema cannot see that file (`README.md`). The developer-key bump stays `1.0-dra
 ## `install.v1.json` is `1.0-draft.3` (2026-11-17)
 
 A grant may name `developer_key_id` as null or as a key id (`ed25519:` and 32 lower-case hex digits). Draft 2
-allowed the member and the reader refused it as an unknown grant field, so a file of the schema was not read.
-The reader now takes that shape and refuses any other. What it breaks: a `developer_key_id` that is not null
+had no such member: its grant took no member it did not list, and the reader refused it as an unknown grant
+field. Draft 3 adds it to the schema and to the reader together. The reader now takes that shape and
+refuses any other. What it breaks: a `developer_key_id` that is not null
 and not a key id. A file that omits the member is unchanged. No rule here ties `developer_key_id` to
 `signer_key_id`. The reader checks the shape and does not store the id on the grant.
 

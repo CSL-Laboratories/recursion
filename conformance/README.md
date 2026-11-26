@@ -37,7 +37,13 @@ Three files:
   what a transcript line must carry because its event says so, what each thing that happens to a
   queued message does to it against the binding committed before the write, the Task of a run and of
   a turn, the identity of a start request, reading a log from a cursor in the projection that was
-  asked for, and the digests an event carries. It also reads the published schemas themselves with
+  asked for, and the digests an event carries. A `session.stop` answer is held too: a Stop is stopped
+  only when every run in it is stopped and `pending` is empty. One pending run makes the answer
+  `pending`, and `pending` names those runs and no others. An ended answer has a run whose code is
+  `ended`. `fits` stays true: the published schema does not say this. The codes it can return are
+  `shape`, `run`, `stopped_while_pending`, `ended_while_pending`, `not_every_run_stopped`,
+  `pending_names`, `pending_without_a_pending_run` and `ended_without_an_ended_run`. It also reads
+  the published schemas themselves with
   the standard library (`fits`), because complete validation of an approval is its published shape
   as well as what must agree inside it: a change and a consumption check both, and `fits` says what
   the Draft 2020-12 validator says on every fixture of the control folder. Before validating an

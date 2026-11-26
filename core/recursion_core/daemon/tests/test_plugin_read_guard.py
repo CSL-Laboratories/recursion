@@ -379,6 +379,39 @@ class PluginReadGuardTests(unittest.TestCase):
                     self.assert_refused_and_never_run(form, config, dirs, marks, host, rows, available)
                     self.assertTrue(rows['plugin:broken'].endswith('; registry label: ' + NOT_READ_INSTALL + TAIL))
 
+    def test_the_run_says_once_at_its_start_and_in_its_status_that_install_json_was_not_read(self):
+        for form in LOOSENED:
+            for named in (True, False):
+                with self.subTest(form=form, plugins_named=named):
+                    config, dirs, marks, _ = self.four(form)
+                    installed = config / 'plugins'
+
+                    def make():
+                        with self.assertLogs('recursion_core.daemon.plugins', 'INFO') as logs:
+                            host = plugins.PluginHost(config, config.parent / 'state', plugin_dirs=dirs if named else [],
+                                                      gil_probe=FakeGilProbe(), verification_available=lambda: True)
+                        return host, [r.getMessage() for r in logs.records]
+                    host, lines = self.bounded('the daemon start (PluginHost)', make)
+                    self.addCleanup(host.close)
+                    said = ('install.json was not read, so no plugin was loaded: the install directory %s %s; found: %s'
+                            % (installed, plugins.DIRECTORY_REFUSED, LOOSENED[form]))
+                    if form in ('gw', 'ow'):
+                        repair = ('(only its mode is wrong: chmod go-w -- %s), then restart the daemon'
+                                  % shlex.quote(str(installed)))
+                    else:  # a link or a file: no command changes that, so the words say what to make it
+                        repair = ('make %s a directory of your own (not a link) that group and other cannot write, then '
+                                  'restart the daemon' % installed)
+                    start = [line for line in lines if line.startswith('install.json was not read')]
+                    self.assertEqual(len(start), 1, lines)
+                    self.assertIn(said, start[0])
+                    self.assertIn(repair, start[0])
+                    listed = self.bounded('inventory', host.inventory)
+                    self.assertEqual(listed['install_file'], start[0])
+                    self.assertEqual(sorted(p.name for p in marks.iterdir()), [])
+        config, dirs, _, _ = self.four('sound')
+        host = self.build(config, dirs)
+        self.assertNotIn('install_file', self.bounded('inventory', host.inventory))
+
     def test_with_a_sound_install_directory_or_none_the_four_plugins_load_as_before(self):
         reserved = {'res': ('refused', 'reserved_destination', None), 'cred': ('refused', 'reserved_credential', None),
                     'grant': ('loaded', None, ['panel']), 'plain': ('loaded', None, [])}

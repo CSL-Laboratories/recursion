@@ -113,6 +113,9 @@ DIRECTORY_REREAD = ('what was found is what the first look found; a directory re
 INSTALL_NOT_READ = ('install.json was not read: the install directory %s %s; so the reserved effects, grants and '
                     'trusted keys written in it could not be checked, and no plugin is loaded while it is so; %s, then '
                     'restart the daemon')
+# Said once by the run itself, at the daemon's start and in its status, while install.json is not read for its directory.
+INSTALL_UNREAD_RUN = ('install.json was not read, so no plugin was loaded: the install directory %s %s; %s, then '
+                      'restart the daemon')
 # The modes a repair command can change. Any other finding (a link, another owner, not a directory) gets words only.
 _MODE_ONLY = frozenset({'group-writable', 'other-writable'})
 _UNREAD = object()
@@ -392,6 +395,8 @@ class PluginHost:
         # The refusal of the install directory when install.json was not read because of it, else None.
         self._install_unread = None
         self._install_view, self._install_marker = ({}, False), _UNREAD
+        # The run's own sentence while install.json is not read because its directory is refused, else None.
+        self.install_file = None
         self._install_lock = threading.Lock()
         self.records, self.registries = [], ()
         self.pending_approvals = collections.deque(maxlen=64)  # (approval id, digest) drawn, newest last
@@ -421,7 +426,9 @@ class PluginHost:
                 # its own directory lies, and none of its code runs: each row says why and what to do.
                 self._install_unread = exc
                 detail = self._install_words(exc)
-            log.error('no plugin can load: %s: %s', exc.code, detail)
+                self._say_install_unread(exc)
+            else:
+                log.error('no plugin can load: %s: %s', exc.code, detail)
             self._refuse_all(sources, exc.code, detail)
             return
         # The label is not a gate: it is on the host before the trust store can refuse below.
@@ -445,10 +452,11 @@ class PluginHost:
     # -- discovery ------------------------------------------------------------------------------
     def _sources(self, plugin_dirs):
         found = []
+        refusal = self._directory_refusal(self._config) if os.path.lexists(self._config) else None
+        if refusal is not None:
+            self._say_install_unread(refusal)
         if self._config.is_dir():
-            refusal = self._directory_refusal(self._config)
             if refusal is not None:
-                log.error('plugin directory %s is not operator-owned or is group/other writable; ignored', self._config)
                 self.records.append({'source': str(self._config), 'plugin_id': None, 'state': 'refused',
                                      'code': 'plugin_directory_untrusted',
                                      'detail': 'install directory %s %s; neither its install.json nor any plugin '
@@ -458,6 +466,13 @@ class PluginHost:
             else:
                 found += sorted(p for p in self._config.iterdir() if p.is_dir() or p.is_symlink())
         return found + [Path(p) for p in plugin_dirs]
+
+    def _say_install_unread(self, refusal):
+        """The run says it once, at the start and in its status: install.json was not read, so no plugin was
+        loaded, the install directory by its whole path, what was found and the repair."""
+        if self.install_file is None:
+            self.install_file = INSTALL_UNREAD_RUN % (self._config, refusal.detail, _repair(self._config, refusal.detail))
+            log.error('%s', self.install_file)
 
     def _directory_refusal(self, path):
         """``plugin_directory_verdict`` for this run. A directory refused once stays refused: no row,
@@ -631,10 +646,13 @@ class PluginHost:
                 item['permissions'] = list(self.loader.permissions(item['plugin_id']))  # after a revoke or a poison
                 item.update(self._degraded_fields(item['plugin_id']))
             plugins.append(item)
-        return {'plugins': plugins, 'verification': self.verification, 'core_poisoned': self.health.poisoned,
-                'authority_profile': self.authority_state, 'approvals_drawn': len(self.pending_approvals),
-                'approval_surface': 'none: no surface can approve or veto yet, so no effect is authorized',
-                'containment': 'none: plugins run in the daemon process and uid'}
+        answer = {'plugins': plugins, 'verification': self.verification, 'core_poisoned': self.health.poisoned,
+                  'authority_profile': self.authority_state, 'approvals_drawn': len(self.pending_approvals),
+                  'approval_surface': 'none: no surface can approve or veto yet, so no effect is authorized',
+                  'containment': 'none: plugins run in the daemon process and uid'}
+        if self.install_file is not None:
+            answer['install_file'] = self.install_file  # present only while install.json is not read for its directory
+        return answer
 
     def route_records(self):
         """The plugin rows of the GUI's inventory: what loaded, what was refused and why.

@@ -181,6 +181,106 @@ def parser_diagnostic_observation():
     raise AssertionError("broken parser was not refused")
 
 
+class _FailingStore(MemoryStore):
+    """A store whose receipt read, receipt write or commit raises, as ``failing`` names."""
+
+    def __init__(self, failing, error):
+        super().__init__()
+        self.failing, self.error = failing, error
+
+    @contextlib.contextmanager
+    def transaction(self):
+        failing, error = self.failing, self.error
+        with super().transaction() as tx:
+
+            class Tx:
+                def receipt_get(self, *key):
+                    if failing == "receipt_get":
+                        raise error
+                    return tx.receipt_get(*key)
+
+                def receipt_put(self, *row):
+                    if failing == "receipt_put":
+                        raise error
+                    return tx.receipt_put(*row)
+
+            yield Tx()
+            if failing == "commit":
+                raise error
+
+
+# The words of the three lines for a refusal with no typed answer. They name no exception type.
+_REFUSED = "refused without a typed answer"
+
+
+def failure_road_observation():
+    """Reach each road on which the dispatcher logs a failure, once, and keep every line it logged there."""
+    # An inert canary, never a credential and never read from an environment or a file.
+    marker = "SYNTHETIC_PRIVATE_VALUE_42"
+
+    def raises(*args):
+        raise ValueError(marker)
+
+    def refuses(*args):
+        raise methods.NotAccepted({"code": 7, "detail": marker})
+
+    def no_answer(ctx, params):
+        return marker
+
+    def no_tenant(principal, params):
+        return ""
+
+    def ok(ctx, params):
+        return {"code": "ok"}
+
+    def with_callback(ctx, params):
+        ctx.after_commit(raises)
+        return {"code": "ok"}
+
+    read, command = "session.status", "session.turn"
+    # road: (method, handler, tenant_of or None, the store part that fails or None, stage words, type words)
+    roads = {
+        "read_handler_raises": (read, raises, None, None, "handler of", "(ValueError)"),
+        "read_handler_returns_no_answer": (read, no_answer, None, None, "handler of", "(TypeError)"),
+        "read_handler_refuses_untyped": (read, refuses, None, None, "handler of", _REFUSED),
+        "read_callback_raises": (read, with_callback, None, None, "after-commit callback of", "(ValueError)"),
+        "tenant_raises": (command, ok, raises, None, "the tenant of", "(ValueError)"),
+        "tenant_names_no_tenant": (command, ok, no_tenant, None, "the tenant of", "(TypeError)"),
+        "tenant_refuses_untyped": (command, ok, refuses, None, "the tenant of", _REFUSED),
+        "command_handler_raises": (command, raises, None, None, "(handler,", "ValueError)"),
+        "command_handler_returns_no_answer": (command, no_answer, None, None, "(handler,", "TypeError)"),
+        "command_handler_refuses_untyped": (command, refuses, None, None, "command ", _REFUSED),
+        "command_receipt_read_fails": (command, ok, None, "receipt_get", "(store,", "ValueError)"),
+        "command_receipt_write_fails": (command, ok, None, "receipt_put", "(store,", "ValueError)"),
+        "command_commit_fails": (command, ok, None, "commit", "(store,", "ValueError)"),
+        "command_callback_raises": (command, with_callback, None, None, "after-commit callback of", "(ValueError)"),
+    }
+    observations = {}
+    for road, (method, handler, tenant_of, failing, stage, kind) in roads.items():
+        table = methods.MethodTable()
+        table.store = _FailingStore(failing, ValueError(marker))
+        options = {}
+        if methods.METHODS[method].idempotency == "command_id":
+            options["tenant"] = tenant_of if tenant_of is not None else methods.INSTALL_TENANT
+        table.register(method, handler, **options)
+        table.freeze()
+        records = []
+        catcher = logging.Handler(logging.DEBUG)
+        catcher.emit = records.append
+        with captured_method_logs() as logs:
+            methods.log.addHandler(catcher)
+            try:
+                answer = table.dispatch(method, {"command_id": "command-one"}, None, None)
+            finally:
+                methods.log.removeHandler(catcher)
+        observations[road] = {
+            "method": method, "stage": stage, "kind": kind, "answer": answer,
+            "lines": [(record.levelname, record.getMessage()) for record in records],
+            "canary_in_log": marker in logs.getvalue(),
+        }
+    return observations
+
+
 def refusal_observation():
     observations = []
     for method in ("session.status", "session.turn"):
@@ -519,6 +619,19 @@ class SweepS2bRegressionTest(unittest.TestCase):
         with self.subTest(site="command_parser"):
             observed = parser_diagnostic_observation()
             self.assertFalse(observed["canary_in_refusal"], observed)
+
+    def test_f03_every_failure_road_writes_one_line_that_names_it(self):
+        # Without a traceback in the log, this line is the one record of the fault: it must be there, and it must
+        # say which method, where (handler, tenant, store or callback) and of what type, with no value of it.
+        for road, observed in failure_road_observation().items():
+            with self.subTest(road=road):
+                self.assertEqual(len(observed["lines"]), 1, observed)
+                level, line = observed["lines"][0]
+                self.assertEqual(level, "ERROR", observed)
+                self.assertIn(observed["method"], line, observed)
+                self.assertIn(observed["stage"], line, observed)
+                self.assertIn(observed["kind"], line, observed)
+                self.assertFalse(observed["canary_in_log"], observed)
 
     def test_f05_not_accepted_still_requires_a_typed_answer(self):
         for observed in refusal_observation():

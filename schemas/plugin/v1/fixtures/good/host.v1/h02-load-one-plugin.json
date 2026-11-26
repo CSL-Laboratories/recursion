@@ -1,0 +1,8 @@
+{
+  "type": "load",
+  "plugin_id": "demo.plugin",
+  "manifest_b64": "eyJwbHVnaW5faWQiOiJkZW1vLnBsdWdpbiJ9",
+  "files": {
+    "plugin.py": "ZGVmIHJlZ2lzdHJ5KCk6CiAgICByZXR1cm4ge30K"
+  }
+}

@@ -160,6 +160,22 @@ window, the scope and `retry_after_s`, the seconds until the next ordinary frame
 (`message`) that says what the person can do. A relay whose folder is refused at the start (a wrong mode,
 another owner) starts for no request, a Stop included, until the folder is put right.
 
+No session waits without end on a file: an ordinary frame waits for the lock of its key's window and of
+the record at most `--lock-wait-s S` seconds in all (first value 2; `0` asks once; a value with no end is
+refused at the start). A lock another session or program still holds then refuses the frame
+(`rate_limited`, detail `window_busy`, not delivered, with a sentence that says so) or leaves its refusal
+out of the record (its stderr line still goes), and the session reads its next frame. Frames of one
+session are served in order, so a request of the ending kind sent behind ordinary frames in the same
+session waits for each of them at most `--lock-wait-s` on files, plus the daemon's reply when that frame
+is sent; one sent in a session of its own, as the client sends `run.stop`, waits on no file.
+
+Requests of the ending kind have no bound of their own here. The daemon's socket keeps its reserved slots
+for `run.stop` only; so one key that sends Stops without pause can hold every slot, the reserved ones
+included, while it sends, and a Stop given on the daemon's machine or from another device is answered
+busy, not delivered, meanwhile: fifty `run.stop` of one key at once, against a socket set as the daemon
+sets it and a handler that takes 0.6 seconds, had 20 answered by the daemon and 30 answered busy, and a
+local Stop made then was busy too.
+
 Not yet: the relay still connects to the socket as the owner's uid. Until the daemon checks a paired
 device's rights at its own socket, the relay's table is the only lock between a device's key and the
 daemon.

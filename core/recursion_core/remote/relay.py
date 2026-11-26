@@ -47,6 +47,14 @@ What it checks:
   file and leaves nothing behind, so a key whose own watching used up its frames can still stop what it
   watches, and a window that cannot be read, a folder changed while the relay runs or a full disk never
   holds it back. Two such requests at once each ask the daemon.
+* NO WAIT WITHOUT END ON A FILE: an ordinary frame waits for the lock of its key's window and of the record
+  at most ``lock_wait_s`` seconds in all (a setting with a first value, the block below; ``0`` asks once).
+  A lock another session or program still holds then refuses the frame (``rate_limited``, detail
+  ``window_busy``, not delivered) with words, or leaves its refusal out of the record (its line still goes
+  to ``record``), and the session reads its next frame. Frames of one session are served in order, so a
+  request of the ending kind sent in the same session behind ordinary frames waits for them: for each, at
+  most ``lock_wait_s`` on files and, when that frame is sent, the daemon's reply to it (``timeout_s``). One
+  sent in a session of its own waits on no file at all.
 * THE RECORD: every refusal the rights and the caps make is written to the record on the daemon's
   machine (``relay/refusals.jsonl`` under the daemon's state folder), at most ``record_max`` lines kept,
   newest last, and is also told to ``record`` (``main`` writes it on stderr, which sshd hands to the
@@ -59,8 +67,12 @@ rights checked there again), the relay's own table is the only lock between a re
 One connection per frame, as the CLI makes one connection per call (``control.client.SocketAPI``): the
 relay holds no slot of the socket between requests, and a ``run.stop`` arriving while the socket's
 ordinary slots are taken is served on its reserved Stop slot exactly as a local Stop is. Frames are
-handled in order, one at a time, per SSH session; the client opens another session for a Stop
-(``ssh_transport.RelayAPI``), so a Stop never waits behind a slow call in the same session.
+handled in order, one at a time, per SSH session; the client opens another session for ``run.stop``
+(``ssh_transport.RelayAPI``), so that Stop never waits behind a call in the same session. The daemon keeps
+its reserved slots for ``run.stop`` alone (``daemon.control_adapter.is_stop_request``): the other requests
+of the ending kind take an ordinary slot, and requests of the ending kind are not counted here, so one key
+sending them without pause can hold every slot of the socket, the reserved ones included, while it sends;
+a Stop from the daemon's machine or another device is answered busy, not delivered, meanwhile.
 
 Command ids pass through untouched: the frame and everything in its ``params`` (a keyed method's
 ``command_id`` included) reach the socket exactly as the client sent them. A reply from the daemon is
@@ -124,6 +136,12 @@ RELAY_MAX_FRAME_BYTES = MAX_FRAME_BYTES
 CAP_SCOPES = ("key", "session")
 RELAY_CAP_SCOPE = "key"
 RELAY_RECORD_MAX = 1000
+# How long an ordinary frame waits in all for the lock of its key's window and of the record, kept by
+# another session of the key or another program, before it is refused (--lock-wait-s S; 0 asks once). A
+# session never waits without end on a file, so a Stop behind that frame in the same session is reached
+# within this bound; a value with no end (inf, none) is refused at the start. Sessions of one key hold a
+# lock for the time of one read and write of a small file.
+RELAY_LOCK_WAIT_S = 2.0
 UNNAMED_KEY = "unnamed"
 # A frame the relay may read (a --max-frame-bytes above the socket's frame) that the socket client refuses
 # before a byte is sent: refused here, not delivered.
@@ -228,7 +246,8 @@ class Relay:
     the caps and the rights make is written to the record on the daemon's machine, at most
     ``record_max`` lines (``None``: no limit; ``0``: none), and told to ``record(event)`` (a dict; it may
     not raise into the relay). ``state_dir`` is the daemon's state folder (default:
-    ``control.client.state_directory(environ)``).
+    ``control.client.state_directory(environ)``). ``lock_wait_s`` bounds, in all, an ordinary frame's wait
+    for the locks of the window and the record (a finite number of seconds, ``0`` or more).
     """
 
     def __init__(
@@ -250,6 +269,7 @@ class Relay:
         cap_scope: str = RELAY_CAP_SCOPE,
         record_max: int | None = RELAY_RECORD_MAX,
         state_dir: str | None = None,
+        lock_wait_s: float = RELAY_LOCK_WAIT_S,
     ) -> None:
         environ = dict(os.environ if environ is None else environ)
         path = default_socket_path(environ) if socket_path is None else socket_path
@@ -269,6 +289,12 @@ class Relay:
             raise ValueError(f"max_frame_bytes (--max-frame-bytes) {max_frame_bytes} is below "
                              f"{RELAY_LEAST_FRAME_BYTES}, the bytes the relay's shortest answer takes: set "
                              f"{RELAY_LEAST_FRAME_BYTES} or more, or none for no limit of the relay's own")
+        if isinstance(lock_wait_s, bool) or not isinstance(lock_wait_s, (int, float)) \
+                or not math.isfinite(lock_wait_s) or not lock_wait_s >= 0:
+            raise ValueError(f"lock_wait_s (--lock-wait-s) {lock_wait_s!r} is not a finite number of seconds of 0 "
+                             f"or more: a relay session never waits without end on a file; set how long an "
+                             f"ordinary request may wait for the relay's files (0 asks once)")
+        self.lock_wait_s = float(lock_wait_s)
         self.max_frames = _cap(max_frames, "max_frames", 0)
         if isinstance(window_s, bool) or not isinstance(window_s, (int, float)) or not math.isfinite(window_s) \
                 or not window_s > 0:
@@ -317,16 +343,20 @@ class Relay:
                 "caps": {"max_frames": self.max_frames, "window_s": self.window_s,
                          "max_frame_bytes": self.max_frame_bytes}}
 
-    def _note(self, event: dict, *, wait: bool = True) -> str | None:
+    def _left(self, deadline: float) -> float:
+        """The seconds of an ordinary frame's wait on files still left before ``deadline`` (0 when none)."""
+        return max(0.0, deadline - time.monotonic())
+
+    def _note(self, event: dict, *, wait_s: float) -> str | None:
         """Write ``event`` to the record and tell it to ``record``. Returns the name of what kept it out of the
-        record on the daemon's machine, else ``None``. ``wait`` false: a record another program holds is
-        not waited for (a refusal of the ending kind waits on no file)."""
+        record on the daemon's machine, else ``None``. The record's lock is waited for at most ``wait_s``
+        seconds; ``0`` asks once (a refusal of the ending kind waits on no file)."""
         missed = None
         if self._refusal_record is not None:
             try:
                 self._refusal_record.add({**event, "at": time.time(), "key": self.key, "device": self.device_id,
                                           "key_label": self.key_label, "client_address": self.client_address},
-                                         wait=wait)
+                                         wait_s=wait_s)
             except Exception as exc:  # noqa: BLE001 - a record that fails never changes an answer
                 missed = type(exc).__name__
         if self._record is not None:
@@ -336,11 +366,12 @@ class Relay:
                 pass
         return missed
 
-    def _refused(self, request: Message, event: dict, code: str, **error: Any) -> Message:
+    def _refused(self, request: Message, event: dict, code: str, deadline: float, **error: Any) -> Message:
         """A refusal of the relay's own, noted. For a request of the ending kind the record is not waited for,
-        and when it could not be written the answer says so in one sentence (``record_notice``)."""
+        and when it could not be written the answer says so in one sentence (``record_notice``); any other
+        waits for it until ``deadline`` at most."""
         ending = ends_something(request)
-        missed = self._note(event, wait=not ending)
+        missed = self._note(event, wait_s=0.0 if ending else self._left(deadline))
         reply = relay_error(code, delivered=False, request=request, **error)
         if ending and missed is not None:
             reply["error"]["record_notice"] = (
@@ -348,18 +379,20 @@ class Relay:
                 f"could not be written ({missed}). The refusal itself stands as answered here.")
         return reply
 
-    def _take_slot(self) -> tuple[int, float | None] | None:
+    def _take_slot(self, deadline: float) -> tuple[int, float | None] | None:
         """Let one frame through the window and return ``None``, or return how many were already in it and
         the seconds until the oldest of them leaves (``None`` when none is in it: a cap of 0 never frees).
 
         Never asked for a request of the ending kind. ``OSError`` when the key's window on the daemon's
-        machine cannot be read or written."""
+        machine cannot be read or written; ``BlockingIOError`` (``relay_store.RelayFileBusy``) when its lock
+        is still held at ``deadline``."""
         if self.max_frames is None:
             return None
         with self._window_lock:
             # The key's window reads the clock itself, under the lock its sessions share (KeyWindow.take).
             if self._key_window is not None:
-                return self._key_window.take(self._clock, self.max_frames, self.window_s)
+                return self._key_window.take(self._clock, self.max_frames, self.window_s,
+                                             wait_s=self._left(deadline))
             now = self._clock()
             while self._forwarded and self._forwarded[0] <= now - self.window_s:
                 self._forwarded.popleft()
@@ -368,13 +401,23 @@ class Relay:
             self._forwarded.append(now)
             return None
 
-    def _limited(self, request: Message, retry_after_s: float | None, *, unreadable: str | None = None) -> Message:
+    def _limited(self, request: Message, retry_after_s: float | None, *, unreadable: str | None = None,
+                 busy: bool = False) -> Message:
         """The ``rate_limited`` answer: what was limited, when it frees, and what the person can do."""
         whose = "this key" if self.cap_scope == "key" else "this session"
         cap = (f"{self.max_frames} request{'' if self.max_frames == 1 else 's'} in any "
                f"{_seconds_text(self.window_s)} second{'' if self.window_s == 1 else 's'}")
         never = "A Stop, an interrupt, a cancel or a denied approval is never held by this limit."
-        if unreadable is not None:
+        if busy:
+            wait = _seconds_text(self.lock_wait_s)
+            detail = f"window_busy:lock_wait_s:{self.lock_wait_s:g}"
+            words = (f"Another session or program held {whose}'s count of requests on the daemon's machine for "
+                     f"the whole {wait} second{'' if wait == '1' else 's'} this request may wait for it "
+                     f"(--lock-wait-s {wait}), so the relay did not send it and went on with the next request: "
+                     f"it never waits longer on a file. Try again; if this goes on, look for a program that "
+                     f"holds the relay's files under the daemon's state folder there. A Stop, an interrupt, a "
+                     f"cancel or a denied approval still goes: it is never counted.")
+        elif unreadable is not None:
             detail = f"window_unreadable:{unreadable}"
             words = (f"The relay could not read {whose}'s count of requests on the daemon's machine ({unreadable}), "
                      f"so it cannot show that this request is within its limit of {cap}, and did not send it. Try "
@@ -434,6 +477,8 @@ class Relay:
             if isinstance(request, RefusedFrame):
                 # A body the socket refuses on read: never forwarded, whatever a later duplicate key made of it.
                 return relay_error("bad_frame", delivered=False, detail=request.detail, request=request), False
+            # The most this frame may wait in all for the relay's files: past it, the next frame is read.
+            deadline = time.monotonic() + self.lock_wait_s
             missing = needs(self.rights, request)
             if missing is not None:
                 # The relay's own lock: refused here, before the frame can reach the daemon.
@@ -441,13 +486,14 @@ class Relay:
                 detail = "method_not_in_table" if right == NEEDS_ALL else f"needs_{right}"
                 return self._refused(request, {"refused": "scope_refused", "method": ascii_text(name, 64),
                                                "needs": right},
-                                     "scope_refused", detail=detail, fields={"method": name, "needs": right}), False
-            return self._forward(request)
+                                     "scope_refused", deadline, detail=detail,
+                                     fields={"method": name, "needs": right}), False
+            return self._forward(request, deadline)
         except Exception as exc:  # noqa: BLE001 - a relay that fails must still answer, and truthfully
             return relay_error("relay_internal_error", delivered="unknown", detail=type(exc).__name__,
                                request=request), "unknown"
 
-    def _forward(self, request: Message) -> tuple[Message, bool | str]:
+    def _forward(self, request: Message, deadline: float) -> tuple[Message, bool | str]:
         refusal = frame_refusal(request, max_bytes=self._max_frame_bytes)
         if refusal is None and self._max_frame_bytes > MAX_FRAME_BYTES and frame_refusal(request) is not None:
             # Over the socket's own frame (a protocol figure): the socket client would refuse it before
@@ -457,21 +503,28 @@ class Relay:
             if refusal == "frame_too_large":
                 return self._refused(request, {"refused": "bad_frame", "cap": "max_frame_bytes",
                                                "value": self.max_frame_bytes},
-                                     "bad_frame", detail=refusal), False
+                                     "bad_frame", deadline, detail=refusal), False
             return relay_error("bad_frame", delivered=False, detail=refusal, request=request), False
         if ends_something(request):
             # Never counted: no slot, no window file, no lock, nothing on disk. Sent now; the daemon answers.
             return self._deliver(request)
         try:
-            taken = self._take_slot()
+            taken = self._take_slot(deadline)
+        except BlockingIOError:
+            # Held by another session or program for the whole wait (``RelayFileBusy``, or ``BlockingIOError``
+            # from the one try of a bound of 0): refused, and the next frame is read.
+            self._note({"refused": "rate_limited", "cap": "max_frames", "window": "busy",
+                        "lock_wait_s": self.lock_wait_s}, wait_s=self._left(deadline))
+            return self._limited(request, None, busy=True), False
         except OSError as exc:
             # The key's window cannot be read: the cap cannot be shown to hold, so the frame is not sent.
-            self._note({"refused": "rate_limited", "cap": "max_frames", "window": f"unreadable:{type(exc).__name__}"})
+            self._note({"refused": "rate_limited", "cap": "max_frames", "window": f"unreadable:{type(exc).__name__}"},
+                       wait_s=self._left(deadline))
             return self._limited(request, None, unreadable=type(exc).__name__), False
         if taken is not None:
             seen, retry_after_s = taken
             self._note({"refused": "rate_limited", "cap": "max_frames", "value": self.max_frames,
-                        "window_s": self.window_s, "seen": seen})
+                        "window_s": self.window_s, "seen": seen}, wait_s=self._left(deadline))
             return self._limited(request, retry_after_s), False
         return self._deliver(request)
 
@@ -509,7 +562,8 @@ class Relay:
             except FrameError as exc:
                 # A frame that cannot be read leaves no trustworthy boundary for the next: answer once, end.
                 if str(exc) == "frame_too_large":
-                    self._note({"refused": "bad_frame", "cap": "max_frame_bytes", "value": self.max_frame_bytes})
+                    self._note({"refused": "bad_frame", "cap": "max_frame_bytes", "value": self.max_frame_bytes},
+                               wait_s=self.lock_wait_s)
                 self._write_quietly(stdout, relay_error("bad_frame", delivered=False, detail=str(exc)))
                 return EXIT_STREAM
             except OSError:
@@ -574,6 +628,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-frame-bytes", dest="max_frame_bytes", default=None)
     parser.add_argument("--cap-scope", dest="cap_scope", choices=list(CAP_SCOPES), default=RELAY_CAP_SCOPE)
     parser.add_argument("--record-max", dest="record_max", default=None)
+    parser.add_argument("--lock-wait-s", dest="lock_wait_s", default=None)
     return parser
 
 
@@ -597,6 +652,16 @@ def _window_option(text: str | None) -> float:
         raise _Usage("--window-s is a number of seconds") from None
 
 
+def _lock_wait_option(text: str | None) -> float:
+    if text is None:
+        return RELAY_LOCK_WAIT_S
+    try:
+        return float(text)  # whether it is a finite number of 0 or more is the Relay's own check
+    except ValueError:
+        raise _Usage("--lock-wait-s is a number of seconds, 0 or more: a relay session never waits without "
+                     "end on a file") from None
+
+
 def _rights_option(text: str | None) -> list[str] | None:
     return None if text is None else text.split(",")
 
@@ -611,8 +676,8 @@ def main(
     connect: Connect = UnixControlClient,
 ) -> int:
     """``relay [--socket PATH] [--key-label NAME] [--device ID] [--rights LIST] [--max-frames N|none]
-    [--window-s S] [--max-frame-bytes N|none] [--cap-scope key|session] [--record-max N|none]``: serve
-    stdin and stdout until stdin ends.
+    [--window-s S] [--max-frame-bytes N|none] [--cap-scope key|session] [--record-max N|none]
+    [--lock-wait-s S]``: serve stdin and stdout until stdin ends.
 
     Nothing but frames is ever written to stdout. Every frame the caps or the rights refused is written
     to the record on the daemon's machine, and one line each goes to stderr, which sshd hands to the
@@ -626,6 +691,7 @@ def main(
         max_frame_bytes = _count_option(args.max_frame_bytes, "--max-frame-bytes", RELAY_MAX_FRAME_BYTES)
         window_s = _window_option(args.window_s)
         record_max = _count_option(args.record_max, "--record-max", RELAY_RECORD_MAX)
+        lock_wait_s = _lock_wait_option(args.lock_wait_s)
     except _Usage as exc:
         print(f"recursion relay: usage error: {exc}", file=err)
         return EXIT_REFUSED
@@ -637,7 +703,7 @@ def main(
         relay = Relay(args.socket, environ=environ, key_label=args.key_label, connect=connect,
                       device_id=args.device, rights=_rights_option(args.rights), max_frames=max_frames,
                       window_s=window_s, max_frame_bytes=max_frame_bytes, cap_scope=args.cap_scope,
-                      record_max=record_max,
+                      record_max=record_max, lock_wait_s=lock_wait_s,
                       record=lambda event: print(f"recursion relay: record: {json.dumps(event, sort_keys=True)}",
                                                  file=err, flush=True))
     except (RemoteBindRefused, InsecureSocketPath, PlatformNotSupported, ValueError, OSError) as exc:

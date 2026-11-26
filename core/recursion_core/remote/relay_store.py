@@ -17,6 +17,12 @@ across sessions is kept here, each file under an exclusive ``flock`` while it is
 A request of the ending kind (``rights.ends_something``) reads and writes no window, and is sent whatever
 these files are; only its refusal for another reason (no right to it, too large) is written to the record,
 without waiting for a record another program holds.
+
+The relay never waits without end for one of these locks: it gives each wait a bound (``wait_s``, the
+relay's ``lock_wait_s``), and a lock still held at the bound is ``RelayFileBusy``. The lock is asked for
+again and again without blocking, the pause between two tries starting at the resolution of the
+monotonic clock and doubling, never past the bound; ``wait_s`` ``None`` (only for a caller of its own,
+never the relay) waits for as long as the lock is held.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ import json
 import math
 import os
 import stat
+import time
 from collections.abc import Callable
 
 RELAY_STATE_DIR = "relay"  # <state folder>/relay
@@ -45,6 +52,37 @@ class RelayFileRefused(OSError):
     (a link, a FIFO, a folder or another uid's file at a file's name, or the folder swapped for something
     else). An ``OSError``, so that every caller that refuses a frame on an unreadable window or skips a
     record that cannot be written does the same here."""
+
+
+class RelayFileBusy(BlockingIOError):
+    """A file of the relay's own that another session or program held under its lock for the whole of the
+    relay's wait for it (``wait_s``). A ``BlockingIOError``, so an ``OSError`` too."""
+
+
+def _flock_within(fd: int, path: str, wait_s: float | None) -> None:
+    """Take the exclusive lock of ``fd`` within ``wait_s`` seconds.
+
+    ``None`` waits for as long as the lock is held; ``0`` asks once (``BlockingIOError`` when it is held);
+    more than 0 asks again until the bound, then raises ``RelayFileBusy``. Tries are spaced from the
+    monotonic clock's own resolution, doubling, never past the bound: no pause of ours."""
+    if wait_s is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    deadline = time.monotonic() + wait_s
+    pause = time.get_clock_info("monotonic").resolution
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                if wait_s == 0:
+                    raise
+                raise RelayFileBusy(errno.EWOULDBLOCK, f"{path} was held by another session or program for "
+                                                       f"the whole of {wait_s:g} seconds") from None
+            time.sleep(min(pause, left))
+            pause *= 2
 
 
 def relay_folder(state_dir: str, *, uid: int | None = None) -> str:
@@ -77,11 +115,12 @@ class _Locked:
 
     The folder is looked at again first (a real directory of ``uid``, mode 0700), and the file opened must
     be a regular file of ``uid``: anything else is ``RelayFileRefused`` before it is read or locked, so a
-    folder swapped while the relay runs, or a FIFO put at a file's name, never holds a frame. ``wait``
-    false asks for the lock without waiting: a file another program holds is ``BlockingIOError`` then."""
+    folder swapped while the relay runs, or a FIFO put at a file's name, never holds a frame. The lock is
+    waited for at most ``wait_s`` seconds (``_flock_within``): ``0`` asks once, and a file another program
+    holds is ``BlockingIOError`` then; past a bound above 0 it is ``RelayFileBusy``."""
 
-    def __init__(self, path: str, *, uid: int | None = None, wait: bool = True) -> None:
-        self.path, self.uid, self.wait = path, uid, wait
+    def __init__(self, path: str, *, uid: int | None = None, wait_s: float | None = None) -> None:
+        self.path, self.uid, self.wait_s = path, uid, wait_s
 
     def __enter__(self) -> int:
         _check_folder(os.path.dirname(self.path), RelayFileRefused, self.uid)
@@ -91,7 +130,7 @@ class _Locked:
             owner = os.geteuid() if self.uid is None else self.uid
             if not stat.S_ISREG(info.st_mode) or info.st_uid != owner:
                 raise RelayFileRefused(f"{self.path} is not a regular file of uid {owner}")
-            fcntl.flock(self.fd, fcntl.LOCK_EX if self.wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _flock_within(self.fd, self.path, self.wait_s)
         except BaseException:
             os.close(self.fd)
             raise
@@ -122,16 +161,18 @@ class KeyWindow:
         self.path = os.path.join(folder, WINDOW_FILE.format(key=key))
         self.uid = uid
 
-    def take(self, clock: Callable[[], float], max_frames: int, window_s: float) -> tuple[int, float | None] | None:
+    def take(self, clock: Callable[[], float], max_frames: int, window_s: float, *,
+             wait_s: float | None = None) -> tuple[int, float | None] | None:
         """Let one frame through and return ``None``, or return how many were already in the window and the
         seconds until the oldest of them leaves it (``None`` when none is in it: a cap of 0 never frees).
+        The file's lock is waited for at most ``wait_s`` seconds (``RelayFileBusy`` past it).
 
         ``clock`` is read once the lock is held, and the seconds come from the same reading. A session that
         read it before waiting for the lock would find the time a session that went first wrote meanwhile
         later than its own now, drop it as a clock that started again, and let its frame through: the cap
         would not hold for sessions at the same time. ``OSError`` when the file cannot be read or written;
         the caller refuses the frame then."""
-        with _Locked(self.path, uid=self.uid) as fd:
+        with _Locked(self.path, uid=self.uid, wait_s=wait_s) as fd:
             now = clock()
             try:
                 stamps = json.loads(_read_all(fd) or b"[]")
@@ -157,12 +198,13 @@ class RefusalRecord:
         self.max_entries = max_entries
         self.uid = uid
 
-    def add(self, event: dict, *, wait: bool = True) -> None:
-        """Add one line. ``wait`` false: a record another program holds is ``BlockingIOError``, not waited for."""
+    def add(self, event: dict, *, wait: bool = True, wait_s: float | None = None) -> None:
+        """Add one line. The record's lock is waited for at most ``wait_s`` seconds (``RelayFileBusy`` past
+        it); ``wait`` false: a record another program holds is ``BlockingIOError``, not waited for."""
         if self.max_entries == 0:
             return
         line = (json.dumps(event, sort_keys=True, ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
-        with _Locked(self.path, uid=self.uid, wait=wait) as fd:
+        with _Locked(self.path, uid=self.uid, wait_s=wait_s if wait else 0) as fd:
             if self.max_entries is None:
                 os.lseek(fd, 0, os.SEEK_END)
                 _write_at_end(fd, line)

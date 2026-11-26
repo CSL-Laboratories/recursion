@@ -22,6 +22,7 @@ import math
 import os
 import shutil
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -65,6 +66,24 @@ def within(test: unittest.TestCase, call, what: str):
 
 def open_descriptors() -> int:
     return len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else -1
+
+
+# The name the control socket's server gives the thread that serves one connection
+# (control_transport.unix.UnixControlServer); the stand-in daemon is that server.
+CONNECTION_THREAD = "control-transport-conn"
+
+
+def settled(test: unittest.TestCase) -> tuple[int, int]:
+    """The test process's threads and descriptors once the stand-in daemon has closed every connection it
+    served. Its worker closes its side of a connection a moment after the reply the relay reads, so a count
+    taken at once can find that side still open; this waits for those workers to end (within the
+    watchdog), so that what is counted beyond them is the relay's own."""
+    deadline = time.monotonic() + support.WATCHDOG_S
+    while any(thread.name == CONNECTION_THREAD for thread in threading.enumerate()):
+        if time.monotonic() > deadline:
+            test.fail("the stand-in daemon did not close its connections")
+        time.sleep(0.01)  # a pause of the test's own while the stand-in's workers end
+    return threading.active_count(), open_descriptors()
 
 
 @unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
@@ -208,10 +227,10 @@ class TheDaemonAnswersEveryStopTests(unittest.TestCase):
         relay.handle(control("run.status", 0))
         files = sorted(os.listdir(relay.state_folder))
         relay.handle(stop(n=1))
-        threads, descriptors = threading.active_count(), open_descriptors()
+        before = settled(self)
         for n in range(MANY_STOPS):
             self.assertEqual(relay.handle(stop(n=n))["result"]["method"], "run.stop")
-        self.assertEqual((threading.active_count(), open_descriptors()), (threads, descriptors))
+        self.assertEqual(settled(self), before)
         self.assertEqual(sorted(os.listdir(relay.state_folder)), files)
         self.assertEqual(len(daemon.seen), MANY_STOPS + 2)
 

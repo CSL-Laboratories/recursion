@@ -61,10 +61,16 @@ or other users (`package_file_untrusted`), and its SHA-256 must be the one the m
 listed path (`package_file_unlisted`): only the listed files and, at the top, `manifest.json` and
 `manifest.sig`. A `__pycache__` folder is not exempt, because Python would import its compiled
 files in place of the checked source; once it loads from a package folder, the loader turns off
-the interpreter's writing of compiled files. Each refusal names the path. What the check does not
-hold: Python reads a listed file again when the plugin imports it, after the check, and only a
-writer with the daemon user's own rights can change it in between. An unsigned package is not held
-to its listing: only `plugin.py` is compared with the manifest's digest.
+the interpreter's writing of compiled files. Each refusal names the path.
+
+So the signature covers the whole package at the moment of the check, and that is where it stops.
+Two cases run code the signature does not cover. First, the loader runs only `plugin.py` from the
+bytes it checked; Python reads every other file again when the plugin imports it, after the check,
+and a file changed in between (only a writer with the daemon user's own rights can) runs as it is
+then. Second, when the daemon's process already holds a module of the same name (imported earlier
+by another plugin or by the daemon itself), Python hands the plugin that module and never reads the
+listed file. An unsigned package is not held to its listing: only `plugin.py` is compared with the
+manifest's digest.
 
 ## What is not decided
 

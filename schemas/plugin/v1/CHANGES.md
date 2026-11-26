@@ -21,7 +21,9 @@ path, except `manifest.json` and `manifest.sig` at the top, is refused `package_
 Each refusal names the path. A missing file is still named first. What it breaks: a signed version
 1 package with a changed or an extra file (a `__pycache__` folder included), or with a file a group
 or other users can write, loaded before as signed and is refused now. No schema changed, and an
-unsigned package is held to nothing new.
+unsigned package is held to nothing new. What the check does not cover: Python reads a listed file
+again when the plugin imports it, after the check, and a module of the same name that the daemon's
+process already holds is handed to the plugin in place of the listed file (`README.md`).
 
 ## `manifest.v1.json` is `1.0-draft.2` (2026-11-18)
 

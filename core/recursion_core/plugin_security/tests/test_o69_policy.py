@@ -1,6 +1,6 @@
 """O69 (CSL-787): the 2026-11-11 same-uid fallback policy, quoted exactly in code and docs.
 
-Lucas, 2026-11-08 (t1418u). The quoted sentence is not accepted text in PRODUCT.md
+The owner, 2026-11-08 (t1418u). The quoted sentence is not accepted text in PRODUCT.md
 055cc7a5c793b7135e5d0565dc4198cf96230531 (CSLR-D-011). It changes no runtime check;
 these tests pin the recorded wording and check that nothing in the shipped code or docs
 reads as a live-order grant. The code has one ``order`` permission and no paper/live

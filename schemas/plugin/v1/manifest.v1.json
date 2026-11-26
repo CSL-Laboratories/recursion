@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "manifest.v1.json",
   "title": "manifest.v1: the plugin manifest, 'csl-plugin-manifest/1'",
-  "x-version": "1.0-draft.1",
+  "x-version": "1.0-draft.2",
   "description": "The manifest a plugin's developer signs. It is the ten fields of 'csl-plugin-manifest/vNext' (core/recursion_core/plugin_security/manifest.py) with the same meanings, plus three: runtime (how the plugin's code is run), interface (which plugin API it is written against) and files (every file of the package with its SHA-256, so the signature covers the whole package and not only the entry file). The manifest is read as bytes in the restricted canonical form (ASCII, sorted keys, whole numbers, no spaces) and the developer's Ed25519 signature is over those bytes. PROVISIONAL (recommended, not decided): that this contract is frozen as version 1 now, and the five permission names after 'order'. Four rules the parser enforces cannot be written in a schema and are listed in README.md: permissions must be in the order this schema lists them; network_destinations and credential_refs must be sorted; files must contain the entry file, with the digest artifact_sha256 names; and the bytes must be in canonical form. Permissions are only ever appended to the list: an existing name never changes its place or its meaning, so the signed bytes for an existing set of permissions never change.",
   "type": "object",
   "additionalProperties": false,
@@ -45,8 +45,8 @@
       "items": {"type": "string", "pattern": "^[a-z][a-z0-9_.:/-]{1,127}$", "not": {"pattern": "[\\r\\n]"}}
     },
     "runtime": {
-      "description": "How the plugin's code is run. 'python-inprocess/1': ordinary Python in the daemon's own process and user. That is not a containment boundary.",
-      "enum": ["python-inprocess/1"]
+      "description": "How the plugin's code is run. In this build a plugin of either runtime runs in the daemon's own process and nothing is contained yet; the name python-sandboxed/1 is accepted so that manifests can be written for the host that follows. 'python-sandboxed/1' is the name for Python run by that host, in a process of its own outside the daemon; a plugin author writes the same plugin.py for either name. 'python-inprocess/1' retires: in every 1.0.x release a manifest that names it is accepted and run the same way as one that names 'python-sandboxed/1', and the developer sees the finding 'runtime_inprocess_retiring'; from 1.1.0 on it is refused 'runtime_retired'. Any other value is refused at install and at load, and nothing is run; a name held for a later release (#/$defs/reserved) is refused with its own text. Runtimes are only ever appended to this list: a later runtime arrives as a new name, under unchanged plugins.",
+      "enum": ["python-sandboxed/1", "python-inprocess/1"]
     },
     "interface": {
       "description": "The plugin API the package is written against.",
@@ -74,6 +74,36 @@
     }
   ],
   "$defs": {
+    "reserved": {
+      "description": "Names held for a later release. A manifest that uses one is refused, typed, with that name's own text, and nothing is run. The parser refuses them; this schema refuses them by the list of allowed values of the field they would go in ('enum' at '/runtime', or at '/permissions/N' for a permission). Every list here is only ever appended to, and reserved is not frozen: a reserved name may be corrected until the first build that answers it.",
+      "$defs": {
+        "runtime": {
+          "description": "Runtime names held for a later release. The parser refuses each with the code 'runtime_reserved'.",
+          "$defs": {
+            "wasm-component/1": {"description": "A WebAssembly component whose interface is generated from the same message schema as the plugin protocol. Refused with: 'wasm-component/1 is reserved for a later release; this release runs python-sandboxed/1 only.'"},
+            "data/1": {"description": "A package that holds only data, such as a theme, and starts no interpreter. Refused with: 'data/1 is reserved; not run in this release.'"}
+          }
+        },
+        "permission": {
+          "description": "Permission names held for a later release. The parser refuses each with the code 'permission_reserved' and the words 'reserved; not available in this release'. None is in the list of permissions, and nothing grants one.",
+          "$defs": {
+            "schedule": {"description": "To start runs on a schedule or on an event."},
+            "memory": {"description": "To keep and read what a persistent agent remembers between runs."},
+            "computer": {"description": "To use a computer or a browser on the user's behalf."}
+          }
+        },
+        "record_kind": {
+          "description": "Record kinds held for a later release. This manifest has no field that declares record kinds, so none is refused here yet; the names are held so that no plugin claims one first.",
+          "$defs": {
+            "trigger.v1": {"description": "What starts a scheduled or event-driven run."},
+            "agent.v1": {"description": "A persistent agent: its name, its instructions and what it may do."},
+            "memory.lesson.v1": {"description": "One lesson a persistent agent keeps between runs."},
+            "work.packet.v1": {"description": "A unit of work handed from one node to another."},
+            "node.v1": {"description": "A machine that takes part in running work."}
+          }
+        }
+      }
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$",

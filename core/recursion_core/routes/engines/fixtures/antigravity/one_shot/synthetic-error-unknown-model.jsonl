@@ -1,0 +1,2 @@
+{"synthetic":true,"written_by":"Claude Opus 5.5 (claude-opus-5-5), Claude Code builder lane ENGINE-E5","source":"event shapes from https://antigravity.google/docs/cli/headless, read 2026-11-14; not captured"}
+{"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","duration_seconds":1.5,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"error":"invalid model selection: model x is not recognized"}}

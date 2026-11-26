@@ -1,0 +1,102 @@
+{
+  "written_by": "Claude Opus 5.5 (claude-opus-5-5), Claude Code builder lane ENGINE-E5",
+  "note": "EXCERPT: values copied by a script (scratchpad make_pin.py) from the pinned ACP schema file; the whole file is not kept here. Pin: agentclientprotocol/agent-client-protocol tag v1.18.0, commit 13b765828f961812f0c78ae577220e994209fa2f, schema/v1/schema.json.",
+  "schema_sha256": "e747a7bec3c02708b70885bf3cccac5c72fa421390dd7e85758fd61e33b1ae21",
+  "StopReason": [
+    "end_turn",
+    "max_tokens",
+    "max_turn_requests",
+    "refusal",
+    "cancelled"
+  ],
+  "PermissionOptionKind": [
+    "allow_once",
+    "allow_always",
+    "reject_once",
+    "reject_always"
+  ],
+  "ToolCallStatus": [
+    "pending",
+    "in_progress",
+    "completed",
+    "failed"
+  ],
+  "RequestPermissionOutcome": [
+    "cancelled",
+    "selected"
+  ],
+  "ErrorCode": {
+    "Parse error": -32700,
+    "Invalid request": -32600,
+    "Method not found": -32601,
+    "Invalid params": -32602,
+    "Internal error": -32603,
+    "Request cancelled": -32800,
+    "Authentication required": -32000,
+    "Resource not found": -32002
+  },
+  "SessionUpdate": [
+    "user_message_chunk",
+    "agent_message_chunk",
+    "agent_thought_chunk",
+    "tool_call",
+    "tool_call_update",
+    "plan",
+    "available_commands_update",
+    "current_mode_update",
+    "config_option_update",
+    "session_info_update",
+    "usage_update",
+    "notice",
+    "compaction_update",
+    "compaction_summary_chunk"
+  ],
+  "InitializeRequest.required": [
+    "protocolVersion"
+  ],
+  "AuthenticateRequest.required": [
+    "methodId"
+  ],
+  "NewSessionRequest.required": [
+    "cwd",
+    "mcpServers"
+  ],
+  "LoadSessionRequest.required": [
+    "mcpServers",
+    "cwd",
+    "sessionId"
+  ],
+  "PromptRequest.required": [
+    "sessionId",
+    "prompt"
+  ],
+  "PromptResponse.required": [
+    "stopReason"
+  ],
+  "CancelNotification.required": [
+    "sessionId"
+  ],
+  "RequestPermissionRequest.required": [
+    "sessionId",
+    "toolCall",
+    "options"
+  ],
+  "SessionNotification.required": [
+    "sessionId",
+    "update"
+  ],
+  "ClientCapabilities.properties": [
+    "_meta",
+    "auth",
+    "elicitation",
+    "fs",
+    "session",
+    "terminal"
+  ],
+  "FileSystemCapabilities.properties": [
+    "_meta",
+    "readTextFile",
+    "writeTextFile"
+  ],
+  "AgentCapabilities.loadSession.type": "boolean"
+}

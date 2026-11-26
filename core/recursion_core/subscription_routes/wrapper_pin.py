@@ -1,6 +1,6 @@
 """Pins for wrapper routes (CSL-786, candidate).
 
-Lucas's 2026-11-09 call, beside the floor table on recursion #323 (CSL-732).
+The owner's 2026-11-09 call, beside the floor table on recursion #323 (CSL-732).
 That table's Measured help column already records which builds have a measured
 ``--help``; this module does not repeat it.
 

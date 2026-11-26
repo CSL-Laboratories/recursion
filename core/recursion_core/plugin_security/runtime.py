@@ -1,4 +1,4 @@
-"""Free-threaded runtime checks (Lucas, Nov 7: CPython 3.14t, ``-X gil=0``, refuse a GIL build).
+"""Free-threaded runtime checks (the owner, Nov 7: CPython 3.14t, ``-X gil=0``, refuse a GIL build).
 
 ``require_production_runtime`` runs once at daemon start and refuses anything other
 than CPython 3.14 built free-threaded, started with ``-X gil=0``, with the GIL off.

@@ -1,0 +1,6 @@
+{
+  "type": "core",
+  "id": 2,
+  "bytes_b64": "eyJhcmdzIjp7InBsdWdpbl9pZCI6ImRlbW8ucGx1Z2luIn0sIm9wIjoicGx1Z2luLnBlcm1pc3Npb25zIiwicHJvdG9jb2wiOiJjc2wtY29yZS92MCJ9",
+  "caller": "other.plugin"
+}

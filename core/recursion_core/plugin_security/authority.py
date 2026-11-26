@@ -31,7 +31,7 @@ verify cache, edit or recreate the ledger). The
 tests record which of those mutants succeed. Containment needs a separate OS user or
 process for the anchor and ledger (F11, F21); F21 is not done.
 
-2026-11-11 same-uid fallback (O69, ``policy.SAME_UID_FALLBACK_POLICY``; Lucas,
+2026-11-11 same-uid fallback (O69, ``policy.SAME_UID_FALLBACK_POLICY``; the owner,
 2026-11-08, t1418u; not accepted text in CSL-Laboratories/csl-research
 contracts/PRODUCT.md 055cc7a5c793b7135e5d0565dc4198cf96230531, SHA-256
 e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf, receipt

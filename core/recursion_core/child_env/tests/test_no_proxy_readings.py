@@ -77,7 +77,6 @@ class StarDotTests(unittest.TestCase):
                 self.assertEqual("launched", _outcome(home, {"NO_PROXY": value}))
 
 
-@unittest.skipIf(os.name == "nt", "POSIX rules")
 class WhitespaceTests(unittest.TestCase):
     """Every character JavaScript's trim and ``\\s`` take (U+FEFF too), and Go's and requests' whitespace."""
 
@@ -86,6 +85,7 @@ class WhitespaceTests(unittest.TestCase):
         self.assertEqual(python | {"\ufeff"}, set(policy._SPACES))
         self.assertEqual(len(policy._SPACES), len(set(policy._SPACES)))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_any_space_around_or_inside_the_host_is_stripped_or_split(self) -> None:
         home = _home(self)
         for space in policy._SPACES:
@@ -98,11 +98,13 @@ class WhitespaceTests(unittest.TestCase):
             with self.subTest(value=ascii(f"x{space}claude.ai")):
                 self.assertEqual("no_proxy_engine_host", _outcome(home, {"NO_PROXY": f"x{space}claude.ai"}, None)[1])
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_bom_keeps_the_position_of_its_entry(self) -> None:
         home = _home(self)
         self.assertEqual(("NO_PROXY", "no_proxy_route_host", 2), _outcome(home, {"NO_PROXY": "a,x\ufeffgateway.example"}))
         self.assertEqual(("NO_PROXY", "no_proxy_wildcard", 3), _outcome(home, {"NO_PROXY": "a b,\ufeff*"}))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_bom_beside_a_harmless_entry_still_launches(self) -> None:
         home = _home(self)
         for value in ("\ufefflocalhost", "x\ufeffother.example", "corp.example\ufeff,127.0.0.1", "\ufeff", "a\ufeff\ufeffb"):
@@ -110,10 +112,10 @@ class WhitespaceTests(unittest.TestCase):
                 self.assertEqual("launched", _outcome(home, {"NO_PROXY": value}))
 
 
-@unittest.skipIf(os.name == "nt", "POSIX rules")
 class RangeTests(unittest.TestCase):
     """Node's built-in matcher reads ``a-b`` as an IPv4 range, trimming each end."""
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_range_holding_the_route_host_refuses(self) -> None:
         home = _home(self)
         for value, position in (("10.0.0.0-10.255.255.255", 1), ("10.1.2.3-10.1.2.3", 1), ("10.1.2.0-10.1.2.3-junk", 1),
@@ -124,6 +126,7 @@ class RangeTests(unittest.TestCase):
                     self.assertEqual(("NO_PROXY", "no_proxy_route_host", position),
                                      _outcome(home, {"NO_PROXY": value}, base_url))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_ranges_that_cover_every_address_are_a_wildcard(self) -> None:
         home = _home(self)
         for parent, expected in (
@@ -146,6 +149,7 @@ class RangeTests(unittest.TestCase):
                             route=ChildRoute(api_key="sk-test-FAKE"), parent={**PROXY, **parent})
         return caught.exception
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_other_ranges_still_launch(self) -> None:
         home = _home(self)
         for value, base_url in (("192.168.0.0-192.168.255.255", V4_GATEWAY), ("10.255.255.255-10.0.0.0", V4_GATEWAY),
@@ -197,7 +201,6 @@ class SpaceJoinTests(unittest.TestCase):
                 self.assertEqual("launched", _outcome(home, {"NO_PROXY": value}, base_url))
 
 
-@unittest.skipIf(os.name == "nt", "POSIX rules")
 class IdnaFoldTests(unittest.TestCase):
     """Go maps names through ``idna.Lookup``: NFKC, case folding, ignorables dropped, ideographic full stops."""
 
@@ -212,6 +215,7 @@ class IdnaFoldTests(unittest.TestCase):
         self.assertEqual("cn", unicodedata.category("\u0378").lower())
         self.assertIsNone(policy._idna_fold("a\u0378b"))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_folded_entry_naming_a_host_refuses(self) -> None:
         home = _home(self)
         for value, base_url, cause in (
@@ -229,6 +233,7 @@ class IdnaFoldTests(unittest.TestCase):
                 outcome = _outcome(home, {"NO_PROXY": value}, base_url)
                 self.assertEqual(cause, outcome if outcome == "launched" else outcome[1])
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_non_ascii_name_refuses_only_beside_a_punycode_host(self) -> None:
         home = _home(self)
         for value in ("b\xfccher.example", "B\xdcCHER.example", "stra\xdfe.example", "\xe9.example"):
@@ -243,6 +248,7 @@ class IdnaFoldTests(unittest.TestCase):
                          "folding can't be compared with a punycode (xn--) host; the entry is not shown", str(caught.exception))
         self.assertEqual("launched", _outcome(home, {"NO_PROXY": "xn--other-kva.example,corp.example"}, IDN_GATEWAY))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_an_unassigned_code_point_is_unparseable_on_any_route(self) -> None:
         home = _home(self)
         for base_url in (None, GATEWAY, LOOPBACK):
@@ -250,6 +256,7 @@ class IdnaFoldTests(unittest.TestCase):
                 self.assertEqual(("NO_PROXY", "no_proxy_unparseable", 2),
                                  _outcome(home, {"NO_PROXY": "localhost,corp\u0378.example"}, base_url))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_harmless_non_ascii_entries_still_launch(self) -> None:
         home = _home(self)
         for value in ("\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54", "corp\u3002example", "\xe9cole.example",
@@ -279,7 +286,6 @@ class LoopbackStaysAllowedTests(unittest.TestCase):
                 self.assertEqual("launched", _outcome(home, {"NO_PROXY": value}, LOOPBACK))
 
 
-@unittest.skipIf(os.name == "nt", "POSIX rules")
 class ReadingTimeTests(unittest.TestCase):
     """The extra readings stay linear-ish: the worst new paths on input about as long as an env value may be."""
 
@@ -304,20 +310,12 @@ class ReadingTimeTests(unittest.TestCase):
         # "linear-ish": a CI runner may be several times slower than a dev box, but halving the input must still
         # roughly halve the time (quadratic gives 4x). SECONDS is only a backstop against blow-ups.
         unit = 100_000
+        # One shape in this file. The other ten are their own modules: a gate run of this file
+        # must not charge every shape's retry budget.
         for label, make in (
             # A 50,000-character requests join with star-dot tails. Most of its time is the "*" matcher on 12,500
             # entries, as before MEDIUM-2 (1.65 s at 100,000 characters at abb3d75d; 1.88 s now).
             ("one long spaced item", lambda n: "*.a " * (n // 8) + "q"),
-            ("one long space run", lambda n: "a" + " " * n + "b"),
-            ("one long BOM run", lambda n: "a" + "\ufeff" * n + "b"),  # undici pieces
-            ("BOM and star", lambda n: "\ufeff*a" * (n // 3) + "q"),
-            ("fullwidth", lambda n: "\uff41" * n + "\uff0eexample"),  # one long IDNA fold
-            ("fullwidth spaced", lambda n: "\uff41 " * (n // 2)),
-            ("dashes", lambda n: "-" * n), ("dashes in a range", lambda n: "10.0.0.0-" + "-" * n + "10.0.0.1"),
-            ("spaced dashes", lambda n: "1.0.0.0 - " * (n // 10)),
-            ("many ranges", lambda n: ",".join(f"10.{i // 256}.{i % 256}.1-10.{i // 256}.{i % 256}.254"
-                                               for i in range(n // 25))),
-            ("mixed", lambda n: "\ufeff \uff0e*.\xad-1 0.0.0.0/1 ," * (n // 20)),
         ):
             value, half = make(unit), make(unit // 2)
             with self.subTest(label=label, length=len(value)):

@@ -14,15 +14,18 @@ import pathlib
 import re
 import sys
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
-from recursion_core.computer_site.tests.site import ComputerSite
+from recursion_core.computer_site.tests.site import ComputerSite, SiteServer
 
 CALL_S = 5.0     # a test's own wait for one answer; it only ends a wait that would never end
 JOIN_S = 10.0    # a test's own wait for its helper threads to finish
 THREADS = 16     # the bound on helper threads in the many-threads case
+SLOW_LOG_S = 0.3 # how long the log write is held back in the log-before-answer case
 HERE = pathlib.Path(__file__).resolve()
 REPO = HERE.parents[4]
 SITE_DIR = HERE.parent / 'site'
@@ -33,10 +36,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _opener(follow):
+    """An opener made of the plain HTTP handlers only: no HTTPS handler (it would build a TLS context,
+    which the repository's simulated-Windows step cannot do) and no proxy handler (a proxy named in the
+    environment must never stand between a test and the loopback site)."""
+    opener = urllib.request.OpenerDirector()
+    for handler in (urllib.request.HTTPHandler(), urllib.request.HTTPDefaultErrorHandler(),
+                    urllib.request.HTTPErrorProcessor(), urllib.request.UnknownHandler(),
+                    urllib.request.HTTPRedirectHandler() if follow else _NoRedirect()):
+        opener.add_handler(handler)
+    return opener
+
+
 def call(url, data=None, headers=None, follow=True, method=None):
     """Return (status, headers, body); a 3xx, 4xx or 5xx answer is returned, not raised."""
     request = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
-    opener = urllib.request.build_opener() if follow else urllib.request.build_opener(_NoRedirect)
+    opener = _opener(follow)
     try:
         with opener.open(request, timeout=CALL_S) as answer:
             return answer.status, answer.headers, answer.read()
@@ -148,6 +163,33 @@ class ServedAndLoggedTests(SiteCase):
         self.assertEqual((plain['body_len'], plain['body_sha256']), (0, hashlib.sha256(b'').hexdigest()))
         self.assertIsInstance(posted['time'], float)
         self.assertLessEqual(posted['time'], plain['time'])
+
+
+class LogBeforeAnswerTests(SiteCase):
+    def test_the_line_is_in_the_log_before_the_answer_reaches_the_client(self):
+        real = SiteServer.record
+
+        def slow(server, *args):
+            time.sleep(SLOW_LOG_S)       # a late log write would now show: the answer would come first
+            return real(server, *args)
+
+        with mock.patch.object(SiteServer, 'record', slow):
+            self.assertEqual(call(self.first.url('/'))[0], 200)
+            self.assertEqual([l['path'] for l in self.first.read_log()], ['/'])
+
+
+class OnlyFixedPagesTests(SiteCase):
+    def test_no_request_path_reads_a_file(self):
+        names = [p.name for p in SITE_DIR.iterdir() if p.is_file() and p.suffix != '.pyc']
+        self.assertIn('server.py', names)
+        paths = ['/' + name for name in names] + ['/../server.py', '/%2e%2e/server.py', '/..%2fserver.py',
+                                                  '/./pages.py', '//server.py', '/README.md']
+        for server in (self.first, self.second):
+            for path in paths:
+                status, _, body = call(server.url(path))
+                self.assertEqual(status, 404, path)
+                self.assertNotIn(b'import', body, path)
+        self.assertEqual(len(self.first.read_log()), len(paths))
 
 
 class ChangeMarkTests(SiteCase):

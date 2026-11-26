@@ -10,7 +10,7 @@ emitted. There is no learned router (grill Q45).
 from recursion_core.routing.config import (CONFIG_FILE, ENGINES, RECURSION_LOOP, VENDORS, Config, ConfigError, Login,
                                            Route, RoutingUnreadable, Rule, catalog, load, load_config, read_routing_file)
 # ``detect.detect`` is reached through its module: re-exporting the function here would hide the module.
-from recursion_core.routing.detect import breaker_view, daemon_route_refusal, key_state_from
+from recursion_core.routing.detect import NOT_CONSULTED, breaker_view, daemon_route_refusal, key_state_from
 from recursion_core.routing.router import (EXPLAIN_PARAMS, decide, explain, explain_answer, next_after_limit,
                                            next_steps, route_decision, snapshot)
 
@@ -18,6 +18,7 @@ __all__ = [
     "CONFIG_FILE",
     "ENGINES",
     "EXPLAIN_PARAMS",
+    "NOT_CONSULTED",
     "RECURSION_LOOP",
     "VENDORS",
     "Config",

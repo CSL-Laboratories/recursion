@@ -24,8 +24,15 @@ The sources are passed in, so that this module depends on none of them and its t
   turns the daemon's breaker into one;
 * ``key_state(connection_id) -> "ready" | "absent" | "not_opted_in"``: the key store answers it
   (``key_state_from`` builds one from the store's metadata); a test passes a plain function;
-* ``active``: the engines whose adapter the engine table can launch, or None to leave that check to
-  ``routes.json`` (the daemon loads an entry only for an engine it has an adapter for).
+* ``active``: the engines whose adapter the engine table can launch.
+
+``NOT_CONSULTED``, passed for a source, leaves that source out on purpose: no daemon refusal, no breaker, or
+no engine table is read (the daemon loads an entry only for an engine it has an adapter for, so ``routes.json``
+still holds that check). It is the one road to that reading. A source passed as None is read narrow, never as
+left out, because None is what a caller writes for an argument it has nothing for: no engine is routable on a
+refusal, a breaker or an engine table passed as None (``route_refused``, ``breaker_unknown``,
+``engine_not_active``). A key route is never routable without a key source, whatever is passed for it
+(``key_state_unknown``): spending needs a positive opt-in.
 """
 
 from __future__ import annotations
@@ -38,6 +45,17 @@ from recursion_core.routing.config import ENGINES, RECURSION_LOOP, Config
 BREAKER_STATES = ("closed", "half_open", "open", "unknown")
 KEY_STATES = ("ready", "absent", "not_opted_in")
 _CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+class _NotConsulted:
+    """The type of ``NOT_CONSULTED``: one value, compared by identity."""
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "NOT_CONSULTED"
+
+
+NOT_CONSULTED = _NotConsulted()  # a source left out on purpose: the one road to not reading it
 
 
 def _code(value: object, fallback: str) -> str:
@@ -57,11 +75,13 @@ def _connection(entry: object) -> tuple[str, str] | None:
 
 
 def _engine_reason(engine: str, entry: object, *, route_refusal, breaker_state, key_state, active) -> str | None:
-    if active is not None and engine not in active:
+    if active is not NOT_CONSULTED and engine not in active:  # None reached here as no engine active
         return "engine_not_active"
     if entry is None:
         return "route_not_configured"
-    if route_refusal is not None:
+    if route_refusal is None:
+        return "route_refused"  # passed as None: the daemon's refusal was not read, so the route is not taken
+    if route_refusal is not NOT_CONSULTED:
         refused = route_refusal(entry)
         if refused is not None:
             return _code(refused, "route_refused")
@@ -69,7 +89,9 @@ def _engine_reason(engine: str, entry: object, *, route_refusal, breaker_state, 
     if conn is None:
         return "route_no_connection"
     kind, ident = conn
-    if breaker_state is not None:
+    if breaker_state is None:
+        return "breaker_unknown"  # passed as None: the breaker was not read, so the connection is not taken
+    if breaker_state is not NOT_CONSULTED:
         state = breaker_state(f"{kind}:{ident}")
         if state not in BREAKER_STATES:
             return "breaker_unknown"
@@ -80,7 +102,7 @@ def _engine_reason(engine: str, entry: object, *, route_refusal, breaker_state, 
     if engine == RECURSION_LOOP and kind != "api_key":
         return "recursion_loop_needs_key"
     if kind == "api_key":
-        if key_state is None:
+        if key_state is None or key_state is NOT_CONSULTED:
             return "key_state_unknown"
         state = key_state(ident)
         if state == "absent":
@@ -101,9 +123,11 @@ def detect(config: Config, *, route_refusal: Callable | None, breaker_state: Cal
     and stops the caller.
 
     Every source is a keyword the caller passes, none of them defaulted, so that no call leaves a check out by
-    leaving an argument out (a call without one raises ``TypeError`` naming it). A source passed as None, said
-    so by the caller, is not consulted, except the key state: a key route with no key source is
-    ``key_state_unknown``, never routable, because spending needs a positive opt-in.
+    leaving an argument out (a call without one raises ``TypeError`` naming it), nor by writing None: a
+    refusal, a breaker or an engine table passed as None leaves no engine routable (``route_refused``,
+    ``breaker_unknown``, ``engine_not_active``). Only ``NOT_CONSULTED`` leaves one of those out on purpose.
+    A key route with no key source (None or ``NOT_CONSULTED``) is ``key_state_unknown``, never routable,
+    because spending needs a positive opt-in.
 
     ``active`` is not a source: it is the caller's own iterable of engine ids (the composition's engine
     table), read once. A single string is refused (TypeError); an iterable that raises, or a value that is
@@ -111,7 +135,7 @@ def detect(config: Config, *, route_refusal: Callable | None, breaker_state: Cal
     """
     if isinstance(active, (str, bytes)):
         raise TypeError("active is an iterable of engine ids, not one string")
-    active_set = None if active is None else frozenset(active)
+    active_set = active if active is NOT_CONSULTED else frozenset() if active is None else frozenset(active)
     engines: dict[str, dict] = {}
     for engine in ENGINES:
         entry = config.routes.get(engine)
@@ -158,13 +182,23 @@ def breaker_view(breaker) -> Callable[[str], str]:
 def daemon_route_refusal(breaker) -> Callable[[Mapping], str | None]:
     """The daemon's own pre-launch refusals of a loaded route entry, as a typed code (Linux only).
 
-    ``breaker`` is the daemon's breaker, or None, passed by a caller that has none: it is not defaulted, so a
-    call cannot leave the breaker's own refusals (a connection it cannot key) out by forgetting it."""
+    ``breaker`` is the daemon's breaker, or ``NOT_CONSULTED`` from a caller that has none, said on purpose: then
+    the breaker's own refusals (a connection or a model it cannot key) are not read. It is not defaulted, so a
+    call cannot leave those out by forgetting it, nor by writing None: a breaker passed as None gives a refusal
+    that refuses every entry ``source_not_given``, without importing the daemon.
+
+    Where the daemon cannot be imported (it imports on Linux only), this function raises ``ImportError`` for
+    any breaker but None; a caller there has no daemon refusal to pass, and passes ``NOT_CONSULTED`` as
+    ``route_refusal`` to ``detect`` and to ``router.next_after_limit``."""
+    if breaker is None:
+        return lambda entry: "source_not_given"
     from recursion_core.daemon.control_adapter import route_unbindable, route_unsupported
     from recursion_core.routes import contract
 
+    keyed_by = None if breaker is NOT_CONSULTED else breaker  # the daemon's own reading of no breaker
+
     def refusal(entry: Mapping) -> str | None:
-        unbindable = route_unbindable(entry, breaker)
+        unbindable = route_unbindable(entry, keyed_by)
         if unbindable is not None:
             return unbindable[0]
         if route_unsupported(entry) is not None:

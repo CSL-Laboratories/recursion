@@ -38,10 +38,12 @@ import copy
 import math
 import re
 from collections.abc import Mapping
+from datetime import datetime, timezone
 
 from recursion_core.routes import contract
 from recursion_core.routes import limits as route_limits
 from recursion_core.routing.config import ENGINES, Config, _model_ok
+from recursion_core.routing.detect import NOT_CONSULTED, _code
 
 REASONS = ("hand_pick", "config", "default")   # common.v1 route_decision.reason
 _CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")     # common.v1 code_word
@@ -490,8 +492,9 @@ def _attempt(entry: object) -> tuple | None:
     """One ``limit_notice.attempts`` entry, read once: ``(engine, model, connection word)``. An entry as
     ``describe`` writes it is a mapping. An entry that is a bare ``kind:id`` word, or a mapping that names its
     connection and neither an engine nor a model, names only its connection, and every listed route on that
-    connection counts as tried. So a notice built by hand, in any of those shapes, cannot hide a route
-    already tried. Each word is read as its plain text, a subclass of ``str`` too, so that comparing it cannot
+    connection counts as tried. A mapping that leaves out only its engine or only its model (absent or null)
+    reads the part it leaves out as any: every listed route it could name on that connection counts as tried.
+    So a notice built by hand, in any of those shapes, cannot hide a route already tried. Each word is read as its plain text, a subclass of ``str`` too, so that comparing it cannot
     raise and it still names the route it spells. An entry whose parts are not words names no listed route,
     and is not an attempt; nor is any other entry, nor one that cannot be read at all. ``next_after_limit``
     reads a history holding any entry that is not an attempt as unreadable: ask, never a switch."""
@@ -502,6 +505,10 @@ def _attempt(entry: object) -> tuple | None:
             return None  # parts that are not words: compared later, they could name nothing (or raise)
         if engine is None and model is None:
             return (_ANY, _ANY, word)  # names only its connection, as a bare word does
+        if engine is None:
+            return (_ANY, model, word)  # a model on a connection: any engine that runs it there was tried
+        if model is None:
+            return (engine, _ANY, word)  # an engine on a connection: any model of it there was tried
         return (engine, model, word)
     if isinstance(entry, str):
         return (_ANY, _ANY, _plain(entry))
@@ -536,10 +543,13 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     others), and a snapshot that is null or cannot be read passes over every listed route
     (``detection_unavailable``, ``detection_malformed``), so a call that has no snapshot gets ask, never a switch
     to a route whose key state it has not seen; ``route_refusal``, keyword only, the daemon's own pre-launch
-    refusal of a route entry (what ``detect.daemon_route_refusal(breaker)`` gives), or None, passed by a caller
-    that has no daemon to ask (then no daemon refusal is read; the snapshot still is): a listed route it refuses, taken as the entry the daemon would launch, is passed
-    over and skipped with its code (``launch_refused``, or ``route_unbindable``'s), and one whose refusal raises
-    is skipped ``detection_source_failed``. ``wait`` waits until the limit's ``reset_at``, or the result's ``retry_at`` when ``reset_at`` is
+    refusal of a route entry (what ``detect.daemon_route_refusal(breaker)`` gives), or ``detect.NOT_CONSULTED``
+    from a caller that has no daemon to ask (then no daemon refusal is read; the snapshot still is): a listed
+    route it refuses, taken as the entry the daemon would launch, is passed over and skipped with its code
+    (``launch_refused``, or ``route_unbindable``'s; an answer that is not a code word is ``route_refused``, as
+    ``detect`` reads it), and one whose refusal raises is skipped ``detection_source_failed``. A
+    ``route_refusal`` passed as None is never read as no daemon: every listed route not passed over before it
+    is skipped ``source_not_given``, so the answer is ask. ``wait`` waits until the limit's ``reset_at``, or the result's ``retry_at`` when ``reset_at`` is
     absent, null or not a finite time, else null; ``routes.limits.notice`` keeps the raw value. A time already
     past is passed through as the vendor gave it (``contract.vendor_reset`` would make it None; this module has
     no clock), so a surface that waits clamps it to now and never sleeps a negative interval. The answer::
@@ -655,11 +665,15 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
         if why is not None:
             skipped.append({"place": place, **route_limits.describe(route), "skipped": why})
             continue
-        if route_refusal is not None:
+        if route_refusal is None:  # passed as None: the daemon's refusal was not read, so the route is not taken
+            skipped.append({"place": place, **route_limits.describe(route), "skipped": "source_not_given"})
+            continue
+        if route_refusal is not NOT_CONSULTED:
             try:  # the daemon's own pre-launch refusal of this route, as the entry it would launch
                 why = route_refusal({"route": copy.deepcopy(route)})
             except Exception:  # noqa: BLE001 - a refusal source that raises: the route is not taken, as detect has it
                 why = "detection_source_failed"
+            why = _code(why, "route_refused") if type(why) is str else why  # a word that is no code: as detect reads it
             if why is not None:
                 skipped.append({"place": place, **route_limits.describe(route),
                                 "skipped": why if type(why) is str else "detection_source_failed"})
@@ -691,8 +705,8 @@ _SKIP_STEPS = {
                            "run detection again, or choose a route yourself",
     "detection_source_failed": "{route} was not tried because one of detection's sources failed: look at the "
                                "daemon's log, or list another route",
-    "breaker_open": "{route} is resting after a failure on its connection: wait for it to reopen, "
-                    "or list another route",
+    "breaker_open": "{route} was not tried because its connection's breaker is open after a failure there, and "
+                    "an open breaker refuses every start: wait for its cooldown to end, or list another route",
     "breaker_unknown": "{route} was not tried because its connection's state could not be read: wait until it "
                        "reads, or list another route",
     "engine_not_active": "{route} uses an engine this daemon does not run: turn the engine on, "
@@ -703,6 +717,9 @@ _SKIP_STEPS = {
                       "or list another route",
     "route_refused": "{route} would be refused by the daemon before launch: change its routes.json entry, "
                      "or list another route",
+    "source_not_given": "{route} was not tried because a check it needs (the daemon's refusal or its breaker) "
+                        "was passed as None, so it was not read: pass that check, or NOT_CONSULTED where no "
+                        "daemon runs, or list another route",
 }
 _SKIP_GENERAL = "{route} was passed over ({code}): see why with routing show, or list another route"
 _ANSWER_STEPS = {
@@ -720,6 +737,15 @@ _ANSWER_STEPS = {
     "no_decision": "What was passed is not a routing decision, so nothing is switched: pass the decision routing "
                    "made",
 }
+
+
+def _when(until: object) -> str:
+    """A wait time as a person reads it: the date and time in UTC, said so; a number no date can hold, as its
+    seconds after the epoch, in UTC too."""
+    try:
+        return datetime.fromtimestamp(until, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (OverflowError, OSError, ValueError, TypeError):
+        return f"{until} seconds after 1970-01-01 00:00 UTC"
 
 
 def _route_words(row: Mapping) -> str:
@@ -741,7 +767,7 @@ def next_steps(answer: Mapping) -> list[str]:
     elif action == "wait":
         until = answer.get("until")
         lines.append("The routing settings say to wait at a limit: "
-                     + (f"it resets at {until}; wait, or choose a route" if until is not None
+                     + (f"it resets at {_when(until)}; wait, or choose a route" if until is not None
                         else "no reset time was given; wait, or choose a route"))
     else:
         reason = answer.get("reason")

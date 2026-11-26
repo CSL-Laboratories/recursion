@@ -1,0 +1,149 @@
+# The ways past the two proofs that are known and not built, each with its reason.
+# The README names every row by its words (core/tests/test_no_call_home_runtime.py holds that), and the
+# commands point a person here. A row is taken out only by the change that makes the proof refuse it,
+# together with a planted test of it. proof = "static" (tools/network_reach.py), "run-time" (the
+# hook of tools/network_audit.py and of the run-time test), or "both".
+#
+# The [[claim]] rows are sentences that would say more than the proofs hold: none may stand in the
+# README's section 'What Recursion connects to'.
+
+[[gap]]
+id = "G01"
+proof = "static"
+words = "builtins, a frame or a function's globals reached through an object's attributes"
+example = "len.__self__.exec(text); an exception's __traceback__.tb_frame.f_builtins['exec']"
+reason = "The scan refuses the named routes to the builtins (__builtins__, __import__, a name built at run time) but not the attributes of an object that lead to them. It can be built: a list of such attributes refused like the other built names."
+
+[[gap]]
+id = "G02"
+proof = "static"
+words = "a module of the package used as a path to what that module imports"
+example = "from recursion_core.daemon.gui import socket; evidence_e2e.subprocess.run([...]); the same call handed to weakref.finalize"
+reason = "A use of the package's own module is recorded as a use of the package; the names that module only imported are not followed. It can be built: a use through the package judged as the import it reaches."
+
+[[gap]]
+id = "G03"
+proof = "static"
+words = "a network method taken as a value"
+example = "c = s.connect; c((host, port))"
+reason = "Only a call is looked at; an attribute that is not called is not. It can be built: such an attribute needs the same row as the call."
+
+[[gap]]
+id = "G04"
+proof = "static"
+words = "a guarded place reached through an object of its class, or a place that takes its program from its caller"
+example = "LeafRun.__new__(LeafRun)._spawn(argv); Harness.run(h, ['prog']) from a new module"
+reason = "The callers of a guarded place are pinned when the place is named by its class or module, not when it is called through an object; a row whose program comes from its arguments is not guarded when its supplier is 'local'. Part can be built (a private name through an object, the 'local' rows guarded); a public method called through an object of any class cannot be followed by reading names alone."
+
+[[gap]]
+id = "G08"
+proof = "both"
+words = "a file the code writes that the interpreter runs at a later start"
+example = "a .pth file written into a site-packages folder; a sitecustomize or usercustomize module"
+reason = "Writing a file is not a reach. On CPython 3.12 with a user site such a file runs in a later Python child before the hook loads, and the whole-suite run can then print PROVEN. Refusing the words .pth, sitecustomize and site-packages in shipped source is a candidate; a file written under a name built at run time is not seen by reading names."
+
+[[gap]]
+id = "G09"
+proof = "both"
+words = "the name-service lookups of pwd and getpass"
+example = "pwd.getpwuid(0); getpass.getuser() from a new place"
+reason = "They go through the system's name service, which can reach a directory server where the system is set so. No audit event exists for them, and the names are allowed in every file. This is the operating system's own traffic by its nature."
+
+[[gap]]
+id = "G10"
+proof = "static"
+words = "a name a module row allows is allowed in every file"
+example = "a second use of an allowed name of an allowed module, in a file that never used it"
+reason = "A module row holds names, not files. A list of names per file would make every new use a row change; not built."
+
+[[gap]]
+id = "G11"
+proof = "both"
+words = "a file path that reaches a network by itself"
+example = "an automount such as /net on macOS, or a Windows network path"
+reason = "No rule of the scan and no audit event names it: opening a file is not a reach, and the path can be built at run time."
+
+[[gap]]
+id = "G15"
+proof = "run-time"
+words = "a program row allows a name, not a file"
+example = "a test's own shell script named sleep that opens a connection"
+reason = "The audit does not look at which file of an allowed name ran; the tests themselves are not scanned."
+
+[[gap]]
+id = "G16"
+proof = "run-time"
+words = "a process of the run (the command itself or a child) that switches the hook off or writes its own events file"
+example = "sitecustomize._watched set to nothing in a child; the command's own process pointing sitecustomize._out at nothing before it connects; an empty events file written for the child's own number"
+reason = "The hook is Python code inside each process of the run, the command's own process included, so code that runs there can undo it. This is code that hides from the hook by its nature: only the static proof, where it reads that code, or a net outside the process can see it."
+
+[[gap]]
+id = "G17"
+proof = "run-time"
+words = "what a unit started by systemd-run runs"
+example = "systemd-run --user --pipe bash -c '...'"
+reason = "systemd-run keeps its program row; the unit's program is started by the user manager, not by a watched process."
+
+[[gap]]
+id = "G18"
+proof = "run-time"
+words = "the program row claude allows the name of a real engine program"
+example = "a test that runs the real engine program by that name"
+reason = "The row is safe only while the tests' PATH holds a stand-in of that name; allowing the stand-in by its full path is a candidate."
+
+[[gap]]
+id = "G19"
+proof = "run-time"
+words = "an interpreter started by a program that is neither Python nor a launcher"
+example = "the system's program loader (ld-linux) copied as sleep, running /usr/bin/python3.12 -I -c '...'; systemd-run starting an interpreter"
+reason = "The hook looks at the files of a start's arguments only when a launcher starts: looking at every argument of every start along PATH cost about 75 ms a look on a host whose PATH holds many slow folders, and turned a product test red. Such a program is judged by its name, so an allowed name lets the interpreter it runs go unseen. It can be built: the hook looks at each argument that names a file by its path (no PATH search) for every start, or a program row allows a file and not a name."
+
+[[gap]]
+id = "G20"
+proof = "run-time"
+words = "a process that was running before the run began, or outside the run's processes, that the run asks to act"
+example = "a Python program started before the audit, which a test asks through a file to open a connection"
+reason = "The hook is in the processes the run starts; a process outside them is not watched, and asking it to act through a file or a socket of this machine is not a reach of the run. No hook can see it by its nature: only a net outside the processes, such as a run inside a network namespace with no route out, can."
+
+[[gap]]
+id = "G21"
+proof = "static"
+words = "a file beside the scan's own script in `tools/` named like a module it imports"
+example = "tools/json.py or tools/ast.pyc: python3 tools/network_reach.py puts tools/ first on its import path"
+reason = "The scan judges what is under core/; its own folder is not scanned, and a file there named like a module the scan imports runs in the scan itself. It can be built: the scan's script takes its own folder off its import path before it imports anything, as the run-time proof's file does."
+
+[[claim]]
+text = "a later change that adds a call home, a module or a refused construct goes red"
+reason = "Once said; only the kinds the tests plant go red."
+
+[[claim]]
+text = "names every program that is not Python"
+reason = "Once said; a program started in ways the hook is not told of is not named."
+
+[[claim]]
+text = "goes red before it can merge"
+reason = "Only of the kinds the tests plant; the rows of this file get past."
+
+[[claim]]
+text = "adds any call home"
+reason = "No proof here holds for every way."
+
+[[claim]]
+text = "every possible way"
+reason = "No proof here holds for every way."
+
+[[claim]]
+text = "Every program the suite starts is watched"
+reason = "A program that is not Python is named, not watched; the rows of this file get past."
+
+[[claim]]
+text = "the ways named below are the ones known"
+reason = "Once said; more ways were found after it."
+
+[[claim]]
+text = "prints PROVEN on a clean checkout"
+reason = "The whole-suite run prints NOT PROVEN on a clean checkout today."
+
+[[claim]]
+text = "only a real interpreter is taken for Python"
+reason = "Once said; an interpreter started by a program that is neither Python nor a launcher is not seen (row G19)."

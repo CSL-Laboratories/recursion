@@ -1,0 +1,1170 @@
+# The list of the ONLY things the shipped package (core/recursion_core, tests not included) may do
+# that bear on the network. tools/network_reach.py checks this file against a scan of the syntax
+# tree, and what it cannot decide is refused, not passed:
+#
+# [[module]]    the only modules a shipped file may import or reach (the package's own excepted),
+#               each with its reason. Any other module is refused. Some modules are refused outright
+#               and no [[module]] row can allow them (the foreign-function modules, the private socket,
+#               ssl, subprocess and os modules, zip import, pickle and the other loaders that run code
+#               found in data).
+# [[construct]] the uses of a construct refused outright in shipped source (running text as code;
+#               reaching a module or a function by a built name; a log handler that sends over a
+#               network; an import of a test module or of anything outside the package), each with
+#               its reason and the exact text of each call: any other use, or a changed call, is refused.
+# [[reach]]     every place where the code can open a connection, look up a name, start a program, or
+#               load code by a name; with who supplies the address and the exact text of each call
+#               (calls), so a call whose arguments change is refused until its row is read again.
+# [[literal]]   every literal address in the shipped source, with its reason.
+#
+# who: settings = an address in your own settings or engine configuration; command = an address you
+# give in a command; plugin-grant = only under a grant you gave the plugin; local = a door on this
+# machine only (a Unix socket in your own folders, or the loopback address); none = no address at all.
+# No row says that an address comes from the code: Recursion sends nothing to its makers.
+#
+# Plugins: a plugin reaches a network only under a grant you gave. The proof of that belongs to the
+# plugin wall (core/recursion_core/plugin_security), not to this list.
+#
+# names (in a [[module]] row): the only names the package may take from that module. A private name
+#               of another module (one that begins with '_') needs a [[construct]] row (private-name).
+# callers (in a [[construct]] row, and in a [[reach]] row whose address comes from your settings or a
+#               command): the only places of the package that may use that place.
+
+[[literal]]
+file = "core/recursion_core/child_env/policy.py"
+function = "<module>"
+names = ["0.0.0.0", "api.anthropic.com", "api.anthropic.com", "api.openai.com", "auth.openai.com", "chatgpt.com", "claude.ai", "mcp-proxy.anthropic.com", "platform.claude.com"]
+reason = "The engines' own provider hosts and 0.0.0.0/0, kept only to COMPARE against a proxy or base address the person set (a NO_PROXY entry that would let an engine host bypass the proxy is refused). Never connected to: policy.py has no network call at all, and a test holds it so."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/child_env/policy.py"
+function = "_loopback_host"
+names = ["localhost"]
+reason = "The name localhost, compared against a host the person set; never looked up."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/control_transport/unix.py"
+function = "_is_host"
+names = ["localhost"]
+reason = "The name localhost, compared to refuse a host where a Unix socket path is wanted; never looked up."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/daemon/__main__.py"
+function = "_start_gui"
+names = ["127.0.0.1", "127.0.0.1"]
+reason = "The loopback address in a log line about the browser view."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.gui"
+names = ["127.0.0.1", "http://127.0.0.1:"]
+reason = "The loopback address the evidence harness uses to reach its own daemon on this machine."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.main"
+names = ["127.0.0.1"]
+reason = "The loopback address the evidence harness uses to reach its own daemon on this machine."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.prepare"
+names = ["127.0.0.1"]
+reason = "The loopback address the evidence harness uses to reach its own daemon on this machine."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/daemon/gui.py"
+function = "LoopbackGUI.__enter__"
+names = ["127.0.0.1", "127.0.0.1"]
+reason = "The loopback address the browser view listens on: this machine only."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-error-500-quota-text.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-error-no-status.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-limit-429-http-date.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-limit-429-no-reset.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-limit-429-retry-after-ms.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-limit-429.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-noise.jsonl"
+function = "<data>"
+names = ["https://example.invalid/s/abc"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routing/schema/routing_config.v1.json"
+function = "<data>"
+names = ["https://json-schema.org/draft/2020-12/schema"]
+reason = "The schema's own identifier ($schema). Never fetched: the routing loader checks the file by its own code, the routing package has no network call, and a test holds it so."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/subscription_routes/own_loop.py"
+function = "_loopback_url"
+names = ["127.0.0.1"]
+reason = "The loopback address in the words of a refusal (use 127.0.0.1 or ::1)."
+fetched = false
+
+[[reach]]
+file = "core/recursion_core/cgroup_leaf/__init__.py"
+function = "<module>"
+names = ["import subprocess"]
+calls = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module so that an engine run can be started in its own cgroup leaf."
+
+[[reach]]
+file = "core/recursion_core/cgroup_leaf/__init__.py"
+function = "LeafRun._spawn"
+names = ["subprocess.Popen"]
+calls = ["subprocess.Popen([sys.executable, '-I', '-S', '-c', TRAMPOLINE, str(procs), str(write_end), *argv], pass_fds=(procs, write_end), close_fds=True, start_new_session=True, env=env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr)"]
+who = "settings"
+address = "the engine program the person configured, and whatever that program itself is set to reach"
+says = "Starts the engine program you configured for a run, inside its own cgroup leaf. Recursion hands it no network address; the engine reaches only the provider you signed it in to."
+callers = []
+
+[[reach]]
+file = "core/recursion_core/child_env/launch.py"
+function = "<module>"
+names = ["import subprocess"]
+calls = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the one engine start below."
+
+[[reach]]
+file = "core/recursion_core/child_env/launch.py"
+function = "spawn"
+names = ["subprocess.Popen"]
+calls = ["subprocess.Popen called as: popen([executable, *argv[1:]], **kwargs)"]
+who = "settings"
+address = "the engine program the person configured"
+says = "Starts one engine program you configured, with exactly the checked environment; Recursion adds no address to it."
+callers = []
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "<module>"
+names = ["import importlib.util"]
+calls = ["import importlib.util"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_approvals_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.approvals')", "importlib.util.find_spec('recursion_core.approvals.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_control_mcp_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.control.mcp')", "importlib.util.find_spec('recursion_core.control.mcp.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_control_scopes"
+names = ["importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.control.scopes')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_events_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.events')", "importlib.util.find_spec('recursion_core.events.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_gui_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.gui')", "importlib.util.find_spec('recursion_core.gui.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_keys_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.keys')", "importlib.util.find_spec('recursion_core.keys.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_launch_check_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.launch_check')", "importlib.util.find_spec('recursion_core.launch_check.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_plugin_security_host_hooks"
+names = ["importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.plugin_security.host_hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_plugin_security_sign_hooks"
+names = ["importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.plugin_security.sign_hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_quota_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.quota')", "importlib.util.find_spec('recursion_core.quota.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_remote_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.remote')", "importlib.util.find_spec('recursion_core.remote.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_routes_driver_hooks"
+names = ["importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.routes.driver_hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_routing_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.routing')", "importlib.util.find_spec('recursion_core.routing.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_sessions_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.sessions')", "importlib.util.find_spec('recursion_core.sessions.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_setup_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.setup')", "importlib.util.find_spec('recursion_core.setup.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_workspace_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+calls = ["importlib.util.find_spec('recursion_core.workspace')", "importlib.util.find_spec('recursion_core.workspace.hooks')"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/operator_reads_socket.py"
+function = "<module>"
+names = ["import socket"]
+calls = ["import socket"]
+who = "local"
+address = "a Unix socket in the person's runtime folder"
+says = "Uses Unix sockets for the operator read door on this machine only."
+
+[[reach]]
+file = "core/recursion_core/control/operator_reads_socket.py"
+function = "OperatorReadsClient._call"
+names = [".connect()", "socket.socket"]
+calls = ["conn.connect(path)", "socket.socket(_AF_UNIX, socket.SOCK_STREAM)"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Connects to the operator read door on this machine, a Unix socket in your own runtime folder; it never leaves the machine."
+
+[[reach]]
+file = "core/recursion_core/control/operator_reads_socket.py"
+function = "OperatorReadsServer.start"
+names = [".bind()", "socket.socket"]
+calls = ["listener.bind(path)", "socket.socket(_AF_UNIX, socket.SOCK_STREAM)"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Opens the operator read door, a Unix socket in your own runtime folder that only your user may use."
+
+[[reach]]
+file = "core/recursion_core/control/operator_reads_socket.py"
+function = "_clear_stale"
+names = [".connect()", "socket.socket"]
+calls = ["probe.connect(path)", "socket.socket(_AF_UNIX, socket.SOCK_STREAM)"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Checks whether an old operator read door in your runtime folder still answers before it is replaced."
+
+[[reach]]
+file = "core/recursion_core/control_transport/framing.py"
+function = "<module>"
+names = ["import socket"]
+calls = ["import socket"]
+who = "local"
+address = "a Unix socket the control door already opened"
+says = "Reads and writes frames on the control door's own Unix socket."
+
+[[reach]]
+file = "core/recursion_core/control_transport/peercred.py"
+function = "<module>"
+names = ["import socket"]
+calls = ["import socket"]
+who = "local"
+address = "a Unix socket the control door already opened"
+says = "Asks the kernel which user is on the other end of a Unix socket of the control door."
+
+[[reach]]
+file = "core/recursion_core/control_transport/unix.py"
+function = "<module>"
+names = ["import socket", "socket.socket"]
+calls = ["import socket", "socket.socket"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Defines the control door as a Unix socket on this machine only."
+
+[[reach]]
+file = "core/recursion_core/control_transport/unix.py"
+function = "UnixControlClient.__init__"
+names = [".connect()", "socket.socket"]
+calls = ["sock.connect(self.path)", "socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Connects a command of yours to the control door, a Unix socket in your own runtime folder."
+
+[[reach]]
+file = "core/recursion_core/control_transport/unix.py"
+function = "UnixControlServer.start"
+names = [".bind()", "socket.socket"]
+calls = ["sock.bind(self._path)", "socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Opens the control door, a Unix socket in your own runtime folder that only your user may use."
+
+[[reach]]
+file = "core/recursion_core/control_transport/unix.py"
+function = "_clear_stale_socket"
+names = [".connect()", "socket.socket"]
+calls = ["probe.connect(path)", "socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Checks whether an old control door in your runtime folder still answers before it is replaced."
+
+[[reach]]
+file = "core/recursion_core/daemon/__init__.py"
+function = "<module>"
+names = ["import subprocess"]
+calls = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the two local service programs below."
+
+[[reach]]
+file = "core/recursion_core/daemon/__init__.py"
+function = "SystemdUserManager._call"
+names = ["subprocess.run"]
+calls = ["subprocess.run(argv, check=True, text=True, capture_output=True, timeout=15)"]
+who = "none"
+address = "none"
+says = "Runs systemctl --user on this machine to start, stop or read your own run services; no address is involved."
+
+[[reach]]
+file = "core/recursion_core/daemon/__init__.py"
+function = "check_operator_linger"
+names = ["subprocess.run"]
+calls = ["subprocess.run called as: call(['loginctl', 'show-user', user, '--property=Linger', '--value'], check=True, text=True, capture_output=True, timeout=15)"]
+who = "none"
+address = "none"
+says = "Runs loginctl on this machine to read whether your user lingers; no address is involved."
+
+[[reach]]
+file = "core/recursion_core/daemon/engine_exec.py"
+function = "main"
+names = ["os.execve"]
+calls = ["os.execve(argv[3], argv[3:], env)"]
+who = "settings"
+address = "the engine program the person configured"
+says = "Replaces this small helper with the engine program you configured, with the environment read from its file."
+callers = ["core/recursion_core/daemon/engine_exec.py <module>"]
+
+[[reach]]
+file = "core/recursion_core/daemon/engine_user.py"
+function = "<module>"
+names = ["import subprocess"]
+calls = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the local probe below."
+
+[[reach]]
+file = "core/recursion_core/daemon/engine_user.py"
+function = "check_engine_no_user_manager"
+names = ["subprocess.run"]
+calls = ["subprocess.run called as: call(['loginctl', 'show-user', user, '--property=Linger', '--value'], check=False, text=True, capture_output=True, timeout=15) ; call(['systemctl', 'is-active', f'user@{uid}.service'], check=False, text=True, capture_output=True, timeout=15)"]
+who = "none"
+address = "none"
+says = "Runs loginctl and systemctl on this machine to read the engine user's state; no address is involved."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "<module>"
+names = ["import http.client", "import socket", "import subprocess"]
+calls = ["import http.client", "import socket", "import subprocess"]
+who = "local"
+address = "the loopback address and a port the harness itself binds, and Unix sockets in a temporary folder"
+says = "An evidence harness a person runs by hand: it starts a daemon of its own and talks to it only on this machine."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.gui"
+names = ["http.client.HTTPConnection"]
+calls = ["http.client.HTTPConnection('127.0.0.1', self.port, timeout=30)"]
+who = "local"
+address = "the loopback address and a port the harness itself binds, and Unix sockets in a temporary folder"
+says = "An evidence harness a person runs by hand: it starts a daemon of its own and talks to it only on this machine."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.prepare"
+names = [".bind()", "socket.socket"]
+calls = ["probe.bind(('127.0.0.1', 0))", "socket.socket()"]
+who = "local"
+address = "the loopback address and a port the harness itself binds, and Unix sockets in a temporary folder"
+says = "An evidence harness a person runs by hand: it starts a daemon of its own and talks to it only on this machine."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.run"
+names = ["subprocess.run"]
+calls = ["subprocess.run(argv, text=True, capture_output=True, timeout=120, env=self.env, **kwargs)"]
+who = "local"
+address = "the loopback address and a port the harness itself binds, and Unix sockets in a temporary folder"
+says = "An evidence harness a person runs by hand: it starts a daemon of its own and talks to it only on this machine."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.start_daemon"
+names = ["subprocess.Popen"]
+calls = ["subprocess.Popen([self.python, '-X', 'gil=0', '-B', '-m', 'recursion_core.daemon', '--gui-port', str(self.port), '--sweep-seconds', '1'], env=self.env, stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)"]
+who = "local"
+address = "the loopback address and a port the harness itself binds, and Unix sockets in a temporary folder"
+says = "An evidence harness a person runs by hand: it starts a daemon of its own and talks to it only on this machine."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_ns.sh"
+function = "<file>"
+names = ["a .sh file the scan cannot read"]
+calls = ["sha256:d14fd8c5798ca36ef2613d8fc484cb5d8d9c5314a35b845e32a7d0cca52b3713"]
+who = "local"
+address = "a session bus socket in the person's runtime folder"
+says = "A shell wrapper a person runs by hand for the evidence harness: it starts a local session bus and a user service manager and runs the harness; it names no network address."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_standin_engine.py"
+function = "<module>"
+names = ["import subprocess"]
+calls = ["import subprocess"]
+who = "none"
+address = "none"
+says = "A stand-in engine for the evidence harness: it starts a local sleeping child and reaches no network."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_standin_engine.py"
+function = "main"
+names = ["subprocess.Popen"]
+calls = ["subprocess.Popen([sys.executable, '-I', '-c', 'import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(3600)'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)"]
+who = "none"
+address = "none"
+says = "A stand-in engine for the evidence harness: it starts a local sleeping child and reaches no network."
+
+[[reach]]
+file = "core/recursion_core/daemon/gui.py"
+function = "<module>"
+names = ["import socket", "import socketserver.TCPServer", "import socketserver.ThreadingMixIn", "import wsgiref.simple_server.WSGIRequestHandler", "import wsgiref.simple_server.WSGIServer"]
+calls = ["import socket", "from socketserver import TCPServer, ThreadingMixIn", "from socketserver import TCPServer, ThreadingMixIn", "from wsgiref.simple_server import WSGIRequestHandler, WSGIServer", "from wsgiref.simple_server import WSGIRequestHandler, WSGIServer"]
+who = "local"
+address = "the loopback address 127.0.0.1 and the port of --gui-port"
+says = "The browser view listens on the loopback address of this machine only, on the port you give with --gui-port."
+
+[[reach]]
+file = "core/recursion_core/daemon/gui.py"
+function = "_Handler"
+names = ["wsgiref.simple_server.WSGIRequestHandler"]
+calls = ["WSGIRequestHandler"]
+who = "local"
+address = "the loopback address 127.0.0.1 and the port of --gui-port"
+says = "The browser view listens on the loopback address of this machine only, on the port you give with --gui-port."
+
+[[reach]]
+file = "core/recursion_core/daemon/gui.py"
+function = "_Server"
+names = ["socketserver.ThreadingMixIn", "wsgiref.simple_server.WSGIServer"]
+calls = ["ThreadingMixIn", "WSGIServer"]
+who = "local"
+address = "the loopback address 127.0.0.1 and the port of --gui-port"
+says = "The browser view listens on the loopback address of this machine only, on the port you give with --gui-port."
+
+[[reach]]
+file = "core/recursion_core/daemon/gui.py"
+function = "_Server.server_bind"
+names = ["socketserver.TCPServer.server_bind"]
+calls = ["TCPServer.server_bind(self)"]
+who = "local"
+address = "the loopback address 127.0.0.1 and the port of --gui-port"
+says = "The browser view listens on the loopback address of this machine only, on the port you give with --gui-port."
+
+[[reach]]
+file = "core/recursion_core/daemon/launcher.py"
+function = "<module>"
+names = ["import subprocess"]
+calls = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for its error types; the run services are started through systemctl."
+
+[[reach]]
+file = "core/recursion_core/plugin_security/loader.py"
+function = "<module>"
+names = ["import importlib.machinery"]
+calls = ["import importlib.machinery"]
+who = "plugin-grant"
+address = "only what the person granted the plugin"
+says = "Runs the code of a plugin you installed, after its signature and grant checks; a plugin reaches a network only under a grant you gave."
+
+[[reach]]
+file = "core/recursion_core/routes/tools/attended_codex.py"
+function = "<module>"
+names = ["import subprocess"]
+calls = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the attended tool below."
+
+[[reach]]
+file = "core/recursion_core/routes/tools/attended_codex.py"
+function = "_run"
+names = ["subprocess.run"]
+calls = ["subprocess.run(argv, capture_output=True, text=True, check=True, timeout=300)"]
+who = "command"
+address = "the codex program the person names on the command line"
+says = "A tool you run by hand: it starts the codex program you name, with its update check turned off, to print its version and its schema into a scratch folder."
+callers = ["core/recursion_core/routes/tools/attended_codex.py schema_mode"]
+
+[[reach]]
+file = "core/recursion_core/subscription_routes/own_loop.py"
+function = "<module>"
+names = ["import subprocess"]
+calls = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the engine start below."
+
+[[reach]]
+file = "core/recursion_core/subscription_routes/own_loop.py"
+function = "_spawn_checked"
+names = ["subprocess.Popen"]
+calls = ["subprocess.Popen"]
+who = "settings"
+address = "the engine program and the loopback proxy the person configured"
+says = "Starts the engine program you configured for your own loop route, with a checked environment; a proxy, if any, must be a loopback address you set."
+callers = ["core/recursion_core/subscription_routes/own_loop.py spawn_copilot_own_loop", "core/recursion_core/subscription_routes/own_loop.py spawn_nous_own_loop"]
+
+[[reach]]
+file = "core/recursion_core/subscription_routes/validated_launch.py"
+function = "<module>"
+names = ["import subprocess"]
+calls = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the engine start below."
+
+[[reach]]
+file = "core/recursion_core/subscription_routes/validated_launch.py"
+function = "spawn_route_process.launch"
+names = ["subprocess.Popen"]
+calls = ["subprocess.Popen(resolved_argv, **kwargs)"]
+who = "settings"
+address = "the engine program the person configured"
+says = "Starts the engine program of a route you configured, with the checked environment; Recursion adds no address to it."
+callers = []
+
+[[reach]]
+file = "core/recursion_core/tui/keymap.py"
+function = "Keymap.default"
+names = [".bind()"]
+calls = ["km.bind(context, seq_text, action)"]
+who = "none"
+address = "none"
+says = "Binds a key to an action in the terminal view; the word bind here names a key, not a network door."
+
+[[reach]]
+file = "core/recursion_core/tui/keymap.py"
+function = "load"
+names = [".bind()"]
+calls = ["km.bind(context, seq_text, action)"]
+who = "none"
+address = "none"
+says = "Binds a key to an action in the terminal view; the word bind here names a key, not a network door."
+
+[[module]]
+name = "argparse"
+reason = "Reads the command line of the daemon, the control program and the evidence harness."
+names = ["ArgumentParser", "Namespace"]
+
+[[module]]
+name = "base64"
+reason = "Encodes bytes as text (a token made on this machine, data embedded in the browser view's own page)."
+names = ["b64encode", "urlsafe_b64encode"]
+
+[[module]]
+name = "calendar"
+reason = "Calendar arithmetic (timegm, monthrange) for an engine's reset time."
+names = ["monthrange", "timegm"]
+
+[[module]]
+name = "codecs"
+reason = "An incremental UTF-8 decoder for the terminal view's input and output."
+names = ["getincrementaldecoder"]
+
+[[module]]
+name = "collections"
+reason = "Counters, ordered and default dictionaries and deques."
+names = ["OrderedDict", "defaultdict", "deque"]
+
+[[module]]
+name = "collections.abc"
+reason = "The abstract types (Mapping, Sequence, Callable) used in checks and annotations."
+names = ["Callable", "Collection", "Hashable", "Iterable", "Iterator", "Mapping", "Sequence"]
+
+[[module]]
+name = "contextlib"
+reason = "Context managers (suppress, contextmanager, ExitStack)."
+names = ["ExitStack", "closing", "contextmanager", "suppress"]
+
+[[module]]
+name = "copy"
+reason = "Copies of plain data (copy, deepcopy)."
+names = ["deepcopy"]
+
+[[module]]
+name = "cryptography.exceptions"
+reason = "The one outside library: the error a failed Ed25519 signature check raises. It computes; it opens no connection."
+names = ["InvalidSignature"]
+
+[[module]]
+name = "cryptography.hazmat.primitives.asymmetric.ed25519"
+reason = "The one outside library: Ed25519 signing and checking of plugins (and the evidence harness's own test key). It computes; it opens no connection."
+names = ["Ed25519PrivateKey", "Ed25519PublicKey"]
+
+[[module]]
+name = "cryptography.hazmat.primitives.serialization"
+reason = "The one outside library: writes the evidence harness's test key as bytes. It computes; it opens no connection."
+names = ["Encoding", "PublicFormat"]
+
+[[module]]
+name = "dataclasses"
+reason = "Plain record classes."
+names = ["asdict", "dataclass", "field", "replace"]
+
+[[module]]
+name = "datetime"
+reason = "Dates and times in records and an engine's reset time."
+names = ["datetime", "timedelta", "timezone"]
+
+[[module]]
+name = "errno"
+reason = "Error numbers of the operating system's calls."
+names = ["ECANCELED", "ECONNREFUSED", "EEXIST", "EINVAL", "EIO", "EMSGSIZE", "ENOENT", "ENOTEMPTY", "EPIPE", "ESRCH", "ETIMEDOUT"]
+
+[[module]]
+name = "fcntl"
+reason = "File locks, descriptor flags and terminal calls (flock, ioctl) on this machine."
+names = ["LOCK_EX", "LOCK_NB", "LOCK_UN", "flock", "ioctl"]
+
+[[module]]
+name = "getpass"
+reason = "The name of the account the daemon runs as, for a message on this machine."
+names = ["getuser"]
+
+[[module]]
+name = "hashlib"
+reason = "Digests (SHA-256) of local data: keys, idempotency, plugin artifacts."
+names = ["sha256"]
+
+[[module]]
+name = "heapq"
+reason = "A priority queue of approvals by time."
+names = ["heapify", "heappop", "heappush"]
+
+[[module]]
+name = "hmac"
+reason = "Compares secrets in constant time (compare_digest)."
+names = ["compare_digest"]
+
+[[module]]
+name = "html"
+reason = "Escapes text for the browser view's own page."
+names = ["escape"]
+
+[[module]]
+name = "http.client"
+reason = "Used only by the evidence harness to ask its own daemon's browser view on this machine; each call has a [[reach]] row."
+names = ["HTTPConnection"]
+
+[[module]]
+name = "importlib.machinery"
+reason = "The plugin loader's list of extension suffixes (it reports a native module a plugin loaded)."
+names = ["EXTENSION_SUFFIXES"]
+
+[[module]]
+name = "importlib.util"
+reason = "find_spec of the package's own optional modules by literal names; each call has a [[reach]] row."
+names = ["find_spec"]
+
+[[module]]
+name = "inspect"
+reason = "Reads a class's own attributes without running them (inspect.getattr_static)."
+names = ["getattr_static"]
+
+[[module]]
+name = "io"
+reason = "Stream classes with which the browser view reads a request on this machine."
+names = ["BufferedReader", "RawIOBase"]
+
+[[module]]
+name = "ipaddress"
+reason = "Decides whether an address a person set is the loopback address; parses, never connects."
+names = ["IPv4Address", "IPv4Network", "IPv6Address", "IPv6Network", "collapse_addresses", "ip_address", "ip_network"]
+
+[[module]]
+name = "itertools"
+reason = "Iteration helpers."
+names = ["count"]
+
+[[module]]
+name = "json"
+reason = "Reads and writes the person's settings, records and messages as JSON."
+names = ["dump", "dumps", "loads"]
+
+[[module]]
+name = "logging"
+reason = "Writes the product's own log on this machine; the handlers that send over a network are refused outright."
+names = ["INFO", "basicConfig", "getLogger"]
+
+[[module]]
+name = "math"
+reason = "Arithmetic on timeouts and sizes."
+names = ["ceil", "floor", "isfinite"]
+
+[[module]]
+name = "mmap"
+reason = "Reads a local file through memory in the attended tool route."
+names = ["ACCESS_READ", "mmap"]
+
+[[module]]
+name = "numbers"
+reason = "Number types in checks of a request's fields."
+names = ["Real"]
+
+[[module]]
+name = "os"
+reason = "Files, descriptors, the environment and the process; its program starts each have a [[reach]] row."
+names = ["O_CLOEXEC", "O_CREAT", "O_DIRECTORY", "O_EXCL", "O_NOCTTY", "O_NOFOLLOW", "O_NONBLOCK", "O_RDONLY", "O_RDWR", "O_TRUNC", "O_WRONLY", "PathLike", "X_OK", "access", "chmod", "close", "defpath", "dup", "environ", "execve", "fchmod", "fdopen", "fsencode", "fspath", "fstat", "fsync", "geteuid", "getpid", "getuid", "kill", "link", "listdir", "lstat", "mkdir", "mkfifo", "name", "open", "pathsep", "pidfd_open", "pipe2", "read", "readlink", "rename", "replace", "rmdir", "sep", "stat", "stat_result", "terminal_size", "umask", "unlink", "walk", "write"]
+
+[[module]]
+name = "os.path"
+reason = "Paths of files on this machine."
+names = ["abspath", "basename", "dirname", "isabs", "isdir", "isfile", "islink", "join", "lexists", "normpath", "realpath", "relpath"]
+
+[[module]]
+name = "pathlib"
+reason = "Paths of files on this machine."
+names = ["Path", "PurePosixPath"]
+
+[[module]]
+name = "pwd"
+reason = "The account's entry on this machine (home folder, uid)."
+names = ["getpwuid"]
+
+[[module]]
+name = "queue"
+reason = "A queue between the terminal view's threads."
+names = ["Empty", "SimpleQueue"]
+
+[[module]]
+name = "re"
+reason = "Regular expressions."
+names = ["IGNORECASE", "Pattern", "compile", "escape", "fullmatch", "match", "search", "sub"]
+
+[[module]]
+name = "secrets"
+reason = "Random tokens and nonces made on this machine and never sent anywhere."
+names = ["compare_digest", "token_bytes", "token_hex", "token_urlsafe"]
+
+[[module]]
+name = "select"
+reason = "Waits on local descriptors (pipes, the terminal, the local control socket)."
+names = ["POLLHUP", "POLLIN", "poll", "select"]
+
+[[module]]
+name = "shlex"
+reason = "Splits and quotes a command line the person typed."
+names = ["split"]
+
+[[module]]
+name = "shutil"
+reason = "Copies and removes local files, finds a program on the person's own PATH."
+names = ["copyfile", "get_terminal_size", "rmtree", "which"]
+
+[[module]]
+name = "signal"
+reason = "Signals between the daemon and the programs it started on this machine."
+names = ["SIGINT", "SIGKILL", "SIGTERM", "pidfd_send_signal", "signal"]
+
+[[module]]
+name = "socket"
+reason = "Unix sockets of the local control door and the loopback browser view; each call has a [[reach]] row."
+names = ["AF_UNIX", "SHUT_RDWR", "SOCK_STREAM", "SOL_SOCKET", "SOMAXCONN", "SO_PEERCRED", "socket"]
+
+[[module]]
+name = "socketserver"
+reason = "The threading mix-in of the loopback browser view's server; its use has a [[reach]] row."
+names = ["TCPServer", "ThreadingMixIn"]
+
+[[module]]
+name = "sqlite3"
+reason = "The local record store, a file on this machine."
+names = ["Connection", "DatabaseError", "Error", "IntegrityError", "SQLITE_CREATE_INDEX", "SQLITE_CREATE_TABLE", "SQLITE_DELETE", "SQLITE_DENY", "SQLITE_FUNCTION", "SQLITE_INSERT", "SQLITE_OK", "SQLITE_READ", "SQLITE_RECURSIVE", "SQLITE_REINDEX", "SQLITE_SELECT", "SQLITE_UPDATE", "complete_statement", "connect"]
+
+[[module]]
+name = "stat"
+reason = "File modes and ownership checks."
+names = ["S_IMODE", "S_ISDIR", "S_ISLNK", "S_ISREG", "S_ISSOCK", "S_ISVTX"]
+
+[[module]]
+name = "struct"
+reason = "Packs and unpacks the frames of the local control door."
+names = ["Struct", "calcsize", "error", "unpack"]
+
+[[module]]
+name = "subprocess"
+reason = "Starts the programs a person configured (engines, systemctl, loginctl); each start has a [[reach]] row."
+names = ["CalledProcessError", "DEVNULL", "Popen", "SubprocessError", "TimeoutExpired", "run"]
+
+[[module]]
+name = "sys"
+reason = "The interpreter's own facts (version, flags, standard streams); the modules table is refused outright except where a [[construct]] row says why."
+names = ["argv", "byteorder", "executable", "exit", "implementation", "modules", "platform", "stderr", "stdin", "stdlib_module_names", "stdout", "version_info"]
+
+[[module]]
+name = "sysconfig"
+reason = "Reads a build setting of the interpreter itself (get_config_var)."
+names = ["get_config_var"]
+
+[[module]]
+name = "tempfile"
+reason = "Temporary files and folders on this machine."
+names = ["TemporaryDirectory", "gettempdir", "mkdtemp"]
+
+[[module]]
+name = "termios"
+reason = "The terminal's modes."
+names = ["BRKINT", "CS8", "CSIZE", "ECHO", "FIONREAD", "ICANON", "ICRNL", "IEXTEN", "IGNBRK", "IGNCR", "IGNPAR", "INLCR", "INPCK", "ISIG", "ISTRIP", "IXANY", "IXOFF", "IXON", "PARENB", "PARMRK", "TCSADRAIN", "TCSAFLUSH", "VMIN", "VTIME", "error", "tcgetattr", "tcsetattr"]
+
+[[module]]
+name = "threading"
+reason = "Threads and locks."
+names = ["BoundedSemaphore", "Condition", "Event", "Lock", "RLock", "Thread", "current_thread", "get_ident", "local"]
+
+[[module]]
+name = "time"
+reason = "Clocks and waits."
+names = ["gmtime", "monotonic", "sleep", "strftime", "time"]
+
+[[module]]
+name = "tomllib"
+reason = "Reads the person's key map file (TOML)."
+names = ["TOMLDecodeError", "loads"]
+
+[[module]]
+name = "traceback"
+reason = "Writes a failure's trace into the evidence harness's own record."
+names = ["print_exc"]
+
+[[module]]
+name = "tty"
+reason = "Puts the terminal into raw mode for the terminal view."
+names = []
+
+[[module]]
+name = "types"
+reason = "Module and namespace types, read-only mappings."
+names = ["GetSetDescriptorType", "MappingProxyType", "MemberDescriptorType", "ModuleType"]
+
+[[module]]
+name = "typing"
+reason = "Annotations."
+names = ["Any", "Callable", "ContextManager", "Iterator", "NamedTuple", "Protocol", "TextIO"]
+
+[[module]]
+name = "unicodedata"
+reason = "Character classes for the cleaning of text shown on the terminal."
+names = ["category", "combining", "east_asian_width", "normalize"]
+
+[[module]]
+name = "urllib.parse"
+reason = "Splits and quotes addresses a person set, and the browser view's own request paths; parses, never connects."
+names = ["parse_qs", "quote", "urlsplit"]
+
+[[module]]
+name = "uuid"
+reason = "Random identifiers of runs and requests (uuid4), made on this machine; never an identifier of the machine (uuid1 and getnode are refused by the identity rule)."
+names = ["uuid4"]
+
+[[module]]
+name = "weakref"
+reason = "Weak references to local objects."
+names = ["finalize"]
+
+[[module]]
+name = "wsgiref.simple_server"
+reason = "The loopback browser view's server and request handler; their uses have [[reach]] rows."
+names = ["WSGIRequestHandler", "WSGIServer"]
+
+[[construct]]
+file = "core/recursion_core/cgroup_leaf/__init__.py"
+function = "require_linux_calls"
+construct = "built-name"
+calls = ["hasattr(os, name)"]
+reason = "hasattr(os, name) over the five literal names of Linux calls written on the line above it: it only asks whether each exists, and refuses the launch with a typed error where one is missing."
+callers = ["core/recursion_core/cgroup_leaf/__init__.py Cgroup2.__init__", "core/recursion_core/cgroup_leaf/__init__.py DelegatedRoot.__init__", "core/recursion_core/cgroup_leaf/__init__.py LeafRun.__init__"]
+
+[[construct]]
+file = "core/recursion_core/daemon/plugins.py"
+function = "_first_imports"
+construct = "built-name"
+calls = ["sys.modules.items()"]
+reason = "reads the names in sys.modules after a plugin load, to report the modules first imported for that plugin; it reads names and changes nothing."
+callers = ["core/recursion_core/daemon/plugins.py PluginHost._import_findings"]
+
+[[construct]]
+file = "core/recursion_core/control/scopes.py"
+function = "_attr"
+construct = "built-name"
+calls = ["getattr(principal, name, default)"]
+reason = "getattr(principal, name, default): reads a principal's attribute by a name of this file's scope rules; an attribute that cannot be read counts as unknown."
+callers = ["core/recursion_core/control/scopes.py Authorizer.__call__", "core/recursion_core/control/scopes.py Authorizer.held"]
+
+[[construct]]
+file = "core/recursion_core/control/scopes.py"
+function = "<module>"
+construct = "built-name"
+calls = ["type.__dict__", "type.__dict__"]
+reason = "type.__dict__ of two literal keys (__mro__ and __dict__): reads a class's own order and dictionary through type's descriptors, so that no metaclass is asked."
+
+[[construct]]
+file = "core/recursion_core/control/api.py"
+function = "ControlAPI._reg"
+construct = "built-name"
+calls = ["getattr(self._registry, op)"]
+reason = "getattr(self._registry, op): calls a method of the daemon's own run registry; every caller in this file passes a literal name (get, list, find_start)."
+callers = []
+
+[[construct]]
+file = "core/recursion_core/plugin_security/protocol.py"
+function = "CoreService.handle"
+construct = "built-name"
+calls = ["getattr(self, '_op_' + op.replace('.', '_'))"]
+reason = "getattr(self, '_op_' + op...): op is first checked against the fixed table of protocol operations (PROTOCOL['ops']), so only a method of that table is reached."
+callers = []
+
+[[construct]]
+file = "core/recursion_core/plugin_security/loader.py"
+function = "PluginLoader.load"
+construct = "text-as-code"
+calls = ["compile(artifact, '<plugin %s>' % manifest.plugin_id, 'exec', dont_inherit=True)"]
+reason = "compile of a plugin artifact after its signature, manifest and permissions were checked; the code runs only in _activate, under the plugin wall."
+callers = []
+
+[[construct]]
+file = "core/recursion_core/tui/sessions.py"
+function = "Transcript.__deepcopy__"
+construct = "built-name"
+calls = ["copied.__dict__.update(copy.deepcopy(self.__dict__, memo))", "self.__dict__"]
+reason = "copies a transcript's own attributes (self.__dict__) into a new transcript with a lock of its own."
+callers = []
+
+[[construct]]
+file = "core/recursion_core/plugin_security/loader.py"
+function = "PluginLoader._activate"
+construct = "built-name"
+calls = ["sys.modules", "module.__dict__", "sys.modules", "sys.modules.get(name)"]
+reason = "the names in sys.modules before and after a plugin runs, to report a native module it loaded; module.__dict__ is the namespace of the plugin's own new module, handed to exec."
+callers = []
+
+[[construct]]
+file = "core/recursion_core/plugin_security/loader.py"
+function = "PluginLoader._activate"
+construct = "text-as-code"
+calls = ["exec(code, module.__dict__)"]
+reason = "exec of the code object that load compiled from a plugin artifact whose signature and manifest were checked first: this is how a plugin runs, under the plugin wall (plugin_security), not under this list."
+callers = []
+
+[[construct]]
+file = "core/recursion_core/daemon/plugins.py"
+function = "PluginHost._load"
+construct = "built-name"
+calls = ["sys.modules"]
+reason = "a set of the names in sys.modules before a plugin load, the other half of _first_imports."
+callers = []
+
+[[construct]]
+file = "core/recursion_core/daemon/launcher.py"
+function = "UnitEngineProcess.close"
+construct = "built-name"
+calls = ["getattr(self, name)", "setattr(self, name, None)"]
+reason = "getattr and setattr of self over the two literal names _out and _pidfd: closes each descriptor once and clears it."
+callers = []
+
+[[construct]]
+file = "core/recursion_core/control/hooks.py"
+function = "Hooks.service"
+construct = "built-name"
+calls = ["getattr(service, part, None)"]
+reason = "getattr(service, part, None) over the two literal names start and stop: checks that a registered service has both, and reaches nothing."
+callers = []
+
+[[construct]]
+file = "core/recursion_core/daemon/__init__.py"
+function = "require_free_threaded"
+construct = "private-name"
+reason = "Reads whether the GIL is on, to refuse to start on an interpreter that is not free-threaded. The name exists only on CPython 3.13 and later, so it is read with getattr, a literal name and None. It starts nothing and reaches no network."
+calls = ["getattr(sys, '_is_gil_enabled', None) called as: check() ; handed on: if sys.implementation.name != 'cpython' or sys.version_info[:2] != (3, 14) or (not sysconfig.get_config_var('Py_GIL_DISABLED')) or (check is None) or check():\n    raise RuntimeError('Requires free-threaded CPython 3.14t with -X gil=0')"]
+callers = ["core/recursion_core/daemon/__main__.py cli", "core/recursion_core/daemon/__main__.py main"]
+
+[[construct]]
+file = "core/recursion_core/daemon/engine_exec.py"
+function = "main"
+construct = "private-name"
+reason = "Ends the child process at once with status 127 when the engine program cannot be started (the usual status of a program not found), without running the parent's exit handlers in the child. It starts nothing and reaches no network."
+calls = ["os._exit(127)"]
+callers = ["core/recursion_core/daemon/engine_exec.py <module>"]
+
+[[construct]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.install_test_plugins"
+construct = "interpreter-hook"
+reason = "The evidence harness, a program a person runs by hand on a scratch home (never the daemon), puts this checkout's own core folder first on its import path so that the test plugins it installs import this package and no other. The folder is the package's own, fixed by the harness's file; no person, plugin or network supplies it."
+calls = ["sys.path.insert(0, str(CORE))"]
+callers = []
+
+[[construct]]
+file = "core/recursion_core/daemon/evidence_standin_engine.py"
+function = "on_sigint"
+construct = "private-name"
+reason = "The evidence stand-in engine ends itself at once with status 130 on an interrupt. It starts nothing and reaches no network."
+calls = ["os._exit(130)"]
+callers = ["core/recursion_core/daemon/evidence_standin_engine.py main (handed on)"]
+
+[[construct]]
+file = "core/recursion_core/plugin_security/runtime.py"
+function = "GilProbe.gil_enabled"
+construct = "private-name"
+reason = "Reads whether the GIL is on, for the plugin wall's check of the interpreter (getattr with a literal name and None). It starts nothing and reaches no network."
+calls = ["getattr(sys, '_is_gil_enabled', None) called as: handed on: return True if probe is None else bool(probe()) ; probe()"]
+callers = []
+
+[[construct]]
+file = "core/recursion_core/plugin_security/runtime.py"
+function = "runtime_report"
+construct = "private-name"
+reason = "Reads whether the GIL is on and the -X gil option of this process, for the runtime report a person reads. Neither starts anything or reaches a network."
+calls = ["getattr(sys, '_is_gil_enabled', None) called as: handed on: return {'implementation': sys.implementation.name, 'version': list(sys.version_info[:3]), 'free_threaded_build': bool(sysconfig.get_config_var('Py_GIL_DISABLED')), 'gil_xoption': sys._xoptions.get('gil'), 'gil_enabled': True if probe is None else bool(probe())} ; probe()", "sys._xoptions.get('gil')"]
+callers = ["core/recursion_core/plugin_security/runtime.py require_production_runtime"]
+
+[[construct]]
+file = "core/recursion_core/routes/launch.py"
+function = "require_free_threaded"
+construct = "private-name"
+reason = "Reads whether the GIL is on, to refuse a route launch on an interpreter that is not free-threaded (getattr with a literal name and None: the name exists only on CPython 3.13 and later). It starts nothing and reaches no network."
+calls = ["getattr(sys, '_is_gil_enabled', None)"]
+callers = []

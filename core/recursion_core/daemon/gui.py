@@ -25,7 +25,7 @@ the page (``gui.surface``), so a Stop cut short this way names no run at all.
 from collections.abc import Mapping
 import io
 import socket
-from socketserver import ThreadingMixIn
+from socketserver import TCPServer, ThreadingMixIn
 from threading import Lock, Thread
 import time
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer
@@ -123,6 +123,14 @@ class _Server(ThreadingMixIn, WSGIServer):
         self._reading = {}    # connections still sending headers, oldest first
         self._working = {}    # connections whose request is being answered -> is it a Stop
         super().__init__(*args)
+
+    def server_bind(self):
+        # http.server.HTTPServer.server_bind names the server by socket.getfqdn(host), a reverse name
+        # lookup that can reach the machine's resolver. The view listens on the loopback address only,
+        # so its name is that address: bind, take the name and port as bound, look nothing up.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+        self.setup_environ()
 
     def process_request(self, request, client_address):
         evicted = None

@@ -17,6 +17,111 @@ Start here:
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute
 - [ANCHOR.md](ANCHOR.md) — why the work exists; [CONTROL_PLANE.md](CONTROL_PLANE.md) — who decides
 
+## What Recursion connects to
+
+Only what you configure. Recursion sends nothing to its makers: no usage counts, no crash
+reports, no update check, and it makes no install or machine identifier. The daemon opens two
+doors, both on your own machine: the control door, a Unix socket in your runtime folder, and the
+browser view on the loopback address `127.0.0.1`. It starts the engine programs you configured,
+with only the addresses you configured; what an engine program reaches on its own is that
+program's setting (Codex is started with its update check turned off). A plugin reaches a network
+only under a grant you gave; that proof belongs to the plugin checks in
+`core/recursion_core/plugin_security/`, not to this list. The shipped code may import only the
+modules listed with their reasons in `tools/network_reach.toml`, and every place in it that the scan
+finds could reach a network is written down there with who supplies its address and the exact text
+of each call (the ways the scan does not find are listed below).
+
+Run the proof on your own machine:
+
+- `python3 tools/network_reach.py` reads every shipped file by its syntax tree. It prints PROVEN,
+  or NOT PROVEN with each problem: a module that is not on the list, or a name of a listed module
+  that its row does not hold; a private name of another module; running text as code, or reaching
+  a module or a function by a name built at run time (a module or `getattr` handed on as a value
+  included); `help`, `breakpoint`, a change of the places modules are loaded from, or a store into
+  the process environment; a foreign-function, private socket or subprocess, zip-import or
+  unpickling module; a log handler that sends over a network; an import of a test module or of
+  anything outside the package; a call that could reach a network and has no row, or whose text is
+  not the text its row holds; a use of a guarded place from a place its row does not name; a
+  symbolic link under `core/`, or a compiled file the interpreter would run instead of its source;
+  a file it cannot read; a coding declaration other than utf-8; a file the interpreter can import
+  (source, compiled or extension) directly under `core/`, a file or folder named like a standard
+  module anywhere under `core/` whatever its suffix, a compiled file with no source beside it, an
+  extension module (machine code the scan cannot read), or a folder outside the package, named like
+  a standard module or a listed module (the interpreter may import it in place of that module); a
+  change of a file it cannot parse (its row holds the file's digest).
+- `python3 core/tests/test_no_call_home_runtime.py` (Linux, CPython 3.12 or later) starts a daemon
+  of its own in a temporary folder, leaves it idle, asks its status and stops it, while the
+  interpreter's audit hook watches that it reaches no address and looks up no name; then it starts
+  a stand-in engine at an address it configured and checks that only that address is reached. It
+  prints PROVEN (run-time) or NOT PROVEN, and the list of what it does not cover. It runs nothing
+  while the scan finds such a file or folder under `core/` (it prints NOT PROVEN and names it). The daemon itself
+  runs only on free-threaded CPython 3.14t; on another interpreter the test stands in for that one
+  check, and the rest of the daemon runs as shipped.
+
+What is proven, and what is not:
+
+- Proven today, by the second command: as shipped, the daemon reaches no address and looks up no
+  name while it is idle with no engine configured, and with an engine configured it reaches only
+  the address a person configured.
+- Proven before every merge: the tests of both proofs (`core/tests/test_network_reach.py`, which
+  checks what the first command checks and plants each refused kind, and the file of the second
+  command) run in the hosted gate (CPython 3.12 on Linux). So a later change of a kind those tests
+  plant (each kind is listed in `core/tests/test_network_reach.py`) goes red there; a way the scan
+  cannot see is not caught. Other ways past the proofs exist: the known ones that are not built are
+  the rows of `tools/network_gaps.toml`, each with its reason, and each is named in the list below.
+  There may be more. Five independent hostile reads of this proof each found a few new ways past it;
+  each was shut or named; more may exist; the list of known ways is in tools/network_gaps.toml.
+- The whole-suite run: the whole test suite can also be run once with the hook in every Python
+  process it starts: `python3 tools/network_audit.py`. On a clean checkout today it prints NOT
+  PROVEN, and says why: the product's own tests start Python children with `-I` or with a cleared
+  environment, which the hook cannot reach (in one run of 2653 passing tests, 176 of 404 Python
+  starts did not load the hook on CPython 3.12, and 143 of 377 on the free-threaded 3.14t). So the
+  whole-suite run is not a proof today; it
+  names what it could not watch. Like the second command, it runs nothing while the scan finds such a
+  file or folder under `core/`. It names a program that is not Python and refuses one that is not
+  listed in `tools/network_audit.toml`. A program started through another program (`env`,
+  `unshare`) is judged by the program it starts, its line read by an exact grammar of what the
+  launcher accepts (a word holding `=` before the program, after a `--` included, is read only as an
+  assignment of a plain name to `env`, and any other such word is refused; a split-string option of `env`, also inside a group
+  such as `-iS`, is refused, and so is any option of a launcher that is not exactly one of the option
+  words of its row in `tools/network_audit.toml`, an abbreviation such as `--split` included; a
+  launcher's start with more arguments than the hook looks at, the setting
+  `RECURSION_AUDIT_MAX_ARGS`, is refused), a program is taken for Python by its name (`python3`,
+  `python3.N`), or by its file whatever its name, looked at when it starts, a Python process that
+  does not load the hook (started with `-I`, `-S` or `-E`, or with a cleared environment) is
+  refused, and a hooked process still running when the command ends makes the run NOT PROVEN (a
+  child forked without a new start is such a process, and so is one given the hook's events folder
+  under another spelling), except in the run-time ways of the list
+  below. Not watched: code that hides from the hook. That run is not part of the hosted gate.
+- Known ways past the proofs, not built (the rows of `tools/network_gaps.toml`, with their reasons):
+  - past the scan: builtins, a frame or a function's globals reached through an object's attributes
+    (`len.__self__`); a module of the package used as a path to what that module imports (`from
+    recursion_core.daemon.gui import socket`); a network method taken as a value (`c = s.connect`);
+    a guarded place reached through an object of its class, or a place that takes its program from
+    its caller; a name a module row allows is allowed in every file; and a file beside the scan's
+    own script in `tools/` named like a module it imports.
+  - past both: a file the code writes that the interpreter runs at a later start (a `.pth` file, a
+    `sitecustomize`); the name-service lookups of pwd and getpass; a file path that reaches a
+    network by itself (an automount such as `/net` on macOS, or a Windows network path).
+  - past the whole-suite run: a program row allows a name, not a file (a test's script named
+    `sleep`); a process of the run (the command itself or a child) that switches the hook off or
+    writes its own events file; what a unit started by systemd-run runs; the program row claude
+    allows the name of a real engine program; an interpreter started by a program that is neither
+    Python nor a launcher (the system's program loader copied under an allowed name); a process that
+    was running before the run began, or outside the run's processes, that the run asks to act.
+- Not proven: the engines' own traffic to the addresses you configured, and anything else an
+  engine program reaches by itself; what a plugin does under a grant you gave (the plugin checks'
+  proof); what the operating system does by itself (its own name lookups and services); what any
+  program the daemon starts reaches by itself (the test runs only its own stand-ins); the traffic
+  of a socket made from a descriptor handed in from outside with its family named; a call into the
+  operating system through a foreign-function module at run time (the shipped code may not import
+  one, and the run-time test refuses any such call it sees); what the audit hook is not told: it
+  sees only what Python code reports to it, so code that replaces a module's `sys` or calls into
+  the operating system directly is not seen, the run-time proof of the daemon holds only together
+  with the static proof, and the whole-suite run holds only for code that does not hide from it
+  (the tests themselves are not scanned); each way of the list above. The test runs on Linux
+  only; Windows and macOS are not covered.
+
 > Governance note: `CONTROL_PLANE.md` and `ANCHOR.md` are the operative authority and scope
 > records. They already describe Recursion v3 (D-017, 2026-09-28); the older claim that they
 > "still describe the pre-v3 control plane" was stale. Neither file is edited in the

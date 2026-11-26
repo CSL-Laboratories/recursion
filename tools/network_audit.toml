@@ -1,0 +1,53 @@
+# The programs that are not Python which the whole test suite may start, each with its reason.
+# tools/network_audit.py (run with no command) allows these by name and refuses any other: what a
+# program that is not Python reaches is not watched by the audit hook, so each one is named here.
+# A row allows a NAME; the audit does not check which file of that name ran.
+
+[[program]]
+name = "claude"
+reason = "The engine name the daemon tests give their stand-in engine units (test_adv1_*, test_composition); the tests run with no real engine configured."
+
+[[program]]
+name = "safe-dummy-engine"
+reason = "A stand-in engine a subscription_routes test writes in its temporary folder."
+
+[[program]]
+name = "safe-engine"
+reason = "A stand-in engine a subscription_routes test writes in its temporary folder."
+
+[[program]]
+name = "sleep"
+reason = "A child that only sleeps, for the launcher and cgroup leaf tests."
+
+[[program]]
+name = "systemctl"
+reason = "The user manager's control program (or a test's stand-in for it); it talks to the user manager by a local socket."
+
+[[program]]
+name = "systemd-run"
+reason = "Starts a unit under the user manager (or a test's stand-in for it); it talks to the user manager by a local socket."
+
+# A [[launcher]] is a program that starts another program. No [[program]] row may allow one: the audit
+# reads its arguments and judges the program it starts by the same rule. options are the exact option
+# words of the launcher the audit reads (a short option by its letter, a long one by its whole word,
+# with or without '=value'); any other option, an abbreviation of a long one included, makes which
+# program it starts not told, and the start is refused. value_options are the options that take the
+# next argument as their value (so the value is not taken for the program).
+
+[[launcher]]
+name = "env"
+options = ["-i", "--ignore-environment", "-0", "--null", "-u", "--unset", "-C", "--chdir", "-v", "--debug",
+           "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"]
+value_options = ["-u", "--unset", "-C", "--chdir"]
+reason = "Runs a stand-in under a cleared environment in the child_env tests. Its split-string option (-S, --split-string) is not among the options: it hands a whole command line in one argument, which the audit does not judge."
+
+[[launcher]]
+name = "unshare"
+options = ["-m", "--mount", "-u", "--uts", "-i", "--ipc", "-n", "--net", "-p", "--pid", "-U", "--user",
+           "-C", "--cgroup", "-T", "--time", "-f", "--fork", "-r", "--map-root-user", "-c", "--map-current-user",
+           "--map-user", "--map-group", "--map-auto", "--map-users", "--map-groups", "--kill-child",
+           "--mount-proc", "--propagation", "--setgroups", "--keep-caps", "-R", "--root", "-w", "--wd",
+           "-S", "--setuid", "-G", "--setgid", "--monotonic", "--boottime"]
+value_options = ["-S", "--setuid", "-G", "--setgid", "-R", "--root", "-w", "--wd", "--map-user", "--map-group",
+                 "--map-users", "--map-groups", "--propagation", "--setgroups", "--monotonic", "--boottime"]
+reason = "Runs a Python child of the test in namespaces of its own (test_adv1_socket_cli_gui). Its options are those of util-linux 2.39; an option with an optional value takes it only after '='."

@@ -28,6 +28,7 @@ from recursion_core.control_transport import InsecureSocketPath
 from recursion_core.control_transport.framing import encode_frame
 from recursion_core.control_transport.unix import MAX_CONNECTIONS
 from recursion_core.daemon import AlreadyRunning, Daemon, Registry, UserLock
+import recursion_core.daemon as daemon_module
 from recursion_core.daemon import control_adapter as adapter
 from recursion_core.daemon import launcher
 from recursion_core.daemon.gui import LoopbackGUI
@@ -305,28 +306,111 @@ class SocketAttackTest(ComposedBase):
         self.assertEqual(receipt['code'], 'stopped', receipt)
         self.assertEqual((again['code'], again.get('repeat')), ('stopped', True), again)
 
-    def seed_settled_runs(self, count):
-        """``count`` settled runs with systemd's real cgroup paths, as ADV1-5 measured them (~975 bytes each)."""
-        store = Registry(self.state)
+    def seed_settled_runs(self, count, *, state=None, one_by_one=False):
+        """``count`` settled runs with systemd's real cgroup paths, as ADV1-5 measured them (~975 bytes each).
+
+        The default writes, in one ``Registry._write``, the rows ``Registry.all`` and
+        ``Registry.control_all`` return. It does not call ``add``, ``state`` or ``control_put``.
+        ``one_by_one=True`` does: ``add``, then ``state(run_id, 'terminated', '')``, then
+        ``control_put``, one publish each. ``all`` does not return ``created`` or ``updated``.
+        The per-run path stamps those on two clocks and the batch path stamps them once, so
+        this helper does not claim those two values are equal. The list tests call this with
+        the default, which is the one commit.
+        """
+        store = Registry(state or self.state)
         long_group = ('/user.slice/user-1000.slice/user@1000.service/app.slice/'
                       'recursion-run-run-%s.service')
-        ids = []
+        ids, rows = [], []
         for i in range(count):
             run_id = 'run-%032x' % i
-            store.add(run_id, BOOT)
-            store.state(run_id, 'terminated', '')
             group = long_group % ('%032x' % i)
             marker = 'cg-%032x' % i
-            store.control_put(run_id, json.dumps({
+            rows.append((run_id, json.dumps({
                 'run_id': run_id, 'tenant': 't1', 'engine': 'claude_code', 'state': 'stopped', 'cgroup': group,
                 'started_at': 1.0e9, 'stop': {'requested_at': 1.0e9, 'checks': 1, 'reason': None, 'requested': True},
                 'start_key': {'client_key': 'key-%032x' % i, 'engine': 'claude_code', 'prompt_sha256': 'f' * 64},
                 'generation': 4, 'members': [], 'cgroup_marker': marker,
                 'stop_attestation': {'proof': 'empty', 'cgroup': group, 'cgroup_marker': marker,
-                                     'member_ids': [], 'generation': 3}}, sort_keys=True))
+                                     'member_ids': [], 'generation': 3}}, sort_keys=True)))
             ids.append(run_id)
+        if one_by_one:
+            for run_id, document in rows:
+                store.add(run_id, BOOT)
+                store.state(run_id, 'terminated', '')
+                store.control_put(run_id, document)
+        else:
+            now = time.time()
+            with store._write() as db:
+                db.execute(daemon_module._CONTROL_TABLE)
+                for run_id, document in rows:
+                    db.execute('INSERT INTO runs VALUES (?, ?, 0, ?, ?, ?, ?, ?)',
+                               (run_id, f'recursion-run-{run_id}.service', 'terminated', BOOT, '', now, now))
+                    db.execute('INSERT OR REPLACE INTO control_runs VALUES (?, ?)', (run_id, document))
         store.close()
         return ids
+
+    def test_the_one_commit_seed_writes_the_rows_the_per_run_calls_write(self):
+        """The rows ``all`` and ``control_all`` return match, and the calls are the ones named above.
+
+        ``created`` and ``updated`` are not in that read and are not asserted equal.
+        """
+        calls = {'add': 0, 'state': 0, 'control_put': 0, 'write': 0}
+        state_args = []
+        real_add, real_state = Registry.add, Registry.state
+        real_put, real_write = Registry.control_put, Registry._write
+
+        def counting_add(self, run_id, boot_id):
+            calls['add'] += 1
+            return real_add(self, run_id, boot_id)
+
+        def counting_state(self, run_id, value, detail=''):
+            calls['state'] += 1
+            state_args.append((value, detail))
+            return real_state(self, run_id, value, detail)
+
+        def counting_put(self, run_id, document):
+            calls['control_put'] += 1
+            return real_put(self, run_id, document)
+
+        @contextlib.contextmanager
+        def counting_write(self):
+            calls['write'] += 1
+            with real_write(self) as db:
+                yield db
+
+        def planted(flag):
+            for key in calls:
+                calls[key] = 0
+            state_args.clear()
+            state = self.tmp / f'seed-{flag}'
+            if flag is None:
+                self.seed_settled_runs(5, state=state)
+            else:
+                self.seed_settled_runs(5, state=state, one_by_one=flag)
+            return dict(calls), list(state_args), state
+
+        def read_back(state):
+            store = Registry(state)
+            try:
+                return store.all(), store.control_all()
+            finally:
+                store.close()
+
+        with mock.patch.object(Registry, 'add', counting_add), \
+                mock.patch.object(Registry, 'state', counting_state), \
+                mock.patch.object(Registry, 'control_put', counting_put), \
+                mock.patch.object(Registry, '_write', counting_write):
+            per_run, per_args, per_state = planted(True)
+            batched, _, batch_state = planted(False)
+            default, _, default_state = planted(None)
+        per_rows = read_back(per_state)
+        self.assertEqual(per_rows, read_back(batch_state))
+        self.assertEqual(per_rows, read_back(default_state))
+        self.assertEqual({run.state for run in per_rows[0]}, {'terminated'})
+        self.assertEqual(per_run, {'add': 5, 'state': 5, 'control_put': 5, 'write': 15})
+        self.assertEqual(per_args, [('terminated', '')] * 5)
+        self.assertEqual(batched, {'add': 0, 'state': 0, 'control_put': 0, 'write': 1})
+        self.assertEqual(default, {'add': 0, 'state': 0, 'control_put': 0, 'write': 1})
 
     @staticmethod
     def unpaged_list(composed):

@@ -24,21 +24,31 @@ Two cases, one for each way the daemon can see the unit after the hard end:
 
 The cases start units in the caller's user manager, so they run only when ``LIVE_CELLS_ENV`` is
 set to 1, a systemd user manager answers and its systemd-run can pass argv verbatim (the launcher
-refuses an older one). Everywhere else they skip and say why. They end only what they started:
-their own grandchild, through a pidfd and after the stand-in's mark is read again, and their own
-units by exact name. A cleanup that had to end a survivor fails the case.
+refuses an older one). Everywhere else they skip and say why.
 
-Whatever ends a case, even a kill of the test run itself, it leaves nothing behind:
-* each run of a case draws a token. Its folder is the runtime directory of a holder unit of its own
-  (``HOLDER_PREFIX``), whose description carries the token; the folder holds a marker file with the
-  same token and a list of the run units by exact name; the stand-in's mark ends with the token;
-* the holder's one process waits on a pidfd of the test process. When the test process ends, the
-  holder stops and resets each listed run unit whose command line carries the mark, by that exact
-  name, then ends; systemd removes the holder's folder and unit (``--collect``);
-* at the start, a holder of an earlier run whose test process is gone is removed only when its
-  description and its folder's marker file carry the same token. Nothing is removed by a name
-  alone: a unit or folder with a like name and no matching token is left and named in the output.
-  The case never deletes a folder itself; systemd removes a holder's folder with the holder.
+They look for nothing of an earlier run: no step lists units or folders, reads a list file or
+matches a token. A case ends only what this test process started, by the names it holds in its own
+memory: its grandchild through a pidfd, after the stand-in's mark is read again, and its own units,
+each name made here from a fixed prefix and random hex (the run unit's from the run id the control
+API draws) and checked against ``UNIT_NAME`` before every call, which hands it to systemctl after
+``--`` so that it is read neither as a pattern nor as an option. A cleanup that had to end a
+survivor fails the case.
+
+When the test process is ended from outside, what it started ends by itself, through properties
+set on the case's own helper units when they start:
+* the holder ``<HOLDER_PREFIX><hex>.service``: its runtime directory is the case's folder; its one
+  process waits on a pidfd of the test process and then exits; ``--collect`` makes systemd unload
+  it and remove the folder; ``RuntimeMaxSec`` bounds it;
+* in the person's case, the run helper ``<HOLDER_PREFIX><hex>-run.service``, started before the run
+  with ``PropagatesStopTo=`` the run unit: it waits the same way, and when it ends, systemd stops
+  the run unit. The run unit itself carries nothing of the test's own; systemd shows the helper on
+  it as ``StopPropagatedFrom``;
+* in the unit-gone case, the run unit's own ``RuntimeMaxSec`` and ``CollectMode``, which that case
+  sets anyway (a run helper there would keep the stopped unit loaded and hide the branch it drives).
+What may stay behind: a run unit whose stop needed the hard end stays loaded and failed in the user
+manager (the person's case; the unit-gone case's is unloaded). Each case prints its units' names
+when the run starts, with the one command that removes such a unit:
+``systemctl --user reset-failed -- recursion-run-<run id>.service``.
 """
 import os
 from pathlib import Path
@@ -57,26 +67,29 @@ LIVE_CELLS_ENV = 'RECURSION_USER_MANAGER_CELLS'
 # Test values (none is a figure of the product).
 STANDIN_LIFE_S = 45          # every stand-in process ends by itself after this
 UNIT_TASKS_MAX = 16          # TasksMax of the run unit in the unit-gone case
-UNIT_RUNTIME_MAX_S = 50      # RuntimeMaxSec of the run unit in the unit-gone case
-CASE_TIMEOUT_S = 90          # each case, start to cleanup
+UNIT_RUNTIME_MAX_S = 25      # RuntimeMaxSec of the run unit in the unit-gone case
+CASE_TIMEOUT_S = 90          # each stop case, start to cleanup
 CONFIRM_TIMEOUT_S = 10.0     # confirm_timeout_s handed to the control API
 STOP_MARGIN_S = 3.0          # scheduling slack on top of the unit's own TimeoutStopSec
 WAIT_FILE_S = 15.0           # how long the stand-in's pid files are waited for
-CALL_TIMEOUT_S = 20          # each systemctl or systemd-run call of the test and of the holder
-HOLDER_TASKS_MAX = 4         # TasksMax of the holder unit (its waiting process and its systemctl calls)
-HOLDER_MARGIN_S = 30         # the holder's RuntimeMaxSec is CASE_TIMEOUT_S plus this
-PLANTED_LIFE_S = 60          # every unit the sweep case plants ends by itself after this
-PLANTED_TASKS_MAX = 2        # TasksMax of each planted unit
+CALL_TIMEOUT_S = 20          # each systemctl or systemd-run call of the test
+HOLDER_TASKS_MAX = 2         # TasksMax of each helper unit (its one waiting process)
+HOLDER_MARGIN_S = 30         # a helper's RuntimeMaxSec is CASE_TIMEOUT_S plus this
+DECOY_CASE_TIMEOUT_S = 300   # the decoy case, with its two runs of a stop case in a child process
+PLANTED_LIFE_S = 330         # every decoy unit ends by itself after this
+PLANTED_TASKS_MAX = 2        # TasksMax of each decoy unit
+KILLED_END_S = UNIT_RUNTIME_MAX_S + 15.0  # after a unit-gone run is ended from outside, how long its units have
 
-# The name of this case's holder units and folders: <prefix><test pid>-<random hex>.
+# The names of this case's helper units and folders: <prefix><random hex>, and <...>-run for a run helper.
 HOLDER_PREFIX = 'rc-stop-real-live-'
-# The holder's description: these words, a space, and the run's token (32 hex digits).
-HOLDER_DESCRIPTION = 'recursion live Stop case holder, token'
-# In the holder's folder: the marker file with the token, and the run units by exact name.
-OWNER_FILE = 'rc-stop-real-live.owner'
-UNITS_FILE = 'rc-stop-real-live.units'
-# The stand-in's mark: this prefix and the run's token.
+# The stand-in's mark: this prefix and random hex, drawn for each case.
 MARK_PREFIX = 'rc-stop-real-'
+# Every unit name the test hands to systemctl or systemd-run: letters, digits, dashes and dots only,
+# a letter or digit first, ending in .service. No *, ?, [ or \ (a pattern), no leading dash (an option).
+UNIT_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9.-]*\.service')
+# The line each stop case prints when its run starts: its units, its mark, and what to do after a kill.
+NAMES_LINE = 'rc-stop-real-live units:'
+_NAMES = re.compile(re.escape(NAMES_LINE) + r' (\S+) (\S+) mark: (\S+?)\.')
 
 # What a person relies on when they press Stop, as systemd must report it for the run unit.
 # Written out here, not read from the launcher, so that a change of the launcher's values turns
@@ -141,38 +154,23 @@ os.rename(out + ".main.tmp", out + ".main")
 time.sleep(life)
 '''
 
-# The holder's one process. argv: <test pid> <units file> <mark> <call timeout>. It waits until
-# the test process has ended; then it stops and resets each run unit named in the units file, by
-# that exact name, when the unit's command line carries the mark; then it exits.
+# A helper unit's one process. argv: <test pid>. It waits until the test process has ended, then
+# exits; what follows (the folder removed, the run unit stopped) is systemd's, from the properties
+# the helper was started with. It reads no file and calls nothing.
 HOLDER_WAIT = r'''
-import os, select, subprocess, sys
-test_pid, units_file, mark, timeout = int(sys.argv[1]), sys.argv[2], sys.argv[3], float(sys.argv[4])
-fd = os.pidfd_open(test_pid)
-select.select([fd], [], [])
-def ctl(*args):
-    try:
-        return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True,
-                              timeout=timeout).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
+import os, select, sys
 try:
-    with open(units_file) as f:
-        names = f.read().split()
+    fd = os.pidfd_open(int(sys.argv[1]))
 except OSError:
-    names = []
-for unit in names:
-    if mark in ctl("show", "-p", "ExecStart", "--value", "--", unit):
-        ctl("stop", "--", unit)
-        ctl("reset-failed", "--", unit)
+    sys.exit(0)
+select.select([fd], [], [])
 '''
 
-# A planted unit's one process: it sleeps argv[1] seconds; further arguments only mark it.
+# A decoy unit's one process: it sleeps argv[1] seconds; further arguments only mark it.
 PLANTED_WAIT = 'import sys, time; time.sleep(float(sys.argv[1]))'
 
 _DURATION = re.compile(r'(\d+(?:\.\d+)?)(us|ms|min|s)')
 _SCALE = {'us': 1e-6, 'ms': 1e-3, 's': 1.0, 'min': 60.0}
-_HOLDER_NAME = re.compile(re.escape(HOLDER_PREFIX) + r'(\d+)-[0-9a-f]+')
-_TOKEN = re.compile(r'[0-9a-f]{32}')
 
 
 def systemd_seconds(text):
@@ -183,9 +181,22 @@ def systemd_seconds(text):
     return sum(float(n) * _SCALE[u] for n, u in parts)
 
 
+def checked_unit(unit):
+    """``unit`` when it is a plain unit name of this test (``UNIT_NAME``); otherwise ValueError."""
+    if not isinstance(unit, str) or not UNIT_NAME.fullmatch(unit):
+        raise ValueError(f'refused to hand {unit!r} to systemctl: a unit name of this test has only letters, '
+                         'digits, dashes and dots, begins with a letter or digit and ends in .service')
+    return unit
+
+
 def _user_systemctl(*args):
     return subprocess.run(['systemctl', '--user', *args], capture_output=True, text=True,
                           timeout=CALL_TIMEOUT_S, check=False)
+
+
+def unit_call(verb, unit, *options):
+    """``systemctl --user <verb> <options> -- <unit>`` for one plain unit name, checked first."""
+    return _user_systemctl(verb, *options, '--', checked_unit(unit))
 
 
 def runtime_dir():
@@ -211,6 +222,7 @@ def live_gate():
     if not runtime_dir().is_dir():
         return (f'the user manager\'s runtime folder {runtime_dir()} is missing; set XDG_RUNTIME_DIR to it '
                 '(this case keeps its files there so that they go when the case ends)')
+    # The launcher's floor (254) is above the 249 that PropagatesStopTo needs.
     from recursion_core.daemon.launcher import VERBATIM_ARGV_MIN_SYSTEMD
     try:
         text = subprocess.run(['systemd-run', '--version'], capture_output=True, text=True,
@@ -253,19 +265,8 @@ def pidfd_ended(fd):
 
 
 def unit_props(unit, names):
-    text = _user_systemctl('show', '-p', ','.join(names), '--', unit).stdout
+    text = unit_call('show', unit, '-p', ','.join(names)).stdout
     return dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
-
-
-def holder_description(token):
-    return f'{HOLDER_DESCRIPTION} {token}'
-
-
-def holder_token(unit):
-    """The token in a holder unit's description, or None when it carries none."""
-    text = unit_props(unit, ['Description']).get('Description', '')
-    head, _, token = text.rpartition(' ')
-    return token if head == HOLDER_DESCRIPTION and _TOKEN.fullmatch(token) else None
 
 
 def own_folder(folder):
@@ -278,82 +279,26 @@ def own_folder(folder):
             and not info.st_mode & 0o077)
 
 
-def read_own_file(folder, name, limit=4096):
-    """A regular file of an own folder, read without following a link; None when there is none."""
-    if not own_folder(folder):
-        return None
-    try:
-        fd = os.open(folder / name, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
-        return None
-    try:
-        info = os.fstat(fd)
-        if not (info.st_mode & 0o170000 == 0o100000) or info.st_uid != os.getuid():
-            return None
-        return os.read(fd, limit).decode('utf-8', 'replace')
-    finally:
-        os.close(fd)
-
-
-def write_own_file(folder, name, text, append=False):
-    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if append else os.O_EXCL)
-    fd = os.open(folder / name, flags, 0o600)
+def write_own_file(folder, name, text):
+    fd = os.open(folder / name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_EXCL, 0o600)
     try:
         os.write(fd, text.encode())
     finally:
         os.close(fd)
 
 
-def remove_leftovers():
-    """Remove what an earlier run of this case left when its test process was ended from outside.
-
-    A holder unit counts as this case's own only when its name has the holder form, its test
-    process is gone, its description carries a token and its folder (the holder's runtime
-    directory, a private folder of this user) holds the marker file with that same token. Then the
-    run units its folder lists are stopped and reset by exact name, each only when its command line
-    carries the stand-in mark with that token, and the holder unit is stopped and reset, which makes
-    systemd remove its folder. Everything else with a like name is left as it is.
-
-    Returns (removed, left): the names removed, and each name left with the reason.
-    """
-    removed, left, seen = [], [], set()
-    listing = _user_systemctl('list-units', '--all', '--plain', '--no-legend', '--', HOLDER_PREFIX + '*').stdout
-    for line in listing.splitlines():
-        unit = (line.split() or [''])[0]
-        name = unit[:-len('.service')] if unit.endswith('.service') else unit
-        seen.add(name)
-        found = _HOLDER_NAME.fullmatch(name) if unit.endswith('.service') else None
-        if found is None:
-            left.append(f'{unit}: not a name of this case\'s holders')
-            continue
-        pid = int(found.group(1))
-        if pid == os.getpid() or alive(pid):
-            left.append(f'{unit}: its test process {pid} is still running')
-            continue
-        token = holder_token(unit)
-        folder = runtime_dir() / name
-        if token is None:
-            left.append(f'{unit}: its description carries no token of this case')
-            continue
-        if (read_own_file(folder, OWNER_FILE) or '').strip() != token:
-            left.append(f'{unit}: its folder holds no marker file with its token')
-            continue
-        mark = MARK_PREFIX + token
-        for run_unit in (read_own_file(folder, UNITS_FILE) or '').split():
-            command = _user_systemctl('show', '-p', 'ExecStart', '--value', '--', run_unit).stdout
-            if mark not in command:
-                left.append(f'{run_unit}: listed by {unit} but its command line carries no mark of it')
-                continue
-            _user_systemctl('stop', '--', run_unit)
-            _user_systemctl('reset-failed', '--', run_unit)
-            removed.append(run_unit)
-        _user_systemctl('stop', '--', unit)
-        _user_systemctl('reset-failed', '--', unit)
-        removed.append(unit)
-    for entry in sorted(runtime_dir().glob(HOLDER_PREFIX + '*')):
-        if entry.name not in seen:
-            left.append(f'{entry}: a folder with no holder unit of this case, so no token to match')
-    return removed, left
+def start_helper(unit, *, folder=None, propagates_stop_to=None):
+    """Start one helper unit of this test; it ends when this test process ends, or at its RuntimeMaxSec."""
+    command = ['systemd-run', '--user', '--quiet', '--collect', '--unit=' + checked_unit(unit),
+               '--description=recursion live Stop case helper', '--service-type=exec',
+               f'--property=TasksMax={HOLDER_TASKS_MAX}',
+               f'--property=RuntimeMaxSec={CASE_TIMEOUT_S + HOLDER_MARGIN_S}']
+    if folder is not None:
+        command += ['--property=RuntimeDirectory=' + folder, '--property=RuntimeDirectoryMode=0700']
+    if propagates_stop_to is not None:
+        command.append('--property=PropagatesStopTo=' + checked_unit(propagates_stop_to))
+    return subprocess.run([*command, '--', sys.executable, '-I', '-c', HOLDER_WAIT, str(os.getpid())],
+                          capture_output=True, text=True, timeout=CALL_TIMEOUT_S, check=False)
 
 
 def dead_pid():
@@ -363,6 +308,16 @@ def dead_pid():
     return done.pid
 
 
+def child_python():
+    """This interpreter with the flags it runs under, for a test run in a child process."""
+    flags = ['-B']
+    if sys.flags.utf8_mode:
+        flags += ['-X', 'utf8']
+    if getattr(sys, '_is_gil_enabled', None) is not None and not sys._is_gil_enabled():
+        flags += ['-X', 'gil=0']
+    return [sys.executable, *flags]
+
+
 class _CaseTimeout(Exception):
     pass
 
@@ -370,13 +325,27 @@ class _CaseTimeout(Exception):
 GATE = live_gate()
 
 
-def _arm_case_timeout(case):
+def _arm_case_timeout(case, seconds=CASE_TIMEOUT_S):
     def timed_out(signum, frame):
-        raise _CaseTimeout(f'the live case passed {CASE_TIMEOUT_S} s')
+        raise _CaseTimeout(f'the live case passed {seconds} s')
     previous = signal.signal(signal.SIGALRM, timed_out)
-    signal.setitimer(signal.ITIMER_REAL, CASE_TIMEOUT_S)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
     case.addCleanup(signal.signal, signal.SIGALRM, previous)
     case.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+
+
+class UnitNameRuleTests(unittest.TestCase):
+    """A name that systemctl could read as a pattern or an option never reaches it."""
+
+    def test_only_plain_unit_names_are_handed_on(self):
+        for good in ('rc-stop-real-live-0a1b2c3d4e5f6071.service', 'recursion-run-run-0f1e2d3c.service',
+                     'rc-stop-real-live-0a1b2c3d4e5f6071-run.service', 'a.b-c.service'):
+            self.assertEqual(checked_unit(good), good)
+        for bad in ('*', 'recursion-run-*', 'recursion-run-*.service', 'rc-stop-?.service', 'rc-[ab].service',
+                    'rc\\x2d.service', '-H.service', '--all.service', 'a b.service', 'a_b.service', 'a/b.service',
+                    'rc-stop-real-live-0a1b', '.service', '', None, 'a.service\n', 'a.service b.service'):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                checked_unit(bad)
 
 
 @unittest.skipIf(GATE is not None, GATE or '')
@@ -385,20 +354,19 @@ class StopOnTheRealPathTests(unittest.TestCase):
         from recursion_core.daemon import launcher
 
         _arm_case_timeout(self)
-        removed, left = remove_leftovers()
-        self.leftovers_removed = removed
-        if left:
-            print('\nleft as they are (not this case\'s): ' + '; '.join(left), file=sys.stderr)
-        self.token = secrets.token_hex(16)
-        self.mark = MARK_PREFIX + self.token
+        self.mark = MARK_PREFIX + secrets.token_hex(16)
+        self.units, self.helpers, self.pidfds, self.processes = [], [], [], []
         self.tmp = self._start_holder()
-        self.units, self.pidfds, self.processes = [], [], []
         self.addCleanup(self._end_own)
         self.launcher_module = launcher
         self.detach = '1'
 
-    def compose(self, manager):
-        """The daemon and the control API over ``manager``, as the product composes them."""
+    def compose(self, manager, *, run_helper):
+        """The daemon and the control API over ``manager``, as the product composes them.
+
+        ``run_helper``: each run gets a run helper whose end stops the run unit (see the module text).
+        """
+        self.run_helper = run_helper
         from recursion_core.daemon import Daemon, Registry
         from recursion_core.daemon.control_adapter import DurableRunRegistry, pid_alive
         from recursion_core.control.api import ControlAPI
@@ -413,48 +381,52 @@ class StopOnTheRealPathTests(unittest.TestCase):
 
     def _start_holder(self):
         """Start this case's holder unit; its runtime directory is the case's folder, gone with the unit."""
-        name = f'{HOLDER_PREFIX}{os.getpid()}-{secrets.token_hex(6)}'
-        self.holder_unit = name + '.service'
+        name = f'{HOLDER_PREFIX}{secrets.token_hex(8)}'
+        self.holder_unit = checked_unit(name + '.service')
         folder = runtime_dir() / name
-        done = subprocess.run(
-            ['systemd-run', '--user', '--quiet', '--collect', '--unit=' + self.holder_unit,
-             '--description=' + holder_description(self.token),
-             '--service-type=exec', '--property=RuntimeDirectory=' + name,
-             '--property=RuntimeDirectoryMode=0700', f'--property=TasksMax={HOLDER_TASKS_MAX}',
-             f'--property=RuntimeMaxSec={CASE_TIMEOUT_S + HOLDER_MARGIN_S}',
-             '--', sys.executable, '-I', '-c', HOLDER_WAIT, str(os.getpid()), str(folder / UNITS_FILE),
-             self.mark, str(CALL_TIMEOUT_S)],
-            capture_output=True, text=True, timeout=CALL_TIMEOUT_S, check=False)
         self.addCleanup(self._stop_holder, folder)
+        done = start_helper(self.holder_unit, folder=name)
         if done.returncode != 0 or not folder.is_dir():
             self.fail(f'the holder unit {self.holder_unit} did not start with its folder {folder}: '
                       f'{done.stderr.strip() or done.returncode}')
         if not own_folder(folder):
             self.fail(f'{folder} is not a private folder of this user')
-        write_own_file(folder, OWNER_FILE, self.token + '\n')
         return folder
 
     def _stop_holder(self, folder):
-        _user_systemctl('stop', '--', self.holder_unit)
-        _user_systemctl('reset-failed', '--', self.holder_unit)
+        unit_call('stop', self.holder_unit)
+        unit_call('reset-failed', self.holder_unit)
         left = unit_props(self.holder_unit, ['LoadState']).get('LoadState')
         if left != 'not-found' or folder.exists():
             self.fail(f'after the case the holder unit reads {left} and its folder is '
                       f'{"still there" if folder.exists() else "gone"}')
 
     def start_run(self, params):
-        """The control API's starter: one launch through ProductionLauncher, bound to the API's run id."""
+        """The control API's starter: one launch through ProductionLauncher, bound to the API's run id.
+
+        Before the launch it starts the run helper (when the case has one), whose PropagatesStopTo
+        names the run unit, so that systemd stops the run unit if this test process ends first.
+        """
         launcher = self.launcher_module
         run_id = params['run_id']
-        unit = f'recursion-run-{run_id}.service'
+        unit = checked_unit(f'recursion-run-{run_id}.service')
+        helper = 'none'
+        if self.run_helper:
+            helper = checked_unit(f'{HOLDER_PREFIX}{secrets.token_hex(8)}-run.service')
+            self.helpers.append(helper)
+            done = start_helper(helper, propagates_stop_to=unit)
+            if done.returncode != 0:
+                raise RuntimeError(f'the run helper {helper} did not start: {done.stderr.strip() or done.returncode}')
         self.units.append(unit)
-        write_own_file(self.tmp, UNITS_FILE, unit + '\n', append=True)
         out = self.tmp / 'standin.pid'
         argv = [sys.executable, '-I', '-c', STANDIN, str(out), self.mark, str(STANDIN_LIFE_S), self.detach]
         ctx = launcher.RunContext(run_id)
         with launcher.bound_run(ctx):
             process = self.launch(argv, env={'PATH': '/usr/bin:/bin'})
         self.processes.append(process)
+        print(f'\n{NAMES_LINE} {self.holder_unit} {unit} mark: {self.mark}. Run helper: {helper}. If this test '
+              'run is ended from outside, these units end by themselves; the run unit may then stay failed in your '
+              f'user manager: remove it with systemctl --user reset-failed -- {unit}', file=sys.stderr, flush=True)
         return {'cgroup': ctx.cgroup}
 
     def wait_file(self, path):
@@ -475,7 +447,7 @@ class StopOnTheRealPathTests(unittest.TestCase):
         return fd
 
     def _end_own(self):
-        """End what this case started and is still there, by exact name. Ending a survivor fails the case."""
+        """End what this case started and is still there, by the names it holds. Ending a survivor fails the case."""
         ended = []
         for pid, fd in self.pidfds:
             if not pidfd_ended(fd) and carries_mark(pid, self.mark):
@@ -484,10 +456,11 @@ class StopOnTheRealPathTests(unittest.TestCase):
             os.close(fd)
         for process in self.processes:
             process.close()
-        for unit in self.units:
-            _user_systemctl('stop', '--', unit)
-            _user_systemctl('reset-failed', '--', unit)
-        left = [unit for unit in self.units if unit_props(unit, ['LoadState']).get('LoadState') != 'not-found']
+        for unit in (*self.units, *self.helpers):
+            unit_call('stop', unit)
+            unit_call('reset-failed', unit)
+        left = [unit for unit in (*self.units, *self.helpers)
+                if unit_props(unit, ['LoadState']).get('LoadState') != 'not-found']
         if ended or left:
             self.fail(f'cleanup had to end stand-in pids {ended}; units still loaded: {left}')
 
@@ -499,7 +472,7 @@ class StopOnTheRealPathTests(unittest.TestCase):
         started = self.api.call('run.start', {'tenant': 'live-stop', 'engine': 'claude_code', 'prompt': 'stand-in'})
         self.assertEqual(started.get('code'), 'started', started)
         run_id = started['run_id'] if 'run_id' in started else started['run']['run_id']
-        unit = f'recursion-run-{run_id}.service'
+        unit = checked_unit(f'recursion-run-{run_id}.service')
         group, _main = self.manager.unit_identity(unit)
         self.assertTrue(group, 'systemd names no control group for the run unit')
         self.assertEqual(self.registry.get(run_id).get('cgroup'), group,
@@ -510,8 +483,11 @@ class StopOnTheRealPathTests(unittest.TestCase):
         gfd = self.own_pidfd(gpid)
         self.own_pidfd(mpid)
         props = unit_props(unit, ['KillMode', 'KillSignal', 'TimeoutStopUSec', 'SendSIGKILL', 'Delegate',
-                                  'CollectMode', 'BindsTo'])
+                                  'CollectMode', 'BindsTo', 'StopPropagatedFrom'])
 
+        self.assertEqual(props.get('StopPropagatedFrom'), self.helpers[-1] if self.run_helper else '',
+                         'the run unit must be stopped by systemd when the case\'s run helper ends, and be '
+                         f'bound from nothing else: {props}')
         self.assertTrue(alive(gpid), 'the grandchild must be alive before Stop')
         self.assertEqual((gsid, gpgrp), (gpid, gpid), 'the grandchild must lead a session of its own')
         self.assertNotEqual(gsid, msid, 'the grandchild must be outside the main\'s session')
@@ -556,7 +532,7 @@ class StopOnTheRealPathTests(unittest.TestCase):
 
     def test_stop_answers_stopped_only_once_a_detached_grandchild_is_gone(self):
         # The person's branch: the run unit exactly as the product starts it, loaded and failed after Stop.
-        self.compose(self.launcher_module.EngineUnitManager())
+        self.compose(self.launcher_module.EngineUnitManager(), run_helper=True)
         unit, props = self.drive_stop()
         after = unit_props(unit, list(AFTER_HARD_END))
         self.assertEqual(after, AFTER_HARD_END,
@@ -581,7 +557,7 @@ class StopOnTheRealPathTests(unittest.TestCase):
                                                   'CollectMode=inactive-or-failed'),
                                 working_directory=working_directory)
 
-        self.compose(CollectedUnitManager())
+        self.compose(CollectedUnitManager(), run_helper=False)
         unit, props = self.drive_stop()
         self.assertEqual(props.get('CollectMode'), 'inactive-or-failed', props)
         after = unit_props(unit, list(AFTER_COLLECT))
@@ -591,86 +567,138 @@ class StopOnTheRealPathTests(unittest.TestCase):
 
 
 @unittest.skipIf(GATE is not None, GATE or '')
-class LeftoverSweepTests(unittest.TestCase):
-    """The start sweep removes a leftover only when it carries this case's token, nothing by its name alone."""
+class LikeNamedDecoyTests(unittest.TestCase):
+    """Units and folders with like names, copied marks and a pattern in a list file are left alone.
+
+    The decoys are this case's own units, each one sleeping process that ends by itself. A stop case
+    runs in a child process twice: once to its end, once ended from outside (SIGKILL) as soon as its
+    run has started (the unit-gone case, whose run unit nothing of the test is left to stop but its own
+    bounds). After each, every decoy must still be active with its files as they were; after the
+    kill, the child's own units must end by themselves within ``KILLED_END_S``.
+    """
 
     def setUp(self):
-        _arm_case_timeout(self)
-        self.planted = []
+        _arm_case_timeout(self, DECOY_CASE_TIMEOUT_S)
+        self.planted, self.decoys = [], []
         self.addCleanup(self._end_planted)
 
     def plant(self, unit, argv, *, description=None, folder=None, files=()):
-        """Start a unit of this case that ends by itself, with a private runtime folder holding ``files``."""
-        command = ['systemd-run', '--user', '--quiet', '--collect', '--unit=' + unit, '--service-type=exec',
-                   f'--property=TasksMax={PLANTED_TASKS_MAX}',
-                   f'--property=RuntimeMaxSec={PLANTED_LIFE_S + HOLDER_MARGIN_S}']
+        """Start a decoy unit that ends by itself, with a private runtime folder holding ``files``."""
+        command = ['systemd-run', '--user', '--quiet', '--collect', '--unit=' + checked_unit(unit),
+                   '--service-type=exec', f'--property=TasksMax={PLANTED_TASKS_MAX}',
+                   f'--property=RuntimeMaxSec={PLANTED_LIFE_S}']
         if description is not None:
             command.append('--description=' + description)
         if folder is not None:
             command += ['--property=RuntimeDirectory=' + folder, '--property=RuntimeDirectoryMode=0700']
+        self.planted.append((unit, folder))
         done = subprocess.run([*command, '--', sys.executable, '-I', '-c', PLANTED_WAIT, str(PLANTED_LIFE_S), *argv],
                               capture_output=True, text=True, timeout=CALL_TIMEOUT_S, check=False)
-        self.planted.append((unit, folder))
         if done.returncode != 0:
             self.fail(f'could not plant {unit}: {done.stderr.strip() or done.returncode}')
         for name, text in files:
             write_own_file(runtime_dir() / folder, name, text)
+        self.decoys.append((unit, folder, tuple(files)))
 
     def _end_planted(self):
         for unit, _folder in self.planted:
-            _user_systemctl('stop', '--', unit)
-            _user_systemctl('reset-failed', '--', unit)
+            unit_call('stop', unit)
+            unit_call('reset-failed', unit)
         left = [unit for unit, _f in self.planted if unit_props(unit, ['LoadState']).get('LoadState') != 'not-found']
         folders = [f for _u, f in self.planted if f is not None and (runtime_dir() / f).exists()]
         if left or folders:
-            self.fail(f'after the case these planted units are still loaded: {left}; folders still there: {folders}')
+            self.fail(f'after the case these decoy units are still loaded: {left}; folders still there: {folders}')
 
-    def active(self, unit):
-        return unit_props(unit, ['ActiveState']).get('ActiveState') == 'active'
+    def assert_untouched(self, when):
+        for unit, folder, files in self.decoys:
+            state = unit_props(unit, ['ActiveState']).get('ActiveState')
+            self.assertEqual(state, 'active', f'{when}: the decoy {unit} reads {state}')
+            for name, text in files:
+                self.assertEqual((runtime_dir() / folder / name).read_text(), text,
+                                 f'{when}: the file {name} of the decoy {unit} changed')
 
-    def test_the_start_sweep_removes_only_what_carries_this_cases_token(self):
+    def child_case(self, test):
+        module = getattr(sys.modules[__name__], '__spec__', None)
+        module = module.name if module is not None else __name__
+        return [*child_python(), '-m', 'unittest', f'{module}.StopOnTheRealPathTests.{test}']
+
+    def test_like_named_units_and_folders_are_left_alone_by_a_run_and_by_a_killed_run(self):
         dead = dead_pid()
         self.assertFalse(alive(dead))
-        own_token, wrong_token, lone_token = (secrets.token_hex(16) for _ in range(3))
-        name = lambda: f'{HOLDER_PREFIX}{dead}-{secrets.token_hex(6)}'
-        own, no_mark, wrong, lone = name(), name(), name(), name()
-        own_run = f'rc-stop-planted-run-{secrets.token_hex(6)}.service'
-        foreign_run = f'rc-stop-planted-run-{secrets.token_hex(6)}.service'
-        lone_unit = f'rc-stop-planted-{secrets.token_hex(6)}.service'
+        # Every decoy name begins with a stem drawn here; the pattern in the list file below covers only
+        # these decoys, so that even a code that read it as a pattern could reach nothing else.
+        stem = f'{HOLDER_PREFIX}{dead}-{secrets.token_hex(4)}'
+        copied = secrets.token_hex(16)
+        copied_mark = MARK_PREFIX + copied
+        like_run = f'recursion-run-run-{secrets.token_hex(16)}.service'
+        holder_form = stem + '01'
+        # The form a holder had in earlier versions of this case: holder name with an ended pid, its
+        # description and its folder's marker with one token, a list file naming a pattern and a run unit.
+        self.plant(holder_form + '.service', [copied_mark], description=f'recursion live Stop case holder, token {copied}',
+                   folder=holder_form,
+                   files=[('rc-stop-real-live.owner', copied + '\n'),
+                          ('rc-stop-real-live.units', f'{stem}*\n{like_run}\n'),
+                          ('data', 'someone else\'s data\n')])
+        self.plant(stem + '02.service', [copied_mark])
+        self.plant(stem + '03.service', ['not-marked'], folder=stem + '03', files=[('data', 'someone else\'s data\n')])
+        # A unit named like a run unit, and one named like a run helper, with folders and data.
+        self.plant(like_run, [copied_mark])
+        like_helper = f'{HOLDER_PREFIX}{secrets.token_hex(8)}-run'
+        self.plant(like_helper + '.service', [copied_mark], description='recursion live Stop case helper',
+                   folder=like_helper, files=[('data', 'someone else\'s data\n')])
+        # A folder with a like name under a unit of another name.
+        lone = f'{HOLDER_PREFIX}{secrets.token_hex(8)}'
+        self.plant(f'rc-stop-planted-{secrets.token_hex(6)}.service', [], folder=lone,
+                   files=[('rc-stop-real-live.owner', copied + '\n'), ('data', 'someone else\'s data\n')])
 
-        # A leftover of this case: holder name, dead test pid, description and marker with one token,
-        # and a listed run unit that carries the mark. Beside it a listed run unit with no mark.
-        self.plant(own_run, [MARK_PREFIX + own_token])
-        self.plant(foreign_run, ['not-marked'])
-        self.plant(own + '.service', [], description=holder_description(own_token), folder=own,
-                   files=[(OWNER_FILE, own_token + '\n'), (UNITS_FILE, f'{own_run}\n{foreign_run}\n'),
-                          ('data', 'leftover data\n')])
-        # A like name and no mark at all.
-        self.plant(no_mark + '.service', [], folder=no_mark, files=[('data', 'someone else\'s data\n')])
-        # A like name whose description token and folder marker differ.
-        self.plant(wrong + '.service', [], description=holder_description(wrong_token), folder=wrong,
-                   files=[(OWNER_FILE, own_token + '\n'), ('data', 'someone else\'s data\n')])
-        # A folder with a like name and a marker, but no unit of that name (its unit has another name).
-        self.plant(lone_unit, [], description=holder_description(lone_token), folder=lone,
-                   files=[(OWNER_FILE, lone_token + '\n'), ('data', 'someone else\'s data\n')])
+        env = dict(os.environ)
+        finished = subprocess.run(self.child_case('test_stop_answers_stopped_only_once_a_detached_grandchild_is_gone'),
+                                  capture_output=True, text=True, env=env, timeout=CASE_TIMEOUT_S + HOLDER_MARGIN_S,
+                                  check=False)
+        self.assertEqual(finished.returncode, 0, finished.stderr[-2000:])
+        self.assert_untouched('after a run of the person\'s case')
 
-        removed, left = remove_leftovers()
-        said = '\n'.join(left)
+        # Decoys with the finished run's own mark, holder name form and folder marker copied.
+        names = _NAMES.search(finished.stderr)
+        self.assertIsNotNone(names, f'the case did not print its units: {finished.stderr[-2000:]}')
+        ended_holder, _unit, ended_mark = names.groups()
+        copy_of = f'{HOLDER_PREFIX}{secrets.token_hex(8)}'
+        self.plant(copy_of + '.service', [ended_mark], description=f'recursion live Stop case helper {ended_mark}',
+                   folder=copy_of, files=[('rc-stop-real-live.owner', ended_mark + '\n'),
+                                          ('rc-stop-real-live.units', f'{stem}*\n{ended_holder}\n'),
+                                          ('data', 'someone else\'s data\n')])
 
-        self.assertEqual(unit_props(own + '.service', ['LoadState']).get('LoadState'), 'not-found', removed)
-        self.assertFalse((runtime_dir() / own).exists(), 'the leftover\'s folder must go with its holder')
-        self.assertEqual(unit_props(own_run, ['LoadState']).get('LoadState'), 'not-found', removed)
-
-        self.assertTrue(self.active(foreign_run), f'a listed run unit without the mark was stopped: {removed}')
-        self.assertIn(foreign_run, said)
-        for decoy in (no_mark, wrong):
-            self.assertTrue(self.active(decoy + '.service'), f'{decoy} was stopped: {removed}')
-            self.assertEqual((runtime_dir() / decoy / 'data').read_text(), 'someone else\'s data\n')
-            self.assertIn(decoy + '.service', said)
-            self.assertNotIn(decoy + '.service', removed)
-        self.assertTrue(self.active(lone_unit))
-        self.assertEqual((runtime_dir() / lone / 'data').read_text(), 'someone else\'s data\n')
-        self.assertIn(str(runtime_dir() / lone), said)
+        child = subprocess.Popen(self.child_case('test_stop_answers_stopped_when_systemd_has_unloaded_the_unit'),
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
+        said, deadline, found, running = b'', time.monotonic() + CASE_TIMEOUT_S, None, False
+        try:
+            while found is None and time.monotonic() < deadline and child.poll() is None:
+                if select.select([child.stderr], [], [], 1.0)[0]:
+                    said += os.read(child.stderr.fileno(), 65536)
+                    found = _NAMES.search(said.decode('utf-8', 'replace'))
+        finally:
+            running = child.poll() is None
+            child.kill()
+            child.communicate(timeout=CALL_TIMEOUT_S)
+        said = said.decode('utf-8', 'replace')
+        self.assertIsNotNone(found, f'the killed run never printed its units: {said[-2000:]}')
+        self.assertTrue(running, f'the child run ended before it could be ended from outside: {said[-2000:]}')
+        holder, unit, _mark = found.groups()
+        own = [checked_unit(holder), checked_unit(unit)]
+        # The kill must land while the run is up and before its Stop, so that what ends it is its own bounds.
+        at_kill = unit_props(unit, ['ActiveState']).get('ActiveState')
+        self.assertEqual(at_kill, 'active', f'the run unit read {at_kill} right after the kill: {said[-2000:]}')
+        deadline = time.monotonic() + KILLED_END_S
+        while time.monotonic() < deadline:
+            states = {u: unit_props(u, ['LoadState']).get('LoadState') for u in own}
+            if set(states.values()) == {'not-found'} and not (runtime_dir() / holder[:-len('.service')]).exists():
+                break
+            time.sleep(0.2)
+        self.assertEqual(set(states.values()), {'not-found'},
+                         f'after the test run was ended from outside, its units did not end by themselves: {states}')
+        self.assertFalse((runtime_dir() / holder[:-len('.service')]).exists(),
+                         'the killed run\'s folder is still there')
+        self.assert_untouched('after a run that was ended from outside')
 
 
 if __name__ == '__main__':

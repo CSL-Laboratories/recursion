@@ -172,6 +172,12 @@ class EveryPrintedCommandTests(_PlacesCase):
         texts.append(self.refused(lambda: self.call("quarantine_accept", PLUGIN, confirm=lambda _q: "yes")).detail)
         texts.extend(_texts(self.call("quarantine_list")))
         plugin.write_bytes(good)
+        # A held release that no longer counts as signed, after an unpin: its refusal names the ways on.
+        self.unpin(confirm=lambda _question: "yes")
+        data = self.live_json()
+        data["trusted_keys"] = {}
+        self.write_live(data)
+        texts.append(self.refused(lambda: self.call("quarantine_accept", PLUGIN, confirm=lambda _q: "yes")).detail)
         return texts
 
     @needs_crypto

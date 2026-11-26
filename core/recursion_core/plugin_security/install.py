@@ -102,6 +102,16 @@ release again and installs it only after the user's typed yes, with a new grant 
 ``quarantine_drop`` moves the held files into a kept place and names it. Nothing is accepted by a flag or a
 default.
 
+The accept question names the release's trust (the key that signs it, or that no key this install trusts
+does) and everything the release would get: each permission, network destination, credential reference and
+install script. A held release that no longer counts as signed (its key revoked in the state folder, taken off
+the trusted list, or a signature that does not check) is refused ``held_release_not_signed`` and nothing is
+written, with or without a pin; while a pin stands the refusal is ``update_unsigned_over_signed`` first, as for
+an install. Only the person may take that risk, for one named release: ``accept_unsigned`` (the command line's
+``--accept-unsigned``) naming the release's full artifact digest lets the question be asked, and only the typed
+yes then writes the grant, signer none and what the release requests except ``order``. A revoked key is refused
+even then. ``list`` says, in a row's ``grant``, when a plugin's permissions were granted that way.
+
 Every command this module prints for a person (``_command``) names the places the running command used: the
 profile with ``--config`` and the state folder with ``--state``, each as an absolute path quoted for the shell,
 unless it is the default place by the command line's one rule. A command run with no state folder prints no
@@ -655,11 +665,14 @@ def quarantine_list(config: os.PathLike | str, *, state: os.PathLike | str | Non
 
 @_typed_refusals
 def quarantine_accept(config: os.PathLike | str, plugin_id: str, *, state: os.PathLike | str | None = None,
-                      wait: bool = True, report_kept=None, confirm=None) -> dict:
+                      wait: bool = True, report_kept=None, confirm=None, accept_unsigned: str | None = None) -> dict:
     """Check the held release of ``plugin_id`` again and install it after the user's typed yes.
 
     The new grant holds what the release requests except ``order``. Any answer but ``yes``, or no
-    ``confirm``, writes nothing. A release that no longer passes the checks refuses as an install would.
+    ``confirm``, writes nothing. A release that no longer passes the checks refuses as an install would. A
+    release that no longer counts as signed refuses ``held_release_not_signed``, unless ``accept_unsigned``
+    is its full artifact digest and its key is not revoked: then the question says it is not signed, and only
+    the typed yes grants it. ``accept_unsigned`` comes from the person's own command line, nothing else.
     """
     _require_platform()
     config_path = Path(config)
@@ -691,14 +704,18 @@ def quarantine_accept(config: os.PathLike | str, plugin_id: str, *, state: os.Pa
         if refused:
             raise InstallRefused(refused[0]["code"], [item["code"] for item in refused])
         if plugin_id in snapshot.pins and trust_name != "signed":
-            raise _update_refused(manifest, snapshot.pins[plugin_id]["signer_key_id"], reason, signature_text,
-                                  places, _trusted_ids(snapshot))
+            refusal = _update_refused(manifest, snapshot.pins[plugin_id]["signer_key_id"], reason, signature_text,
+                                      places, _trusted_ids(snapshot))
+            refusal.codes.append("held_release_not_signed")
+            raise refusal
+        if trust_name != "signed" and (reason == "signer_key_revoked" or accept_unsigned is None
+                                       or type(accept_unsigned) is not str
+                                       or accept_unsigned != manifest.artifact_sha256):
+            raise _not_signed_refused(manifest, reason, signature_text, held, places, accept_unsigned)
         granted = tuple(perm for perm in manifest.permissions if perm != "order")
         running = snapshot.plugins.get(plugin_id)
         asks = _asks_for_more(None if running is None else parse_manifest(running.manifest), manifest)
-        question = " ".join([f"Install the held release {manifest.version} of the plugin {plugin_id} and grant it: "
-                             f"{', '.join(granted) or 'no permission'} (order is never granted this way)?", *asks,
-                             "Type yes to install it:"])
+        question = _accept_question(manifest, granted, signer, asks)
         if not _confirmed(confirm, question):
             raise NothingChanged(f"the release {manifest.version} of the plugin {plugin_id} stays held at {held}: "
                                  f"the answer was not yes, and nothing was written.")
@@ -744,6 +761,62 @@ def quarantine_drop(config: os.PathLike | str, plugin_id: str, *, state: os.Path
                            _set_aside(config_path, plugin_id, folder, names))
     finally:
         os.close(fd)
+
+
+def _accept_question(manifest, granted: tuple, signer: str | None, asks: list) -> str:
+    """The one question of an accept: the release's trust, then everything it would get, then what it asks for
+    more than the running release."""
+    trust = (f"signed by the key {signer}" if signer is not None
+             else "NOT signed by a key this install trusts")
+
+    def named(kind: str, values) -> str:
+        return ", ".join(f"the {kind} {value}" for value in values) or f"no {kind}"
+
+    words = [f"Install the held release {manifest.version} of the plugin {manifest.plugin_id}, {trust}, and grant "
+             f"it: {', '.join(granted) or 'no permission'} (order is never granted this way)?",
+             f"With it the release reaches {named('network destination', manifest.network_destinations)}, holds "
+             f"{named('credential reference', manifest.credential_refs)} and has "
+             f"{named('install script', manifest.install_scripts)}."]
+    if signer is None:
+        words.append(f"No key this install trusts vouches for it: these permissions are granted by your word alone, "
+                     f"for this release only (artifact {manifest.artifact_sha256}).")
+    return " ".join([*words, *asks, "Type yes to install it:"])
+
+
+def _not_signed_refused(manifest, reason: str, signature_text, held: Path, places: _Places,
+                        accept_unsigned) -> InstallRefused:
+    """``held_release_not_signed``: what the held release is now, that nothing was written, and the ways on."""
+    plugin_id, kid = manifest.plugin_id, key_id(manifest.developer_key)
+    if reason == "signer_key_revoked":
+        state = "the state folder" if places.state is None else f"the state folder {places.state}"
+        why = f"its key {kid} was revoked in {state}"
+    elif reason == "signer_not_on_trusted_list":
+        why = f"its key {kid} is not on this install's trusted list"
+    elif signature_text is None:
+        why = "it carries no signature"
+    else:
+        why = f"its signature does not check against its key {kid}"
+    ways = []
+    if reason != "signer_key_revoked":
+        ways.append(f"put the key {kid} back on this install's trusted list, only if you trust it, and run the "
+                    f"accept again")
+    ways.append(f"install a release signed by a key on this install's trusted list")
+    ways.append(f"drop the held copy: {_command(places, 'quarantine', 'drop', plugin_id)}")
+    if reason != "signer_key_revoked":
+        accept = _command(places, "quarantine", "accept", plugin_id, "--accept-unsigned", manifest.artifact_sha256)
+        ways.append(f"or take the risk for this one release yourself, unsigned (it asks a typed yes after naming all "
+                    f"it gets): {accept}")
+    given = ""
+    if accept_unsigned is not None:
+        if reason == "signer_key_revoked":
+            given = " A revoked key is not accepted unsigned, even with --accept-unsigned."
+        else:
+            given = (f" The digest given with --accept-unsigned is not this release's artifact digest "
+                     f"{manifest.artifact_sha256}.")
+    return InstallRefused("held_release_not_signed", detail=(
+        f"The held release {manifest.version} of the plugin {plugin_id} is no longer signed by a key this install "
+        f"trusts: {why}.{given} Nothing was written: the running release, its grant and the held copy at {held} "
+        f"are as they were. To go on: {'; '.join(ways)}."), show_detail=True)
 
 
 def _nothing_held(places: _Places, plugin_id: str | None) -> str:
@@ -970,11 +1043,18 @@ def _rows(snapshot: Snapshot) -> list[dict]:
     for plugin in snapshot.plugins.values():
         manifest = parse_manifest(plugin.manifest)
         digest = hashlib.sha256(plugin.manifest).hexdigest()
-        rows.append({
+        row = {
             "plugin_id": manifest.plugin_id,
             "version": manifest.version,
             "registry_label": snapshot.labels.get(digest, "unlisted"),
-        })
+        }
+        grant = snapshot.grants.get(manifest.plugin_id)
+        if (grant is not None and grant.signer_key_id is None and grant.permissions
+                and grant.artifact_sha256 == manifest.artifact_sha256):
+            # A grant with no signer: the person granted these permissions for this one release, unsigned.
+            row["grant"] = (f"unsigned: its permissions {', '.join(grant.permissions)} were granted by your own "
+                            f"word for the release {grant.artifact_sha256}, not by a key this install trusts")
+        rows.append(row)
     rows.sort(key=lambda row: row["plugin_id"])
     return rows
 

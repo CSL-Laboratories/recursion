@@ -20,6 +20,9 @@ then one line with the commands that go on, and returns 0.
 ``quarantine list`` shows what is held; ``quarantine accept <id>`` asks one
 question, as unpin does, and installs the held release only on ``yes``;
 ``quarantine drop <id>`` moves the held release into a kept place and names it.
+A held release that no longer counts as signed is refused; ``quarantine accept <id> --accept-unsigned
+<artifact sha256>`` names that one release by its digest, and then the question says it is not signed and only
+the typed ``yes`` installs it. A revoked key is refused even then.
 """
 
 from __future__ import annotations
@@ -101,6 +104,9 @@ def _parser() -> argparse.ArgumentParser:
         held.error = _error  # type: ignore[method-assign]
         if action != "list":
             held.add_argument("plugin_id")
+        if action == "accept":
+            # The person's own word, for one named release: its full artifact digest. Read from nowhere else.
+            held.add_argument("--accept-unsigned", metavar="ARTIFACT_SHA256")
         held.add_argument("--config")
         held.add_argument("--state")
     return parser
@@ -150,7 +156,7 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None) -> int:
             result = quarantine_list(_config_dir(args.config), state=_state_dir(args.state))
         elif args.command == "quarantine" and args.action == "accept":
             result = quarantine_accept(_config_dir(args.config), args.plugin_id, state=_state_dir(args.state),
-                                       report_kept=report, confirm=ask)
+                                       report_kept=report, confirm=ask, accept_unsigned=args.accept_unsigned)
         elif args.command == "quarantine":
             result = quarantine_drop(_config_dir(args.config), args.plugin_id, state=_state_dir(args.state))
         else:

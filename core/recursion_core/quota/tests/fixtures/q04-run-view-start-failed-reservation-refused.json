@@ -1,0 +1,23 @@
+{
+  "run_id": "run-3c9e1f0a7b2d4e6f8a1b3c5d7e9f0a2b",
+  "tenant": "t1",
+  "engine": "claude_code",
+  "state": "start_failed",
+  "cgroup": null,
+  "started_at": 1794679361.5,
+  "stop": null,
+  "start_key": {
+    "client_key": "k-7",
+    "engine": "claude_code",
+    "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
+  },
+  "generation": 2,
+  "cgroup_marker": null,
+  "members": [],
+  "stop_attestation": null,
+  "observed": null,
+  "start_error": {
+    "code": "reservation_refused",
+    "detail": "no_opt_in"
+  }
+}

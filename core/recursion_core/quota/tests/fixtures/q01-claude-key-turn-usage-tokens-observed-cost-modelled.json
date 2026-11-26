@@ -1,0 +1,46 @@
+{
+  "seq": 4,
+  "session_id": "run:run-3c9e1f0a7b2d4e6f8a1b3c5d7e9f0a2b",
+  "run_id": "run-3c9e1f0a7b2d4e6f8a1b3c5d7e9f0a2b",
+  "turn_id": null,
+  "time": "2026-11-14T18:02:41.512Z",
+  "type": "usage",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "connection_id": "api_key:anthropic-main",
+    "model": "claude-sonnet-5-5",
+    "bucket": null,
+    "span": "turn",
+    "input_tokens": {
+      "value": 2310,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "output_tokens": {
+      "value": 487,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "reasoning_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+      "value": 18432,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "cache_write_tokens": {
+      "value": 1206,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "cost_usd": {
+      "value": 0.4127,
+      "quality": "known",
+      "provenance": "modelled"
+    }
+  }
+}

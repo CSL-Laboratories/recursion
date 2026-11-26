@@ -1,0 +1,18 @@
+{
+  "method": "run.start",
+  "params": {
+    "tenant": "t1",
+    "prompt": "Fix the failing test.",
+    "client_key": "k-8"
+  },
+  "answer": {
+    "code": "start_failed",
+    "run_id": "run-6a0c2e4f1b3d5a7c9e0f2b4d6a8c0e1f",
+    "detail": "StartRefused",
+    "recorded": true,
+    "start_error": {
+      "code": "reservation_refused",
+      "detail": "cap_zero"
+    }
+  }
+}

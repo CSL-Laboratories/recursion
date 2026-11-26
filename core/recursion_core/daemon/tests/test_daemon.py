@@ -322,6 +322,7 @@ class DaemonTests(unittest.TestCase):
                 self.registry.add('three', 'boot-a')
         # The rename had already published "two". A later open can use it.
         self.assertEqual([run.run_id for run in self.registry.all()], ['one', 'two'])
+        self.registry.close()
         reopened = Registry(self.path / 'state')
         self.addCleanup(reopened.close)
         self.assertEqual([run.run_id for run in reopened.all()], ['one', 'two'])
@@ -393,6 +394,7 @@ class DaemonTests(unittest.TestCase):
         stale_wal.write_bytes(b'y' * 64)
         live = directory / f'.runs.sqlite3.tmp-{os.getpid()}-99'
         live.write_bytes(b'keep')
+        self.registry.close()
         reopened = Registry(directory)
         self.addCleanup(reopened.close)
         self.assertFalse(stale.exists())

@@ -10,7 +10,8 @@
   ],
   "properties": {
     "version": {
-      "const": 1
+      "const": 1,
+      "description": "JSON Schema cannot tell 1.0 from 1, so this schema accepts version 1.0; the reader takes only the whole number 1 and refuses 1.0 (settings_unreadable), keeping every default."
     },
     "plugin_host": {
       "type": "object",

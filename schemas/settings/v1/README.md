@@ -29,5 +29,8 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
 ## Fixtures
 
 `fixtures/good/` holds a file read whole with no note; `fixtures/bad/` holds a file whose one value keeps
-its default with a note. `core/recursion_core/daemon/tests/test_settings.py` reads both and checks that
-this schema declares exactly the reader's table.
+its default with a note (`b01`) and a file the reader refuses whole (`b02`, `version = 1.0`). JSON Schema
+cannot tell 1.0 from 1, so this schema accepts version 1.0; the reader takes only the whole number 1 and
+refuses that file with `settings_unreadable`, keeping every default.
+`core/recursion_core/daemon/tests/test_settings.py` reads them all and checks that this schema declares
+exactly the reader's table.

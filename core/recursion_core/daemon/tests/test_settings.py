@@ -901,7 +901,8 @@ class WhatAPluginIsHanded(_Folder):
 class PublishedShape(_Folder):
     def test_the_schema_declares_exactly_the_table(self) -> None:
         schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
-        self.assertEqual({"const": settings.FILE_VERSION}, schema["properties"]["version"])
+        version = schema["properties"]["version"]  # its description says what the schema cannot decide
+        self.assertEqual({"const": settings.FILE_VERSION, "description": version.get("description")}, version)
         kinds = {bool: "boolean", int: "integer", float: "number", str: "string"}
         found = {}
 
@@ -945,13 +946,15 @@ class PublishedShape(_Folder):
     def test_the_good_fixture_is_read_whole_and_the_bad_one_keeps_the_default(self) -> None:
         good = sorted((SCHEMA_DIR / "fixtures" / "good").glob("*.toml"))
         bad = sorted((SCHEMA_DIR / "fixtures" / "bad").glob("*.toml"))
-        self.assertEqual((1, 1), (len(good), len(bad)))
+        self.assertEqual((1, 2), (len(good), len(bad)))
         self.put(good[0].read_text(encoding="utf-8"))
         loaded = settings.load(self.environ)
         self.assertEqual([], self.codes(loaded))
         self.assertEqual({settings.SOURCE_FILE}, {v.source for v in loaded.values.values()})
         self.put(bad[0].read_text(encoding="utf-8"))
         self.assert_default(settings.load(self.environ), settings.OUT_OF_RANGE)
+        self.put(bad[1].read_text(encoding="utf-8"))  # version = 1.0: the schema accepts it, the reader refuses it
+        self.assert_default(settings.load(self.environ), settings.UNREADABLE)
 
 
 class WindowsNoOwnerCheck(_Folder):
@@ -1037,7 +1040,119 @@ class ATableAndAKeyReadUnderTheFullDottedName(_Folder):
                 loaded = self.read(text)
                 self.assert_default(loaded, settings.UNKNOWN_KEY)
                 self.assertNotIn(FULL_NAME, loaded.values)
-                self.assertEqual("'engines' is not a setting this version knows; it is skipped", loaded.notes[0].detail)
+                self.assertEqual("'engines' is not a setting this version knows; it is skipped; remove it or check "
+                                 "its spelling", loaded.notes[0].detail)
+
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class TheStartLinesWhateverLoggingHeldBefore(_Folder):
+    """A root logger an embedding caller or a test host set up first: the daemon's start lines still carry the
+    time and the process id and are written at INFO, and the caller's own handler keeps receiving them."""
+
+    def start(self, err: io.StringIO) -> None:
+        from recursion_core.daemon import __main__ as daemon_main
+        with mock.patch.dict(os.environ, self.environ), \
+                mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(daemon_main, "require_posix"), \
+                mock.patch.object(daemon_main, "require_free_threaded"), \
+                mock.patch.object(daemon_main, "refuse_engine_user"), \
+                mock.patch.object(daemon_main, "check_operator_linger"), \
+                mock.patch.object(daemon_main.signal, "signal"), \
+                mock.patch.object(daemon_main, "UserLock"), \
+                mock.patch.object(daemon_main, "Registry", side_effect=_ReachedTheLock), \
+                self.assertRaises(_ReachedTheLock):
+            daemon_main.main()
+
+    def test_a_root_handler_set_up_first_at_info_or_warning_leaves_both_lines_with_time_and_process_id(self) -> None:
+        self.put(OFF)
+        root, own = logging.getLogger(), logging.getLogger("recursion_core.daemon")
+        kept = (root.handlers[:], root.level, own.handlers[:], own.level)
+
+        def restore() -> None:
+            root.handlers[:], own.handlers[:] = kept[0], kept[2]
+            root.setLevel(kept[1])
+            own.setLevel(kept[3])
+        self.addCleanup(restore)
+        form = r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} \[" + str(os.getpid()) + r"\] INFO recursion_core\.daemon: "
+        starts = (f"settings file: {self.file}",
+                  "settings: plugin_host.gil_check = false (default true; source: settings file)")
+        for level in (logging.INFO, logging.WARNING):
+            caller = io.StringIO()
+            bare = logging.StreamHandler(caller)
+            bare.setFormatter(logging.Formatter("%(message)s"))
+            root.handlers[:] = [bare]
+            root.setLevel(level)
+            for attempt in ("a first start", "a second start in the same process"):
+                with self.subTest(root=logging.getLevelName(level), attempt=attempt):
+                    err = io.StringIO()
+                    self.start(err)
+                    shown = err.getvalue().splitlines()
+                    for start in starts:
+                        found = [line for line in shown if line.endswith(start)]
+                        self.assertEqual(1, len(found), shown)
+                        self.assertRegex(found[0], form)
+            self.assertIn(starts[0], caller.getvalue().splitlines())  # the caller's own handler is kept
+
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class AKeyIsShownWhole(_Folder):
+    """Only values are cut in a note; a key is named whole, so two long keys that differ late read apart."""
+
+    def test_two_unknown_keys_of_100_characters_that_differ_after_character_90_give_two_notes(self) -> None:
+        first, second = "a" * 100, "a" * 90 + "b" * 10
+        self.put(f"version = 1\n[plugin_host]\n{first} = false\n{second} = false\n")
+        details = [note.detail for note in settings.load(self.environ).notes]
+        self.assertEqual(2, len(set(details)), details)
+        for key, detail in zip((first, second), details):
+            self.assertTrue(detail.startswith(f"'plugin_host.{key}' is not a setting this version knows; it is "
+                                              "skipped; remove it or check its spelling"), detail)
+
+    def test_two_long_quoted_keys_that_differ_late_give_two_notes_with_the_whole_key(self) -> None:
+        first, second = "a" * 90 + ".b", "a" * 90 + ".c"
+        self.put(f'version = 1\n"{first}" = 1\n"{second}" = 1\n')
+        details = [note.detail for note in settings.load(self.environ).notes]
+        self.assertEqual(2, len(set(details)), details)
+        for key, detail in zip((first, second), details):
+            self.assertTrue(detail.startswith(f"'{key}' is a quoted key that holds a dot"), detail)
+
+    def test_the_note_for_an_unknown_key_says_what_to_do_and_keeps_the_nearest_known_key(self) -> None:
+        self.put("version = 1\n[plugin_host]\ngil_chek = false\n")
+        self.assertEqual("'plugin_host.gil_chek' is not a setting this version knows; it is skipped; remove it or "
+                         "check its spelling; did you mean plugin_host.gil_check?",
+                         settings.load(self.environ).notes[0].detail)
+
+    def test_a_value_is_still_cut_in_its_note(self) -> None:
+        self.put('version = 1\n[plugin_host]\ngil_check = "' + "x" * 200 + '"\n')
+        detail = settings.load(self.environ).notes[0].detail
+        self.assertNotIn("x" * 200, detail)
+        self.assertIn("...", detail)
+
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class TheVersionTheSchemaCannotTell(_Folder):
+    """JSON Schema compares numbers by value, so the schema cannot refuse version 1.0; it says so, and the reader
+    (which takes only the whole number 1) is what refuses it, with its own words, in a published bad vector."""
+
+    SAYS = "JSON Schema cannot tell 1.0 from 1, so this schema accepts version 1.0; the reader takes only the whole number 1"
+
+    def test_the_schema_accepts_1_0_on_purpose_and_its_version_says_the_reader_takes_only_1(self) -> None:
+        schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
+        version = schema["properties"]["version"]
+        self.assertEqual(version["const"], json.loads("1.0"))  # a parsed 1.0 meets const 1: accepted on purpose
+        self.assertIn(self.SAYS, version.get("description", ""))
+        readme = " ".join((SCHEMA_DIR / "README.md").read_text(encoding="utf-8").split())
+        self.assertIn(self.SAYS, readme)
+
+    def test_the_bad_vector_version_1_0_is_refused_by_the_reader_with_its_words(self) -> None:
+        vector = SCHEMA_DIR / "fixtures" / "bad" / "b02-version-written-as-a-float.toml"
+        self.assertTrue(vector.is_file(), vector)
+        self.put(vector.read_text(encoding="utf-8"))
+        loaded = settings.load(self.environ)
+        self.assert_default(loaded, settings.UNREADABLE)
+        self.assertIn("version must be 1, found 1.0; write `version = 1`", loaded.notes[0].detail)
 
 
 if __name__ == "__main__":

@@ -106,11 +106,15 @@ def printable(text: str) -> str:
                    (f"\\x{ord(char):02x}" if ord(char) < 0x100 else f"\\u{ord(char):04x}") for char in str(text))
 
 
-def shown_lines(result: dict) -> list:
-    """What a person reads after an install by registry: the label, the requested permissions, the status."""
-    lines = [f"Registry label: {result.get('registry_label')} (a label, not a gate).",
-             "Requested permissions (requested by the release, not enforced by this install): "
-             + (", ".join(result.get("requested_permissions") or ()) or "none") + "."]
+def shown_lines(result: dict, *, status_only: bool = False) -> list:
+    """What a person reads after an install by registry: the label, the requested permissions, the status.
+
+    ``status_only`` keeps only the status line (the install of a registry folder prints no label lines yet).
+    """
+    lines = [] if status_only else [
+        f"Registry label: {result.get('registry_label')} (a label, not a gate).",
+        "Requested permissions (requested by the release, not enforced by this install): "
+        + (", ".join(result.get("requested_permissions") or ()) or "none") + "."]
     if result.get("status") in ("deprecated", "withdrawn"):
         reason = printable(result.get("status_reason") or "no reason given").rstrip(".")
         lines.append(f"This release is {result['status']}: {reason}.")
@@ -154,8 +158,10 @@ def split_registry(value: object) -> tuple[str, str, str | None]:
 def _checked_install(config, root, plugin_id, given, commit, **options) -> dict:
     """``install_plugin`` on ``root``; a registry that fails its check is refused with each file named."""
     try:
-        # A withdrawn release is refused unless the person named it (allow_withdrawn) for this install.
-        return install_plugin(config, root, plugin_id, refuse_withdrawn=True, **options)
+        # install_plugin decides on every call whether the chosen release may be installed; the registry is
+        # named in its words as the person named it, and its kind is the way the release was chosen.
+        return install_plugin(config, root, plugin_id, registry_name=given,
+                              registry_kind="folder" if commit is None else "pinned", **options)
     except InstallRefused as exc:
         findings = getattr(exc, "findings", None)
         if not findings:

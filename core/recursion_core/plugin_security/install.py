@@ -312,12 +312,18 @@ class Snapshot:
 def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, plugin_id: str, *,
                    version: str | None = None, state: os.PathLike | str | None = None, wait: bool = True,
                    git_repository: str | None = None, report_kept=None, confirm=None,
-                   write_grant: bool | None = None, confirm_grant=None, refuse_withdrawn: bool = False,
-                   allow_withdrawn: str | None = None) -> dict:
+                   write_grant: bool | None = None, confirm_grant=None, allow_withdrawn: str | None = None,
+                   registry_name: str | None = None, registry_kind: str | None = None) -> dict:
     """Check ``registry_root``, then write the release as the next generation.
 
-    ``refuse_withdrawn`` True (the install by registry) refuses a withdrawn release, with its status and
-    reason, unless ``allow_withdrawn`` names that same version: the person's explicit step.
+    The release chosen (by ``version``, or the newest active one) passes ``_installable`` on every call,
+    and no keyword turns that off. A withdrawn release goes on only as ``_WITHDRAWN_RULE`` says for the way
+    it was chosen, or when ``allow_withdrawn`` names that same version (the person's own step for this one
+    install); an ``allow_withdrawn`` that names any other release is refused ``allow_withdrawn_unmatched``.
+    A withdrawn release that goes on is said to be withdrawn before the install goes on: the words go to
+    ``report_kept`` when it is given and into the result as ``withdrawn``. ``registry_name`` is the registry
+    as the person named it, for those words (without it they name ``registry_root``); ``registry_kind`` is
+    ``pinned`` for a registry read at a commit and ``folder`` (or None) otherwise.
 
     ``git_repository`` is a local bare path. The fetch, and every refusal of
     that fetch, finishes before the profile lock. A refusal does not fall
@@ -355,12 +361,12 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
         raise InstallRefused("plugin_not_in_registry")
     if version is not None and type(version) is not str:
         raise InstallRefused("release_not_in_registry")
-    chosen = _select(report, plugin_id, version)
-    if refuse_withdrawn and chosen.status == "withdrawn" and allow_withdrawn != chosen.version:
-        raise InstallRefused("release_withdrawn", detail=(
-            f"The release {chosen.version} of {plugin_id} is withdrawn: {chosen.status_reason or 'no reason given'}. "
-            f"Nothing was installed. To install it anyway, name it with --version {chosen.version} "
-            f"--allow-withdrawn {chosen.version}."), show_detail=True)
+    chosen, said = _installable(_select(report, plugin_id, version), report, _Road(
+        version, allow_withdrawn, registry_kind, os.fspath(registry_root) if registry_name is None else registry_name,
+        config_path, state, git_repository))
+    if said is not None and report_kept is not None:
+        # Said before anything is fetched or written, in words that cannot be missed.
+        report_kept(said)
     artifact = chosen.artifact
     fetched = False
     if git_repository is not None or artifact is None:
@@ -373,10 +379,15 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
         raise InstallRefused("source_digest_mismatch" if fetched else "artifact_digest_mismatch")
     fd = _lock(config_path, wait=wait)
     try:
-        return _install_locked(config_path, chosen, plugin_id, state, artifact, fetched, report_kept, confirm,
-                               write_grant, confirm_grant)
+        result = _install_locked(config_path, chosen, plugin_id, state, artifact, fetched, report_kept, confirm,
+                                 write_grant, confirm_grant)
     finally:
         os.close(fd)
+    if said is not None:
+        # A withdrawn release went on: the result says so, installed or held, and how it was let through.
+        result.update(status=chosen.status, status_reason=chosen.status_reason, withdrawn=said,
+                      withdrawn_by=("allow_withdrawn" if allow_withdrawn is not None else "named_version"))
+    return result
 
 
 @_typed_refusals
@@ -731,20 +742,135 @@ def _plugin_id_ok(value: object) -> bool:
             and value not in (".", "..") and "/" not in value and "\\" not in value)
 
 
-def _select(report, plugin_id: str, version: str | None):
+def _releases(report, plugin_id: str) -> list:
     # Only releases under registry/ can be chosen. examples/ is checked, never indexed or installed.
-    matches = [item for item in report.checked if item.plugin_id == plugin_id and not item.in_examples]
+    return [item for item in report.checked if item.plugin_id == plugin_id and not item.in_examples]
+
+
+def _newest_active(matches: list):
+    """The release an install by id alone takes: the newest active one, or None."""
+    active = [item for item in matches if item.status == "active"]
+    return active[-1] if active else None
+
+
+def _select(report, plugin_id: str, version: str | None):
+    """The release the arguments name. Its result goes straight into ``_installable``, on every road."""
+    matches = _releases(report, plugin_id)
     if not matches:
         raise InstallRefused("plugin_not_in_registry")
     if version is None:
-        active = [item for item in matches if item.status == "active"]
-        if not active:
+        newest = _newest_active(matches)
+        if newest is None:
             raise InstallRefused("release_not_active")
-        return active[-1]
+        return newest
     for item in matches:
         if item.version == version:
             return item
     raise InstallRefused("release_not_in_registry")
+
+
+@dataclass(frozen=True)
+class _Road:
+    """How a release was chosen for one install, and what the words of ``_installable`` name."""
+
+    version: str | None
+    allow_withdrawn: object
+    registry_kind: str | None
+    registry: str
+    config: Path
+    state: object
+    git_repository: object
+
+    def way(self) -> str:
+        """The key of ``_WITHDRAWN_RULE`` for this road."""
+        if self.version is None:
+            return "chosen_for_the_person"
+        return "named_at_a_registry_commit" if self.registry_kind == "pinned" else "named_by_version"
+
+
+# What a withdrawn release does on each way it can be chosen, when the person gave no --allow-withdrawn:
+# "refuse" refuses release_withdrawn with the reason, the newest release that is not withdrawn and the one
+# step; "say" installs it and says, before the install goes on, that it is withdrawn, why, and what is newer.
+# A change of this policy changes this one rule. A pin and a range are "chosen_for_the_person" when they come.
+_WITHDRAWN_RULE = {
+    "chosen_for_the_person": "refuse",
+    "named_at_a_registry_commit": "refuse",
+    "named_by_version": "say",
+}
+
+
+def _installable(chosen, report, road: _Road):
+    """The one decision whether the release ``chosen`` may be installed: ``(chosen, words)`` or a refusal.
+
+    ``install_plugin`` calls it on what ``_select`` returns, on every road (an id alone, a named version, a
+    registry folder, a registry at a commit, ``--git``, a direct call), before any source is fetched and
+    before the profile lock, so before a release can be written or held. No keyword skips it. ``words`` is
+    None for a release that is not withdrawn, else what the person is told before the install goes on. A
+    step that names any other release than the withdrawn one chosen is refused, never silently ignored.
+    """
+    withdrawn = chosen.status == "withdrawn"
+    allow = road.allow_withdrawn
+    if allow is not None and not (withdrawn and allow == chosen.version):
+        codes = ["release_withdrawn", "allow_withdrawn_unmatched"] if withdrawn else ["allow_withdrawn_unmatched"]
+        raise InstallRefused(codes[0], codes, detail=_unmatched_words(chosen, report, road), show_detail=True)
+    if not withdrawn:
+        return chosen, None
+    if allow is None and _WITHDRAWN_RULE[road.way()] == "refuse":
+        raise InstallRefused("release_withdrawn", detail=_withdrawn_words(chosen, report, road, installed=False),
+                             show_detail=True)
+    return chosen, _withdrawn_words(chosen, report, road, installed=True)
+
+
+def _install_command(road: _Road, plugin_id: str, version: str | None, allow: str | None = None) -> str:
+    """The exact command that installs ``version`` of ``plugin_id`` from the road's registry, printable."""
+    from ._entrypoints import _state_dir  # the one rule for the default state folder
+    from .registry_source import printable
+
+    words = ["install", plugin_id, "--registry", shlex.quote(road.registry)]
+    if road.git_repository is not None:
+        words += ["--git", shlex.quote(os.fspath(road.git_repository))]
+    if version is not None:
+        words += ["--version", shlex.quote(version)]
+    if allow is not None:
+        words += ["--allow-withdrawn", shlex.quote(allow)]
+    if road.state is not None and Path(road.state).absolute() != _state_dir(None).absolute():
+        words += ["--state", _shown(road.state)]
+    return printable(_command(road.config, *words))
+
+
+def _withdrawn_words(chosen, report, road: _Road, *, installed: bool) -> str:
+    """That the release is withdrawn, by whom and why, what is newer, and what the person can do next."""
+    from .registry_source import printable
+
+    plugin_id, version = printable(chosen.plugin_id), printable(chosen.version)
+    reason = printable(chosen.status_reason or "no reason given").rstrip(".")
+    newest = _newest_active(_releases(report, chosen.plugin_id))
+    if newest is None:
+        instead = f"No release of {plugin_id} in that registry is active, so none can be taken in its place."
+    else:
+        instead = (f"The newest release of {plugin_id} there that is not withdrawn is {printable(newest.version)}; "
+                   f"to install it run: {_install_command(road, chosen.plugin_id, newest.version)}")
+    head = (f"WITHDRAWN: the release {version} of {plugin_id} was withdrawn by the keepers of the registry "
+            f"{printable(road.registry)}, who give this reason: {reason}.")
+    if installed:
+        how = ("you allowed it for this one install with --allow-withdrawn" if road.allow_withdrawn is not None
+               else "you named it by its version")
+        return f"{head} It is installed because {how}. {instead}"
+    return (f"{head} Nothing was installed. {instead} . To install {version} anyway, at your own risk and for "
+            f"this one install only, run: {_install_command(road, chosen.plugin_id, chosen.version, chosen.version)}")
+
+
+def _unmatched_words(chosen, report, road: _Road) -> str:
+    """The words of a step that names another release than the withdrawn one chosen for this install."""
+    from .registry_source import printable
+
+    head = (f"The step --allow-withdrawn {printable(road.allow_withdrawn)} does not match this install: it lets "
+            f"through only the one withdrawn release it names, and the release chosen here is "
+            f"{printable(chosen.version)} of {printable(chosen.plugin_id)}, which is {printable(chosen.status)}. ")
+    if chosen.status == "withdrawn":
+        return head + _withdrawn_words(chosen, report, road, installed=False)
+    return head + ("Nothing was installed. Run the install again without --allow-withdrawn; to install a "
+                   "withdrawn release, name it with --version and with --allow-withdrawn, both with its version.")
 
 
 def _install_locked(config: Path, chosen, plugin_id: str, state, artifact: bytes, fetched: bool,

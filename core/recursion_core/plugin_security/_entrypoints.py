@@ -25,7 +25,9 @@ question, as unpin does, and installs the held release only on ``yes``;
 
 ``install <plugin_id> --registry <address>@<full commit>`` reads the registry's tree at that commit
 (a local bare repository or its ``file://`` address; the commit must be on the registry's default
-branch) and installs from it with the same checks; ``--registry <folder>`` reads a registry folder on disk. The id may be given as
+branch) and installs from it with the same checks; ``--registry <folder>`` reads a registry folder on disk by the
+same road, with the same checks, refusals and status line. A withdrawn release that goes on is said to be withdrawn,
+with the registry's reason and the newest release that is not, on stderr before the install goes on. The id may be given as
 the one word after ``install`` or with ``--plugin``. With no registry named the install refuses
 ``registry_not_named`` and says how to name one.
 
@@ -44,10 +46,10 @@ import os
 import sys
 from pathlib import Path
 
-from .install import (InstallRefused, NothingChanged, disable_plugin, enable_plugin, install_plugin,
-                      list_plugins, quarantine_accept, quarantine_drop, quarantine_list, remove_plugin,
-                      rollback_generation, unpin_plugin)
-from .registry_source import install_from_registry, list_not_wired, shown_lines, split_registry
+from .install import (InstallRefused, NothingChanged, disable_plugin, enable_plugin, list_plugins,
+                      quarantine_accept, quarantine_drop, quarantine_list, remove_plugin, rollback_generation,
+                      unpin_plugin)
+from .registry_source import install_from_registry, list_not_wired, shown_lines
 
 __all__ = ["main"]
 
@@ -233,14 +235,14 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None, stdin=None
                 write_grant, confirm = None, _confirm_grant(stdin, err)
             options = dict(version=args.version, state=_state_dir(args.state), report_kept=report,
                            confirm=ask, git_repository=args.git, write_grant=write_grant, confirm_grant=confirm)
-            if args.registry is not None and split_registry(args.registry)[0] == "folder":
-                result = install_plugin(_config_dir(args.config), args.registry, plugin_id, **options)
-            else:
-                result = install_from_registry(_config_dir(args.config), plugin_id, registry=args.registry,
-                                               allow_withdrawn=args.allow_withdrawn, **options)
-                if result.get("result") != "quarantined":
-                    for line in shown_lines(result):
-                        err.write(f"{line}\n")
+            # One road for a registry folder and a registry at a commit: the same checks, refusals and status
+            # line. A folder install prints no label lines yet: the lines it printed before are kept as they were.
+            result = install_from_registry(_config_dir(args.config), plugin_id, registry=args.registry,
+                                           allow_withdrawn=args.allow_withdrawn, **options)
+            if result.get("result") != "quarantined":
+                folder = (result.get("registry") or {}).get("kind") == "local"
+                for line in shown_lines(result, status_only=folder):
+                    err.write(f"{line}\n")
         elif args.command == "registry":
             # The registry list lives in the person's settings file, which this build does not read yet.
             raise list_not_wired(f"recursion plugin registry {args.action}")

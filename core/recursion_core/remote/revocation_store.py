@@ -45,7 +45,8 @@ start makes. While the mark is there, a missing file is refused like an unreadab
 deleting the file never lets a revoked phone pair again. ``forget-every-revocation`` (``main``) empties the
 record and removes the mark, the one knowing way to start a new record.
 
-An OLDER copy of the file put back is refused too. Beside the mark the same step writes a count,
+An OLDER copy of the record ALONE put back, while the count beside it stands, is refused too. Beside the mark
+the same step writes a count,
 ``.revocations.json.count``: how many revoked devices the record held at its last write. A device's revocation
 is never taken out of the record but by the forget command, so a record that holds fewer devices than the count
 says is a copy from before the last revocation: a phone revoked after it would be let in again, so it is refused
@@ -54,8 +55,14 @@ LATEST copy, or start knowingly with fewer by the forget command). The count is 
 stop between the two leaves a count that is lower, which is read and caught up at the next write; a folder
 written before the count existed gets it at the next write, which every start makes.
 
+What the count does NOT see: a copy of the whole relay folder put back together (the record with the count of
+the same time, as a backup of the folder holds them), an older record with the count taken away (it reads as a
+folder written before the count existed), or a record edited by hand with the count left as it is. Each of
+these is read as good, and a phone revoked after that copy pairs again with no word. A guard against them needs
+a witness kept outside the relay folder, which this module does not keep.
+
 The forget command says only what it did. It refuses a state folder that is not there, or holds no relay folder
-(it makes none); it refuses while the daemon runs: every store takes a shared lock beside the record,
+(it makes none); it refuses while the daemon, another run of it or another program holds the record: every store takes a shared lock beside the record,
 ``.revocations.json.live``, at its first read or write and holds it for its life, so a running book is found
 whether it writes or not, and the record's own lock held (a write under way) refuses it too. Each run appends one
 line to ``revocations.forgotten.jsonl`` beside the record: the time, the user, and how many revocations and
@@ -646,9 +653,9 @@ class FileRevocationStore:
             fcntl.flock(live, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             os.close(live)
-            raise RevocationStoreError(f"the daemon is running: a book holds the record of revoked phones open "
-                                       f"({self._live_path} is held); stop it first, then run the command "
-                                       f"again") from None
+            raise RevocationStoreError(f"the record of revoked phones is in use: {self._live_path} is held by the "
+                                       f"daemon, another run of this command, or another program; stop it first, "
+                                       f"then run the command again") from None
         try:
             probe = os.open(self._lock_path, flags)
         except FileNotFoundError:
@@ -661,9 +668,9 @@ class FileRevocationStore:
             fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             os.close(live)
-            raise RevocationStoreError(f"the daemon is running: the record of revoked phones is being written "
-                                       f"({self._lock_path} is held); stop it first, then run the command "
-                                       f"again") from None
+            raise RevocationStoreError(f"the record of revoked phones is being written: {self._lock_path} is held "
+                                       f"by the daemon, another run of this command, or another program; stop it "
+                                       f"first, then run the command again") from None
         finally:
             os.close(probe)
         return live

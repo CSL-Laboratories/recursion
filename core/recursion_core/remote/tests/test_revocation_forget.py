@@ -82,7 +82,7 @@ class RunningDaemonTests(Folder):
         live = DeviceBook(clock=self.clock, store=FileRevocationStore(self.state))
         code, out, err = self.command()
         self.assertNotEqual(code, 0)
-        for words in ("nothing was forgotten", "the daemon is running", "stop it first"):
+        for words in ("nothing was forgotten", "is held by the daemon, another run of this command, or another program", "stop it first"):
             self.assertIn(words, err)
         self.assertEqual(FileRevocationStore(self.state).load().devices.keys(), {"dev_a", "dev_b"})
         del live
@@ -94,7 +94,7 @@ class RunningDaemonTests(Folder):
         code, out, err = self.command()
         self.assertLess(time.monotonic() - started, revocation_store.REVOCATIONS_LOCK_TIMEOUT_S / 2)
         self.assertNotEqual(code, 0)
-        for words in ("nothing was forgotten", "the daemon is running", "stop it first"):
+        for words in ("nothing was forgotten", "is held by the daemon, another run of this command, or another program", "stop it first"):
             self.assertIn(words, err)
         self.assertFalse(os.path.lexists(self.lines))
 

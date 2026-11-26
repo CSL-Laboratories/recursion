@@ -1334,17 +1334,18 @@ def check_operator_linger(user, call=subprocess.run):
     engine user: a lingering engine user manager can start units outside an operator
     leaf (owner-reported host evidence on CSL-728/CSL-738, Nov 7), so the future
     cross-uid path requires the engine user to have no user manager during runs.
+
+    Linux runs that loginctl read. Darwin runs the LaunchAgent read instead.
+    Every other platform keeps the loginctl read. On win32, main refuses in
+    require_posix before it calls this, with the same text as before.
     """
-    refusal = f'Linger=yes required for operator {user}; founder host setup needed'
-    try:
-        result = call(['loginctl', 'show-user', user, '--property=Linger', '--value'],
-                      check=True, text=True, capture_output=True, timeout=15)
-    except (OSError, subprocess.SubprocessError) as exc:
-        # logind unknown user, logind not running, loginctl missing or hung: fail closed
-        # with the named refusal, not a raw traceback.
-        raise RuntimeError(f'{refusal} (linger probe failed: {type(exc).__name__}: {exc})') from exc
-    if result.stdout.strip() != 'yes':
-        raise RuntimeError(refusal)
+    from recursion_core.hostos import select
+
+    # The direct callers, including the simulated-Windows run of the daemon
+    # tests, still pass this function the loginctl read. Only Darwin replaces it.
+    if sys.platform == 'darwin':
+        return select('darwin').check_operator(user, call)
+    return select('linux').check_operator(user, call)
 
 
 def refuse_engine_user(environ):

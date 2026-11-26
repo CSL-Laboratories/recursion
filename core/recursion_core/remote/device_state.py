@@ -44,8 +44,11 @@ the phone door of this lane's later slices keep, so that they are tested before 
   counts as released at the restart (the door's connections ended with the daemon). A wall clock that moved
   back keeps a record longer; one that moved forward may forget it early.
 * A store that cannot be read at the start fails closed: ``connect`` and ``add`` refuse everything with
-  ``revocations_unreadable`` (read again at each try) until it can be read, because a lost record must never
-  admit a revoked id. A revocation whose write fails, for any reason the store gives, still holds in memory
+  ``revocations_unreadable`` until it can be read, because a lost record must never admit a revoked id. It is
+  read again at a try of ``connect`` or ``add``, OUTSIDE the book's lock, so ``admit`` and ``check_connection``
+  never wait on the file's lock; one read at a time (a try that finds a read under way answers at once with the
+  last refusal), and at most once per ``revocations_retry_s`` seconds on the book's clock (``None``, the first
+  value: at every try). A revocation whose write fails, for any reason the store gives, still holds in memory
   for as long as the daemon runs, and ``revoke`` raises ``RevocationNotWritten`` (its ``connections`` are the
   ones to close), whose words say plainly that the device is NOT revoked on disk, that after a restart it
   would be let in again, what stopped the write, and to revoke it again before any restart. The device is
@@ -108,6 +111,13 @@ REVOKED_CONNECTION_KEEP_MAX: int | None = 100_000
 # more is refused. none: no cap. The first value; the one place it is named, an argument of DeviceBook still
 # winning, until the settings file is in this tree.
 CONNECTIONS_MAX: int | None = 64
+
+# The row remote.device.revocations_retry_s: while the record of revocations cannot be read, how often a try of
+# connect or add reads it again, in seconds on the book's clock: none reads at every try. Reads are made outside
+# the book's lock and one at a time whatever the value. The first value none: a record put back is taken at the
+# very next try (a person mending the file sees it work at once); the one place it is named, an argument of
+# DeviceBook still winning, until the settings file is in this tree.
+REVOCATIONS_RETRY_S: float | None = None
 
 # The length of the boot id, in random bytes: a figure of the id's form, not a setting.
 _BOOT_BYTES = 16
@@ -253,6 +263,7 @@ class DeviceBook:
     ``revoked_connection_keep_max``: the most such records kept (``None``: no bound); see the module text.
     ``connections_max``: the most live connections one device holds (``None``: no cap).
     ``store``: where revocations are kept across a restart (``None``: in memory only).
+    ``revocations_retry_s``: while the store cannot be read, how often a try reads it again (``None``: every try).
     """
 
     clock: Callable[[], float] = time.monotonic
@@ -261,7 +272,10 @@ class DeviceBook:
     wall: Callable[[], float] = time.time
     revoked_connection_keep_max: int | None = REVOKED_CONNECTION_KEEP_MAX
     connections_max: int | None = CONNECTIONS_MAX
+    revocations_retry_s: float | None = REVOCATIONS_RETRY_S
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _retry_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _last_try: float | None = field(default=None, init=False, repr=False)
     _write_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _devices: dict[str, DeviceRecord] = field(default_factory=dict, init=False, repr=False)
     _connections: dict[Hashable, str] = field(default_factory=dict, init=False, repr=False)
@@ -285,6 +299,11 @@ class DeviceBook:
                                  "number of seconds, 0 or more")
         _count_setting("revoked_connection_keep_max", self.revoked_connection_keep_max, "no bound")
         _count_setting("connections_max", self.connections_max, "no cap")
+        retry = self.revocations_retry_s
+        if retry is not None and (isinstance(retry, bool) or not isinstance(retry, (int, float))
+                                  or math.isnan(retry) or retry < 0):
+            raise PairingRefused("setting_invalid", "remote.device.revocations_retry_s is none (read again at every "
+                                 "try) or a number of seconds, 0 or more")
         with self._write_lock:
             with self._lock:
                 change, forget = self._load() if self.store is not None else (None, ())
@@ -296,13 +315,18 @@ class DeviceBook:
 
     # -- the store --------------------------------------------------------------------------------
     def _load(self) -> tuple[Revocations | None, tuple]:
-        """Called with the book's lock held: memory takes what the store holds. Returns the releases to write and
-        the records to forget."""
+        """Called with the book's lock held, at the start: memory takes what the store holds. Returns the releases
+        to write and the records to forget."""
         try:
             held = self.store.load()  # type: ignore[union-attr]
         except RevocationStoreError as exc:
             self._unreadable = unreadable_detail(str(exc))
+            self._last_try = self.clock()
             return None, ()
+        return self._take(held)
+
+    def _take(self, held: Revocations) -> tuple[Revocations | None, tuple]:
+        """Called with the book's lock held: memory takes what the store was read to hold."""
         self._unreadable = None
         now, wall = self.clock(), self.wall()
         self._revoked_devices.update(held.devices)
@@ -377,12 +401,36 @@ class DeviceBook:
             del self._unwritten_connections[conn_id]
 
     def _readable(self) -> str | None:
-        """Called with the book's lock held: ``None`` when the store was read, else the refusal's words. An
-        unreadable store is read again here; what it then holds is taken; the releases it finds stay unwritten
-        until a revoke of their device writes them (on disk they are kept longer, the safe side)."""
-        if self._unreadable is not None:
-            self._load()
+        """Called with the book's lock held: ``None`` when the store was read, else the refusal's words."""
         return self._unreadable
+
+    def _retry(self) -> None:
+        """Called with no lock of the book held, before a try of ``connect`` or ``add``: while the store could not
+        be read, read it again OUTSIDE the book's lock, so that ``admit`` and ``check_connection`` never wait on
+        the file; one read at a time (a try that finds a read under way does not wait for it), at most once per
+        ``revocations_retry_s`` on the book's clock. What it then holds is taken; the releases it finds stay
+        unwritten until a revoke of their device writes them (on disk they are kept longer, the safe side)."""
+        if self.store is None or self._unreadable is None:
+            return
+        if not self._retry_lock.acquire(blocking=False):
+            return
+        try:
+            every, now = self.revocations_retry_s, self.clock()
+            if every is not None and self._last_try is not None and now < self._last_try + every:
+                return
+            self._last_try = now
+            try:
+                held = self.store.load()
+            except RevocationStoreError as exc:
+                with self._lock:
+                    if self._unreadable is not None:
+                        self._unreadable = unreadable_detail(str(exc))
+                return
+            with self._lock:
+                if self._unreadable is not None:
+                    self._take(held)
+        finally:
+            self._retry_lock.release()
 
     def _change_of(self, device_ids) -> Revocations:
         """Called with the book's lock held: these devices' revocations and every connection record they keep."""
@@ -429,6 +477,7 @@ class DeviceBook:
             raise PairingRefused("expiry_invalid", "a device's expiry is a finite number on the book's clock")
         scopes = device_scopes(grant.scopes)
         label = device_label(grant.label)
+        self._retry()
         with self._lock:
             if self.store is not None:
                 unreadable = self._readable()
@@ -464,6 +513,7 @@ class DeviceBook:
             return Admission(False, "connection_invalid")
         if self.store is not None and not storable_id(conn_id):
             return Admission(False, "connection_invalid", STORABLE_ID_WORDS)
+        self._retry()
         with self._lock:
             if self.store is not None:
                 unreadable = self._readable()

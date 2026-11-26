@@ -98,6 +98,19 @@ class EngineOutcome:
     trajectory_format: str | None = "stream-json"
 
 
+def _finite_seconds(timeout_s: float) -> float:
+    """The wait below has no deadline when ``timeout_s`` is NaN or Infinity, and a huge int overflows."""
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+        raise ValueError(f"a time limit must be a finite number of seconds, got {timeout_s!r}")
+    try:
+        number = float(timeout_s)
+    except OverflowError:
+        raise ValueError("a time limit must be a finite number of seconds") from None
+    if not math.isfinite(number):
+        raise ValueError(f"a time limit must be finite, got {timeout_s!r}")
+    return number
+
+
 def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeout_s: float) -> dict:
     """Run argv in its own session and wait for THAT process, at most ``timeout_s``.
 
@@ -114,6 +127,9 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
     and the Popen object reaps the engine whenever it does exit.
     Times are monotonic.
     """
+    if stdin is not None and not isinstance(stdin, bytes):
+        raise ValueError("stdin must be bytes")
+    timeout_s = _finite_seconds(timeout_s)
     started = time.monotonic()
     try:
         process = subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

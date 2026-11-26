@@ -43,6 +43,7 @@ from eval import gitutil, heldout
 from eval import record as record_mod
 from eval import scratch as scratch_mod
 from eval import suite as suite_mod
+from eval import validate as validate_mod
 
 DEV_SUITE = PACKAGE_ROOT / "devset" / "suite.json"
 DEFAULT_OUT = PACKAGE_ROOT / "results"
@@ -133,11 +134,12 @@ def grade(task, work: Path, scratch) -> dict:
     if done["timed_out"]:
         return {"verdict": "unresolved", "error": "tests_failed", "exit": None, "log": log, "seconds": done["seconds"],
                 "detail": f"hidden tests ran past {task.grading_timeout_s:g} s"}
+    # Exit 0 whose final summary shows nothing passed is the same as no test ran.
+    if done["exit"] == NO_TESTS_RAN or validate_mod.collected_tests_all_skipped(log):
+        return {"verdict": "not_graded", "error": "no_tests_ran", "exit": done["exit"], "log": log,
+                "seconds": done["seconds"], "detail": "the hidden-test command ran no test"}
     if done["exit"] == 0:
         return {"verdict": "resolved", "error": None, "detail": None, "exit": 0, "log": log, "seconds": done["seconds"]}
-    if done["exit"] == NO_TESTS_RAN:
-        return {"verdict": "not_graded", "error": "no_tests_ran", "exit": NO_TESTS_RAN, "log": log,
-                "seconds": done["seconds"], "detail": "the hidden-test command ran no test"}
     return {"verdict": "unresolved", "error": "tests_failed", "exit": done["exit"], "log": log,
             "seconds": done["seconds"], "detail": f"hidden tests exit {done['exit']}"}
 

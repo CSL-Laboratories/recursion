@@ -1,0 +1,7 @@
+{
+  "effect": {
+    "id": "dlv-00000000000000000000000000000013",
+    "kind": "queue_delivery"
+  },
+  "why": "turn_ended"
+}

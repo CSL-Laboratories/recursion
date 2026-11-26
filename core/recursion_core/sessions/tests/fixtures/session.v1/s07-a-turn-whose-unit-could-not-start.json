@@ -1,0 +1,45 @@
+{
+  "active_turn_id": null,
+  "budget": {
+    "cap_usd": 0
+  },
+  "created_at": "2026-11-14T09:00:10.000Z",
+  "engine_session_id": null,
+  "parent_session_id": null,
+  "principal": {
+    "id": "local",
+    "kind": "owner"
+  },
+  "revision": 3,
+  "route": {
+    "connection": {
+      "id": "made-up-login",
+      "kind": "subscription"
+    },
+    "engine": "claude_code",
+    "model": null
+  },
+  "session_id": "ses-00000000000000000000000000000010",
+  "spawn_kind": "root",
+  "state": "idle",
+  "tenant": "t1",
+  "worker": null,
+  "workspace": null,
+  "turns": [
+    {
+      "ended_at": "2026-11-14T09:00:11.000Z",
+      "expires_at": null,
+      "index": 0,
+      "outcome": "failed",
+      "result": {
+        "code": "engine_missing",
+        "detail": "no such binary",
+        "result_ref": null
+      },
+      "run_id": "run-00000000000000000000000000000011",
+      "started_at": null,
+      "state": "failed",
+      "turn_id": "turn-00000000000000000000000000000012"
+    }
+  ]
+}

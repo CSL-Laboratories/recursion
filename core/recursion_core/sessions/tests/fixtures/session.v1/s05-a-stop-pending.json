@@ -1,0 +1,59 @@
+{
+  "active_turn_id": "turn-0000000000000000000000000000000b",
+  "budget": {
+    "cap_usd": 0
+  },
+  "created_at": "2026-11-14T09:00:02.000Z",
+  "engine_session_id": null,
+  "parent_session_id": null,
+  "principal": {
+    "id": "local",
+    "kind": "owner"
+  },
+  "revision": 7,
+  "route": {
+    "connection": {
+      "id": "made-up-login",
+      "kind": "subscription"
+    },
+    "engine": "codex",
+    "model": null
+  },
+  "session_id": "ses-00000000000000000000000000000002",
+  "spawn_kind": "root",
+  "state": "stop_pending",
+  "tenant": "t1",
+  "worker": {
+    "alive": true,
+    "run_id": "run-00000000000000000000000000000003"
+  },
+  "workspace": null,
+  "turns": [
+    {
+      "ended_at": "2026-11-14T09:00:06.000Z",
+      "expires_at": null,
+      "index": 0,
+      "outcome": "waiting",
+      "result": {
+        "code": null,
+        "detail": "Done for now.",
+        "result_ref": null
+      },
+      "run_id": "run-00000000000000000000000000000003",
+      "started_at": "2026-11-14T09:00:03.000Z",
+      "state": "ended",
+      "turn_id": "turn-00000000000000000000000000000004"
+    },
+    {
+      "ended_at": null,
+      "expires_at": null,
+      "index": 1,
+      "outcome": null,
+      "result": null,
+      "run_id": "run-00000000000000000000000000000003",
+      "started_at": "2026-11-14T09:00:07.000Z",
+      "state": "running",
+      "turn_id": "turn-0000000000000000000000000000000b"
+    }
+  ]
+}

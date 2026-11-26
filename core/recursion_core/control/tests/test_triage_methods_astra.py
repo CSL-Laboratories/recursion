@@ -10,6 +10,7 @@ import copy
 import io
 import json
 import logging
+import signal
 import sys
 import threading
 import time
@@ -596,6 +597,68 @@ def _wait_until(predicate):
     return False
 
 
+class _BookkeepingFaultSlots(dict):
+    """A stand-in for the table's slot dict whose ``setdefault`` or ``pop`` fails once while the table lock is held.
+
+    ``how`` is "raise" (a RuntimeError) or "sigint" (a real SIGINT to this process; the default handler raises
+    KeyboardInterrupt inside the call, on the main thread, where unittest runs its tests).
+    """
+
+    def __init__(self, table, where, how):
+        super().__init__()
+        self.table, self.where, self.how, self.fired = table, where, how, []
+
+    def _fire(self, name):
+        if name != self.where or self.fired:
+            return
+        self.fired.append(self.table._slots_lock.locked())
+        if self.how == "raise":
+            raise RuntimeError("synthetic failure inside the slot bookkeeping")
+        signal.raise_signal(signal.SIGINT)
+
+    def setdefault(self, key, default=None):
+        self._fire("setdefault")
+        return dict.setdefault(self, key, default)
+
+    def pop(self, key, *default):
+        self._fire("pop")
+        return dict.pop(self, key, *default)
+
+
+def _bookkeeping_fault(where, how):
+    """Raise inside the slot bookkeeping of one dispatch on the main thread, then dispatch an unrelated id."""
+    table = make_commands(lambda ctx, params: {"code": "ok"})
+    table._slots = slots = _BookkeepingFaultSlots(table, where, how)
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        table.dispatch("session.turn", {"command_id": "command-one", "text": "hello"}, None, None)
+        raised = None
+    except (RuntimeError, KeyboardInterrupt) as exc:
+        raised = type(exc).__name__
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    observed = {"fired_under_lock": slots.fired, "raised": raised, "table_lock_held": table._slots_lock.locked()}
+    other_done, other = threading.Event(), []
+
+    def other_call():
+        try:
+            other.append(table.dispatch("session.queue", {"command_id": "command-unrelated"}, None, None))
+        except BaseException as exc:  # noqa: BLE001 - the observation is the failure mode
+            other.append(type(exc).__name__)
+        finally:
+            other_done.set()
+
+    other_thread = threading.Thread(target=other_call, daemon=True)
+    other_thread.start()
+    observed["other_finished"] = other_done.wait(_BOUND_S)
+    observed["other"] = list(other)
+    if table._slots_lock.locked():
+        table._slots_lock.release()  # the test lets the helper go; the product did not
+    other_thread.join(_BOUND_S)
+    observed["threads_left"] = other_thread.is_alive()
+    return observed
+
+
 class _Uncopyable:
     """A refusal value whose copy raises. The dispatcher must still answer."""
 
@@ -653,6 +716,19 @@ class SweepS2bRegressionTest(unittest.TestCase):
                 self.assertTrue(observed["retry_finished"], observed)
                 self.assertEqual(observed["retry"], [{"code": "ok"}], observed)
                 self.assertFalse(observed["threads_left"], observed)
+
+    def test_an_exception_or_interrupt_inside_the_bookkeeping_gives_the_table_lock_back(self):
+        expected = {"raise": "RuntimeError", "sigint": "KeyboardInterrupt"}
+        for where in ("setdefault", "pop"):
+            for how in ("raise", "sigint"):
+                with self.subTest(where=where, how=how):
+                    observed = _bookkeeping_fault(where, how)
+                    self.assertEqual(observed["fired_under_lock"], [True], observed)
+                    self.assertEqual(observed["raised"], expected[how], observed)
+                    self.assertFalse(observed["table_lock_held"], observed)
+                    self.assertTrue(observed["other_finished"], observed)
+                    self.assertEqual(observed["other"], [{"code": "ok"}], observed)
+                    self.assertFalse(observed["threads_left"], observed)
 
     def test_every_frame_after_acquire_with_a_waiter_queued_drops_the_lock(self):
         events = _post_acquire_events()

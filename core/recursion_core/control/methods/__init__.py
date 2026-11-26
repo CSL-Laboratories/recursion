@@ -726,23 +726,32 @@ class MethodTable:
     def _enter_count(self, key, marker):
         """Count this caller under the table lock and return its ``[lock, waiters]`` slot.
 
-        Acquire and release are one straight-line statement. A branch between them is a second
-        trace event, and an interruption on that event used to leave the table lock held, so
-        every command method waited. ``marker[0]`` is the slot before the lock is given back,
+        The ``with`` and its body are one line. A branch between taking and giving back the lock
+        is a second trace event, and an interruption on that event used to leave the table lock
+        held, so every command method waited. An exception or an interrupt raised inside the
+        bookkeeping leaves through the ``with``, which gives the lock back, but an interrupt from an
+        opcode trace on one of the 4 steps of the ``with`` exit itself still leaves it held, and
+        this caller's own ``_leave_count`` then waits on it. ``marker[0]`` is the slot before the lock is given back,
         so the caller can drop the count even when this function's return is itself interrupted.
         """
         lock = self._slots_lock
         slots = self._slots
         fresh = [threading.Lock(), 0]
-        lock.acquire(); slot = slots.setdefault(key, fresh); slot[1] += 1; marker.__setitem__(0, slot); lock.release(); return slot
+        with lock: slot = slots.setdefault(key, fresh); slot[1] += 1; marker.__setitem__(0, slot)
+        return slot
 
     def _leave_count(self, key, slot):
-        """Give this caller's waiter count back. The entry goes when it was the last waiter."""
+        """Give this caller's waiter count back. The entry goes when it was the last waiter.
+
+        An exception or an interrupt raised inside the bookkeeping leaves through the one-line
+        ``with``, which gives the table lock back, but an interrupt from an opcode trace on one of
+        the 4 steps of the ``with`` exit itself still leaves it held.
+        """
         lock = self._slots_lock
         slots = self._slots
         missing = object()
         choice = (missing, key)  # index 0 keeps the entry; index 1 drops it. No branch, so no second trace event.
-        lock.acquire(); slot[1] -= 1; slots.pop(choice[(slot[1] == 0) & (slots.get(key) is slot)], None); lock.release()
+        with lock: slot[1] -= 1; slots.pop(choice[(slot[1] == 0) & (slots.get(key) is slot)], None)
 
     def _with_slot(self, key, body):
         """Run ``body`` while this caller holds the command slot, then drop the slot before returning.

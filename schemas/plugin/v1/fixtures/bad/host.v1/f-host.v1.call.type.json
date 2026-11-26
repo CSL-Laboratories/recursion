@@ -1,0 +1,10 @@
+{
+  "type": "not-call",
+  "id": 1,
+  "name": "operator",
+  "args": {
+    "command": {
+      "command": "status"
+    }
+  }
+}

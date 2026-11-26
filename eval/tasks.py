@@ -222,7 +222,10 @@ def _meta(task_id_hint: str, meta: dict) -> dict:
 
 
 def load_txtar(path: Path) -> Task:
-    data = path.read_bytes()
+    # The repository stores eval txtar files with LF (.gitattributes). Read every CRLF pair as LF before the
+    # parse and the digest, so a working copy that holds CRLF gives the committed file's contents and pin.
+    # A lone CR is kept.
+    data = path.read_bytes().replace(b"\r\n", b"\n")
     _, files = txtar.parse(data.decode("utf-8"))
     if "task.json" not in files or "prompt.md" not in files:
         raise TaskError(f"{path.name}: needs task.json and prompt.md sections")

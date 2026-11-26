@@ -18,7 +18,7 @@ session. `check_operator_linger` only reads `loginctl show-user`; nothing here
 enables or disables lingering or touches any service. The daemon fails closed
 when operator Linger is not `yes`.
 
-Operator linger is not engine linger. Lucas (Nov 7, recorded on B6 and B9):
+Operator linger is not engine linger. The owner (Nov 7, recorded on B6 and B9):
 linger for the engine user conflicts with leaf containment. Owner-reported host
 evidence (gs-worker-nbg, Nov 7, recorded on CSL-728 and CSL-738): a lingering
 engine user inside a root-created wrapper unit ran `systemd-run --user` and
@@ -29,9 +29,9 @@ during runs: no linger and no running `user@<engine uid>.service`. So the engine
 user does not get its own lingering `systemd --user` daemon; Q38's "engine user
 gets its own daemon" clause stays open under that invariant.
 
-## Engine user: no linger, no user manager (Lucas, Nov 8)
+## Engine user: no linger, no user manager (the owner, Nov 8)
 
-Lucas's Nov 8 call replaces "Linger=yes for both": the operator keeps
+The owner's Nov 8 call replaces "Linger=yes for both": the operator keeps
 `Linger=yes`; the engine user gets `Linger=no` and no `user@<engine uid>.service`.
 Stop still ends just the one run. `engine_user.py` holds read-only pieces for the
 later cross-uid path, which this package still refuses. The daemon does not call

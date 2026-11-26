@@ -55,7 +55,7 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   This is not a containment or security boundary against a same-uid process.
 - Cross-uid (B6 proper) comes later and must require that the engine user has no
   user manager during runs: no linger and no running `user@<engine uid>.service`.
-  Engine linger plus an operator-owned leaf is not containment. Lucas, 2026-11-07,
+  Engine linger plus an operator-owned leaf is not containment. The owner, 2026-11-07,
   recorded on B6 and B9: "linger for the engine user and leaf containment
   conflict ... design the cross-uid path so the engine has no user manager during
   runs." Owner-reported host evidence (gs-worker-nbg, Ubuntu 26.04.1, kernel 7.0,
@@ -68,16 +68,16 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   processes. They exercise the trampoline, pidfd and evidence logic, not kernel
   cgroup behaviour. The live cell runs only when `RECURSION_CGROUP_ROOT` points at
   a writable delegated root. The hd18/escgrp/dwdump cells are not run here.
-- Open for Lucas (CSL-738 wiring): the launcher must sit in the delegated
+- Open for the owner (CSL-738 wiring): the launcher must sit in the delegated
   subtree, so if the daemon unit is the launcher, its runs sit inside the
   daemon's own unit and a default `KillMode=control-group` stop ends them,
   against §3.1 ("runs live outside the daemon's own unit"). Which process
   launches, and where the delegated root sits, is not decided here.
 - Child environment (B1) is not handled here: `env` is passed through as given.
 
-## B6 evidence contract (Lucas, 2026-11-08)
+## B6 evidence contract (the owner, 2026-11-08)
 
-Lucas's 2026-11-08 call: the engine user gets no linger and no systemd user manager;
+The owner's 2026-11-08 call: the engine user gets no linger and no systemd user manager;
 the operator keeps linger. `b6_evidence.evaluate(record)` judges a recorded host
 run against every B6 bar. It runs no probe, touches no systemd or cgroup, and
 switches no uid.

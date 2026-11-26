@@ -24,7 +24,7 @@ Start here:
 > session). GUI-timing supersession for ANCHOR's "terminal first, GUI later" is already
 > D-038; additions beyond D-038 live in `docs/v3/AMENDMENT-2026-10-24.md` (now in csl-research
 > history, see above). Status:
-> amendment proposed (2026-10-24); acceptance is a human decision by Lucas.
+> amendment proposed (2026-10-24); acceptance is a human decision by the owner.
 
 ## Layout
 

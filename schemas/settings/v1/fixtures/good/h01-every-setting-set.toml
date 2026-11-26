@@ -14,3 +14,6 @@ hidden_names = ["pin"]
 shown_names = []
 # Show ten characters of the digest of a long key.
 digest_chars = 10
+# Read a password label by rule too, and add one label word of your own; the shipped words stay.
+label_by_rule = true
+label_words = ["standinlabel"]

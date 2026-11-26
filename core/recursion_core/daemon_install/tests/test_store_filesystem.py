@@ -1036,6 +1036,195 @@ class SearchOnlyFoldersAboveTheStoresTests(unittest.TestCase):
 
 
 @unittest.skipUnless(LINUX, "the installer is Linux-only")
+@unittest.skipIf(LINUX and os.geteuid() == 0, "root searches and reads every folder whatever its mode, so a folder it "
+                 "cannot search or read cannot be made for it: run these as a person who is not root")
+class EveryAdvisedStepOpensNothingToOthersTests(unittest.TestCase):
+    """Each step a refusal of the walk advises (``store_ground_undecided``), done as the words write it, lets the
+    install finish and leaves the folder no wider than before for any other user; for a folder of another user no
+    mode change is advised at all. Another user's folder is a stand-in: ``os.fstat`` answers another owner for it
+    (a folder of another user cannot be made without root)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="store-ground-advice-")
+        self.addCleanup(tmp.cleanup)
+        self.case = os.path.realpath(tmp.name)
+        os.chmod(self.case, 0o700)
+        self.table = os.path.join(self.case, "mountinfo")
+        with open(self.table, "w", encoding="utf-8") as out:
+            out.write("20 1 0:20 / / rw,relatime shared:0 - ext4 src0 rw\n")
+        patcher = mock.patch.object(INSTALL, "_MOUNTINFO", self.table, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.parent = os.path.join(self.case, "parent")
+        self.home = os.path.join(self.parent, "home")
+        os.makedirs(self.home, 0o700)
+        self.others = set()  # (device, inode) of the folders another user owns, as os.fstat answers
+        real = os.fstat
+
+        def fstat(fd, *args, **kwargs):
+            info = real(fd, *args, **kwargs)
+            if (info.st_dev, info.st_ino) not in self.others:
+                return info
+            fields = list(info)
+            fields[4] = os.geteuid() + 1  # st_uid
+            return os.stat_result(fields)
+
+        patcher = mock.patch.object(INSTALL.os, "fstat", fstat)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def mode(self, path, mode):
+        os.chmod(path, mode)
+        self.addCleanup(os.chmod, path, 0o700)  # put back before the temporary folder is removed
+
+    def another_users(self, path):
+        info = os.stat(path)
+        self.others.add((info.st_dev, info.st_ino))
+
+    def handed_over(self, path):
+        info = os.stat(path)
+        self.others.discard((info.st_dev, info.st_ino))
+
+    def refused(self, call, *args, **kwargs):
+        with self.assertRaises(InstallRefused) as caught:
+            call(*args, **kwargs)
+        self.assertEqual(caught.exception.kind, "store_ground_undecided", caught.exception.detail)
+        self.assertNotIn("\n", caught.exception.detail)
+        return caught.exception.detail
+
+    def done_as_written(self, detail, folder):
+        """Run the command the words give, as written (the text after 'with: ', up to the end of the sentence), and
+        answer the folder's mode before and after; the command must be the person's own chmod of ``folder``."""
+
+        found = re.search(r"with: (chmod \S+ \S+?)\. ", detail)
+        self.assertIsNotNone(found, detail)
+        argv = shlex.split(found.group(1))
+        self.assertEqual(argv[0], "chmod")
+        self.assertTrue(argv[1].startswith("u+"), argv)  # the person's own bits: nobody else gains anything
+        self.assertEqual(argv[2], folder)
+        before = os.stat(folder)
+        subprocess.run(argv, check=True, capture_output=True, timeout=60)
+        after = os.stat(folder)
+        self.assertEqual(after.st_uid, before.st_uid)
+        self.assertEqual(stat.S_IMODE(after.st_mode) & 0o077, stat.S_IMODE(before.st_mode) & 0o077,
+                         "no wider for group or other users than before")
+        return stat.S_IMODE(after.st_mode)
+
+    def finishes(self, roots):
+        plan = install(roots, EXEC)
+        self.assertTrue(plan.stores)
+        for kind, path, made in plan.stores:
+            with self.subTest(store=kind):
+                self.assertTrue(made)
+                self.assertTrue(os.path.isfile(path))
+        return plan
+
+    def unchanged(self, folder, before):
+        after = os.stat(folder)
+        self.assertEqual((after.st_uid, stat.S_IMODE(after.st_mode)), (before.st_uid, stat.S_IMODE(before.st_mode)))
+
+    def test_another_users_store_folder_that_cannot_be_read_is_named_with_no_mode_change(self):
+        other = os.path.join(self.case, "other")
+        os.mkdir(other, 0o700)
+        self.mode(other, 0o300)  # search and write, not read
+        self.another_users(other)
+        paths = owned_paths(Roots(home=self.home, state_home=other))
+        for call, args in ((INSTALL.store_ground, (paths.store_dir,)), (INSTALL.check_store_ground, ((paths.store_dir,),)),
+                           (INSTALL.store_ground, (other,))):
+            with self.subTest(call=call.__name__, args=args):
+                detail = self.refused(call, *args)
+                self.assertEqual(detail, (
+                    f"Recursion creates no store in {other}: it belongs to another user and cannot be read (EACCES), "
+                    "and the stores would be made in it or below it, which the install does only from a folder that "
+                    "is yours and that you can read. Choose a place of your own for the stores: run recursiond "
+                    "install with XDG_STATE_HOME set to an absolute folder of yours on a local disk. Or have the "
+                    "folder's owner hand it over to your user, then run the command again."))
+                self.assertNotIn("chmod", detail)
+
+    def test_another_users_folder_above_that_cannot_be_searched_is_named_with_no_mode_change(self):
+        other = os.path.join(self.case, "other")
+        state = os.path.join(other, "state")
+        os.makedirs(state, 0o700)
+        self.another_users(other)
+        self.mode(other, 0o000)
+        paths = owned_paths(Roots(home=self.home, state_home=state))
+        for written in (paths.store_dir, state, os.path.join(other, "x", "..", "state")):
+            with self.subTest(written=written):
+                detail = self.refused(INSTALL.store_ground, written)
+                self.assertEqual(detail, (
+                    f"Recursion creates no store in {written}: {other} on the way to it belongs to another user and "
+                    "cannot be searched (EACCES), and the install needs search (x) permission on every folder above "
+                    "the store folder. Choose a place of your own for the stores: run recursiond install with "
+                    "XDG_STATE_HOME set to an absolute folder of yours on a local disk. Or have the folder's owner "
+                    "give search permission on it to your user alone, then run the command again."))
+                self.assertNotIn("chmod", detail)
+
+    def test_a_place_of_your_own_lets_the_install_finish_beside_another_users_folders(self):
+        unreadable = os.path.join(self.case, "unreadable")
+        os.mkdir(unreadable, 0o700)
+        unsearchable = os.path.join(self.case, "unsearchable")
+        os.makedirs(os.path.join(unsearchable, "state"), 0o700)
+        self.mode(unreadable, 0o300)
+        self.mode(unsearchable, 0o000)
+        self.another_users(unreadable)
+        self.another_users(unsearchable)
+        before = {folder: os.stat(folder) for folder in (unreadable, unsearchable)}
+        for refused in (unreadable, os.path.join(unsearchable, "state")):
+            self.refused(INSTALL.check_store_ground, (owned_paths(Roots(home=self.home, state_home=refused)).store_dir,))
+        mine = os.path.join(self.case, "mine")
+        os.mkdir(mine, 0o700)
+        plan = self.finishes(Roots(home=self.home, state_home=mine))  # the advised step: XDG_STATE_HOME, a place of yours
+        for kind, path, made in plan.stores:
+            self.assertFalse(path.startswith((unreadable + "/", unsearchable + "/")), path)
+        for folder, info in before.items():
+            with self.subTest(folder=folder):
+                self.unchanged(folder, info)
+        self.assertFalse(os.path.lexists(os.path.join(unreadable, "recursion")))
+
+    def test_a_folder_handed_over_then_its_own_advice_done_as_written_lets_the_install_finish(self):
+        other = os.path.join(self.case, "other")
+        os.mkdir(other, 0o700)
+        self.mode(other, 0o300)
+        self.another_users(other)
+        roots = Roots(home=self.home, state_home=other)
+        self.refused(INSTALL.check_store_ground, (owned_paths(roots).store_dir,))
+        self.handed_over(other)  # the owner's step: the folder is now the person's
+        detail = self.refused(install, roots, EXEC)
+        self.assertIn(f"{other} cannot be read (EACCES)", detail)
+        self.assertEqual(self.done_as_written(detail, other), 0o700)
+        self.finishes(roots)
+
+    def test_your_own_folder_above_that_cannot_be_searched_done_as_written_lets_the_install_finish(self):
+        self.mode(self.parent, 0o000)
+        detail = self.refused(INSTALL.store_ground, self.home)
+        self.assertIn(f"give your user search permission on it with: chmod u+x {self.parent}. ", detail)
+        self.assertEqual(self.done_as_written(detail, self.parent), 0o100)
+        self.finishes(Roots(home=self.home))
+
+    def test_your_own_store_folder_that_cannot_be_read_done_as_written_lets_the_install_finish(self):
+        paths = owned_paths(Roots(home=self.home))
+        os.makedirs(paths.store_dir, 0o700)
+        self.mode(paths.store_dir, 0o300)
+        detail = self.refused(install, Roots(home=self.home), EXEC)
+        self.assertIn(f"with: chmod u+rx {paths.store_dir}. ", detail)
+        self.assertEqual(self.done_as_written(detail, paths.store_dir), 0o700)
+        self.finishes(Roots(home=self.home))
+
+    def test_the_owner_given_search_to_your_user_alone_then_lets_the_install_finish(self):
+        other = os.path.join(self.case, "other")
+        state = os.path.join(other, "state")
+        os.makedirs(state, 0o700)
+        self.another_users(other)
+        self.mode(other, 0o000)
+        roots = Roots(home=self.home, state_home=state)
+        self.refused(INSTALL.check_store_ground, (owned_paths(roots).store_dir,))
+        self.handed_over(other)  # in the stand-in the person is the folder's owner: their own search bit only
+        detail = self.refused(INSTALL.check_store_ground, (owned_paths(roots).store_dir,))
+        self.assertEqual(self.done_as_written(detail, other), 0o100)
+        self.finishes(roots)
+
+
+@unittest.skipUnless(LINUX, "the installer is Linux-only")
 class TheReadmeSaysWhatTheInstallerDoesTests(unittest.TestCase):
     """The README's sentences on the key, its ledger and the stores after a failed step are true of the code."""
 

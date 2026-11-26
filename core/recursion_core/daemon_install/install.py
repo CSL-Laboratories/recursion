@@ -92,6 +92,22 @@ _UNSEARCHABLE = ("{folder} cannot be searched ({code}): the install needs search
 _UNREADABLE = ("{folder} cannot be read ({code}): the stores are made in it or below it, so the install needs read "
                "and search permission on it, and only search permission on the folders above it; give your user "
                "that permission with: {how}")
+# The whole details of ``store_ground_undecided`` for a folder of ANOTHER user that the walk cannot search (a
+# folder above the store folder) or read (the last folder it reaches). No mode change is advised for a folder that
+# is not the person's: opening it to every user would open the way to the stores, and the install would still make
+# no store in a folder that is not the person's. The ways that leave every folder as it is: a place of the
+# person's own (XDG_STATE_HOME, the variable ``layout.state_home`` reads), or the owner's own step.
+_NOT_YOURS_UNREADABLE = ("Recursion creates no store in {folder}: it belongs to another user and cannot be read "
+                         "({code}), and the stores would be made in it or below it, which the install does only from "
+                         "a folder that is yours and that you can read. Choose a place of your own for the stores: "
+                         "run recursiond install with XDG_STATE_HOME set to an absolute folder of yours on a local "
+                         "disk. Or have the folder's owner hand it over to your user, then run the command again.")
+_NOT_YOURS_UNSEARCHABLE = ("Recursion creates no store in {store}: {folder} on the way to it belongs to another user "
+                           "and cannot be searched ({code}), and the install needs search (x) permission on every "
+                           "folder above the store folder. Choose a place of your own for the stores: run recursiond "
+                           "install with XDG_STATE_HOME set to an absolute folder of yours on a local disk. Or have "
+                           "the folder's owner give search permission on it to your user alone, then run the command "
+                           "again.")
 # The whole details of ``store_ground_changed``: a folder read was moved or replaced before, or while, the
 # stores were made.
 _CHANGED_BEFORE = ("{where} was moved or replaced after its disk was read and before the stores were made, so "
@@ -193,22 +209,31 @@ def _undecided(folder: str, why: str) -> InstallRefused:
     return InstallRefused("store_ground_undecided", _UNDECIDED.format(folder=_shown(folder), why=why))
 
 
-def _how(fd: int, path: str, bits: str) -> str:
-    """The command that gives the person ``bits`` on the folder ``fd`` is (``chmod``): for their own folder their
-    own bits, else everyone's, run by the folder's owner."""
+def _mine(fd: int) -> bool:
+    """True when the folder ``fd`` is the person's own (its owner is the effective user); False when it is another
+    user's, or when its owner cannot be read (then no mode change is advised either)."""
 
     try:
-        mine = os.fstat(fd).st_uid == os.geteuid()
+        return os.fstat(fd).st_uid == os.geteuid()
     except (OSError, AttributeError):
-        mine = False
-    return f"chmod u+{bits} {_quoted(path)}" if mine else f"chmod a+{bits} {_quoted(path)}, run by its owner"
+        return False
+
+
+def _how(path: str, bits: str) -> str:
+    """The command that gives the person ``bits`` on their OWN folder ``path``: their own bits only (``u+``), so no
+    other user gains anything by it. Never asked for a folder of another user (``_mine``)."""
+
+    return f"chmod u+{bits} {_quoted(path)}"
 
 
 def _cannot_search(fd: int, path: str, folder: str, exc: OSError) -> InstallRefused:
     """``store_ground_undecided`` for the folder ``fd`` (``path``) the walk holds and cannot search below."""
 
     code = errno.errorcode.get(exc.errno, exc.errno)
-    return _undecided(folder, _UNSEARCHABLE.format(folder=_shown(path), code=code, how=_how(fd, path, "x")))
+    if not _mine(fd):
+        return InstallRefused("store_ground_undecided", _NOT_YOURS_UNSEARCHABLE.format(
+            store=_shown(folder), folder=_shown(path), code=code))
+    return _undecided(folder, _UNSEARCHABLE.format(folder=_shown(path), code=code, how=_how(path, "x")))
 
 
 def _for_reading(fd: int, path: str, folder: str) -> int:
@@ -223,7 +248,10 @@ def _for_reading(fd: int, path: str, folder: str) -> int:
         return os.open(".", _FOLDER_OPEN, dir_fd=fd)
     except OSError as exc:
         code = errno.errorcode.get(exc.errno, exc.errno)
-        raise _undecided(folder, _UNREADABLE.format(folder=_shown(path), code=code, how=_how(fd, path, "rx"))) from None
+        if not _mine(fd):
+            raise InstallRefused("store_ground_undecided", _NOT_YOURS_UNREADABLE.format(
+                folder=_shown(path), code=code)) from None
+        raise _undecided(folder, _UNREADABLE.format(folder=_shown(path), code=code, how=_how(path, "rx"))) from None
 
 
 def _walk(folder: str) -> tuple[int, str, tuple[str, ...], str, str]:

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "theme.v1.json",
+  "title": "gui.theme/1",
+  "x-version": "1",
+  "description": "One operator theme as data. Tokens are the five colours bg, fg, muted, accent and border (#rrggbb), plus optional density and radius. The core compiles them to custom properties on [data-theme-scope] and refuses the whole document otherwise. Contrast floors (fg and muted at least 4.5:1 against bg, accent at least 3:1) are not expressible here; the parser enforces them. A radius of 4.0 is the same JSON number as 4 to a schema checker; the parser refuses that too.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "name", "title", "tokens"],
+  "properties": {
+    "schema": {"const": "gui.theme/1"},
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}(?!\\n)$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+(?!\\n)$"
+    },
+    "tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bg", "fg", "muted", "accent", "border"],
+      "properties": {
+        "bg": {"$ref": "#/$defs/colour"},
+        "fg": {"$ref": "#/$defs/colour"},
+        "muted": {"$ref": "#/$defs/colour"},
+        "accent": {"$ref": "#/$defs/colour"},
+        "border": {"$ref": "#/$defs/colour"},
+        "density": {"enum": ["compact", "normal", "roomy"]},
+        "radius": {"enum": [0, 2, 4, 8]}
+      }
+    }
+  },
+  "$defs": {
+    "colour": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}(?!\\n)$"
+    }
+  }
+}

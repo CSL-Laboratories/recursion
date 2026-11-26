@@ -1,0 +1,14 @@
+{
+  "schema": "gui.theme/1",
+  "name": "roomy",
+  "title": "Roomy",
+  "tokens": {
+    "bg": "#101418",
+    "fg": "#f2f4f7",
+    "muted": "#b8c0cc",
+    "accent": "#7cc4ff",
+    "border": "#3a4450",
+    "density": "roomy",
+    "radius": 8
+  }
+}

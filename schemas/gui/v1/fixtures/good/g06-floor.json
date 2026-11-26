@@ -1,0 +1,12 @@
+{
+  "schema": "gui.theme/1",
+  "name": "floor",
+  "title": "Floor",
+  "tokens": {
+    "bg": "#ffffff",
+    "fg": "#767676",
+    "muted": "#767676",
+    "accent": "#949494",
+    "border": "#000000"
+  }
+}

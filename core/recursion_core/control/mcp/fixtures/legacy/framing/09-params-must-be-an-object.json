@@ -1,0 +1,82 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "framing/09-params-must-be-an-object",
+  "protocol": "2025-06-18",
+  "summary": "A request whose params are not an object is invalid params.",
+  "source": "MCP 2025-06-18 basic/index (Messages) and basic/transports (stdio); JSON-RPC 2.0 sections 4-5",
+  "api": [],
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "ping",
+        "params": [
+          1
+        ]
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params: params must be an object"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "ping",
+        "params": "x"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params: params must be an object"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "ping",
+        "params": null
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 5,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params: params must be an object"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "ping",
+        "params": {}
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 6,
+          "result": {}
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

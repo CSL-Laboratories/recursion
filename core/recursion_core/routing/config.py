@@ -1,6 +1,6 @@
 """The routing config: ``routing.json`` beside ``routes.json``, and the cross-field rules its schema cannot state.
 
-Lucas's grill Q45 answer (Nov 6, 2026): "It should be default + customizable + hand picked. Hand picked
+The owner's grill Q45 answer (2026-11-06): "It should be default + customizable + hand picked. Hand picked
 wins". A routing config has:
 
 * ``logins``: each one names a connection (``connection_id``, the route contract's
@@ -27,7 +27,7 @@ The loader checks, before any entry is used, the rules a JSON Schema cannot stat
   vendor cannot be configured, so nothing can rotate onto it;
 * the Claude subscription is bound to ``claude_code`` and nothing else (grill Q12, PRODUCT.md 3.3:
   "We can use Anthropics signed in subscription for their CLI, but we need to use their API Key for
-  other harnesses"). No other vendor/engine pairing is refused here: Lucas's Nov 8 answer lets a
+  other harnesses"). No other vendor/engine pairing is refused here: the owner's 2026-11-08 answer lets a
   subscription run through other harnesses' sign-ins, and ``subscription_routes`` decides which;
 * the login bound to an engine is the connection ``routes.json`` launches that engine with, so a
   decision never names one login while the launch uses another;

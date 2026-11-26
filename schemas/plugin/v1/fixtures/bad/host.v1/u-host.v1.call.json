@@ -1,0 +1,11 @@
+{
+  "type": "call",
+  "id": 1,
+  "name": "operator",
+  "args": {
+    "command": {
+      "command": "status"
+    }
+  },
+  "x_nobody_defined": true
+}

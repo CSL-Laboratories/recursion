@@ -63,7 +63,7 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   the profile names, and refuses (`launch_refused`) when custody holds no key for it. The full
   child-env rules (B1, CSL-785, #320) are a separate module.
 
-## Claude Code driver (Lucas's correction, Nov 7 ~6:34pm PST)
+## Claude Code driver (the owner's correction, Nov 7 ~6:34pm PST)
 
 This replaces the Nov 8 briefing sentence "Refuse --bare. Clear apiKeyHelper, CLAUDE_CODE_OAUTH_TOKEN and
 CLAUDE_CODE_SIMPLE from the engine environment." Each run uses the route the user picked, and only that

@@ -46,7 +46,10 @@ The rules this module keeps:
 * NEVER SHOWN, under any cap and under ``"none"``, not in part and not by its length: the value and the
   default of a row declared to hold a secret, a sign-in or an address (``Setting.holds``), which show only
   ``<set; hidden by its declaration>`` or ``<not set>``, by declaration and with no pattern, and never in a
-  note, a digest or a hint, whatever ``status.shown_names`` says; the value of a
+  note, a digest or a hint, whatever ``status.shown_names`` says (one note still counts: the note for a file
+  that is not TOML gives the TOML reader's line and column and nothing else of the line, and on a declared
+  row's line that column counts the characters before it; its line, and the line of the note for a file that
+  is not UTF-8, counts the lines before it); the value of a
   setting whose name holds a word of the row ``status.hidden_names`` (the first net: by name, whatever the
   value looks like); a text that looks like a key or a password; and a sign-in, by one rule on each run of
   text (the sign-in rule). A run is what stands between two white-space characters as Python counts them
@@ -687,6 +690,10 @@ def _flatten(table: dict, prefix: str = ""):
             yield name, value
 
 
+# The place the TOML reader puts at the end of its words; the note keeps it and none of the words before it.
+_TOML_PLACE = re.compile(r"\((?:at line \d+, column \d+|at end of document)\)\Z")
+
+
 def _read(path: Path) -> tuple[dict | None, str | None]:
     """The parsed file, or (None, None) when there is no file, or (None, why) when it cannot be used."""
 
@@ -725,8 +732,11 @@ def _read(path: Path) -> tuple[dict | None, str | None]:
     except UnicodeDecodeError as exc:  # its line only: a byte's place would tell the length of what stands before it
         line = data.count(b"\n", 0, exc.start) + 1
         return None, f"is not UTF-8 (at line {line}); save it as UTF-8"
-    except tomllib.TOMLDecodeError as exc:  # its text ends with the line and column, as the reader reports them
-        return None, f"is not TOML: {exc}; correct the file there"
+    except tomllib.TOMLDecodeError as exc:  # its place only: the reader's words can name a character of a value
+        place = _TOML_PLACE.search(str(exc))
+        if place is None:
+            return None, "is not TOML; correct the file"
+        return None, f"is not TOML {place.group(0)}; correct the file there"
     except (ValueError, RecursionError):  # plain ones, with no line; their words can count a number's digits
         return None, ("holds a value or a nesting the TOML reader cannot take (a whole number with more digits than "
                       "this interpreter reads, or lists, tables or keys nested deeper than it follows); shorten it")

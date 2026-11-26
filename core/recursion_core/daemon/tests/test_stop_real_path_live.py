@@ -11,22 +11,33 @@ The stand-in run: the main forks a child; the child forks a grandchild and exits
 calls setsid(), ignores SIGINT and SIGTERM, writes its pid, session and process group, and ends by
 itself after ``STANDIN_LIFE_S``. ``run.stop`` must answer ``stopped`` only once that grandchild is
 gone, it must be gone within the unit's own stop bound, and the daemon's row must read terminated.
+The unit's stop properties are checked against the values written out below, each with what a
+person would meet if it were otherwise.
 
 The case starts units in the caller's user manager, so it runs only when ``LIVE_CELLS_ENV`` is set
 to 1, a systemd user manager answers and its systemd-run can pass argv verbatim (the launcher
 refuses an older one). Everywhere else it skips and says why. It ends only what it started: its
-own grandchild, through a pidfd and after the stand-in's mark is read again, and its own unit by
+own grandchild, through a pidfd and after the stand-in's mark is read again, and its own units by
 name. A cleanup that had to end a survivor fails the case.
+
+Whatever ends the case, even a kill of the test run itself, it leaves nothing behind:
+* its folder is the runtime directory of a holder unit of its own (``HOLDER_PREFIX``), a unit
+  whose one process waits on a pidfd of the test process; when the test process ends, the holder
+  ends, and systemd removes the folder and the unit (``--collect``);
+* the run unit is bound to the holder (``BindsTo=``), so it is stopped when the holder ends, and
+  carries ``CollectMode=inactive-or-failed``, so systemd unloads it once it is inactive or failed;
+* at the start, a holder unit or folder of an earlier run of this case whose test process is gone
+  is removed, found by ``HOLDER_PREFIX``, a name only this case uses.
 """
 import os
 from pathlib import Path
 import re
 import secrets
 import select
+import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -41,7 +52,36 @@ CASE_TIMEOUT_S = 90          # the whole case, start to cleanup
 CONFIRM_TIMEOUT_S = 10.0     # confirm_timeout_s handed to the control API
 STOP_MARGIN_S = 3.0          # scheduling slack on top of the unit's own TimeoutStopSec
 WAIT_FILE_S = 15.0           # how long the stand-in's pid files are waited for
-CALL_TIMEOUT_S = 20          # each systemctl call of the test
+CALL_TIMEOUT_S = 20          # each systemctl or systemd-run call of the test
+HOLDER_TASKS_MAX = 2         # TasksMax of the holder unit (its one waiting process)
+HOLDER_MARGIN_S = 30         # the holder's RuntimeMaxSec is CASE_TIMEOUT_S plus this
+
+# The name of this case's holder units and folders: <prefix><test pid>-<random hex>.
+HOLDER_PREFIX = 'rc-stop-real-live-'
+
+# What a person relies on when they press Stop, as systemd must report it for the run unit.
+# Written out here, not read from the launcher, so that a change of the launcher's values turns
+# this case red instead of moving the case with it.
+#
+# The first signal is SIGINT, the signal of Ctrl-C. The engines treat it as the person's own
+# interrupt: they write out what they have (the session, the last turn) and end their own way. If
+# the first signal were SIGTERM or SIGKILL, a person who pressed Stop could find the last turn lost
+# and the session unable to resume.
+EXPECTED_KILL_SIGNAL = signal.SIGINT
+# The wait between that first signal and the hard end of whatever ignores it. It is what a person
+# waits between pressing Stop and reading 'stopped' when a process will not end by itself; if it
+# grew, Stop would seem to hang, and past the confirm window the person would read 'pending'.
+# The value is a figure of the product (``launcher.STOP_PROPERTIES``), not yet a row of the
+# person's settings; it is pinned here at the value the Stop procedure states.
+EXPECTED_STOP_WAIT_S = 2.0
+# The hard end follows the wait. Without it, a process that ignores SIGINT (as the grandchild here
+# does) would go on running and spending after Stop, and the person would never read 'stopped'.
+EXPECTED_SEND_SIGKILL = 'yes'
+# Stop reaches the whole control group, not the main process alone: a detached grandchild is ended
+# too. With KillMode=process it would outlive the Stop the person asked for.
+EXPECTED_KILL_MODE = 'control-group'
+# Child control groups an engine makes stay inside the unit, so Stop reaches them as well.
+EXPECTED_DELEGATE = 'yes'
 
 # The stand-in. argv: <pid file> <mark> <life seconds> <setsid 1|0>. The mark is only in argv, so
 # every process of the tree carries it in /proc/<pid>/cmdline (fork without exec keeps it).
@@ -69,8 +109,16 @@ os.rename(out + ".main.tmp", out + ".main")
 time.sleep(life)
 '''
 
+# The holder's one process: it waits until the test process (argv[1]) has ended, then exits.
+HOLDER_WAIT = r'''
+import os, select, sys
+fd = os.pidfd_open(int(sys.argv[1]))
+select.select([fd], [], [])
+'''
+
 _DURATION = re.compile(r'(\d+(?:\.\d+)?)(us|ms|min|s)')
 _SCALE = {'us': 1e-6, 'ms': 1e-3, 's': 1.0, 'min': 60.0}
+_HOLDER_NAME = re.compile(re.escape(HOLDER_PREFIX) + r'(\d+)-[0-9a-f]+')
 
 
 def systemd_seconds(text):
@@ -86,13 +134,18 @@ def _user_systemctl(*args):
                           timeout=CALL_TIMEOUT_S, check=False)
 
 
+def runtime_dir():
+    """The folder under which the user manager makes a unit's RuntimeDirectory."""
+    return Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
+
+
 def live_gate():
     """None when the live case can run here; otherwise why it cannot, in words a person can act on."""
     if not sys.platform.startswith('linux'):
         return 'needs Linux: Stop ends a run through a systemd user unit and its control group'
     if os.environ.get(LIVE_CELLS_ENV) != '1':
         return (f'starts transient units in your systemd user manager; set {LIVE_CELLS_ENV}=1 to run it '
-                '(the hosted checks do not set it and have no user manager)')
+                '(the hosted checks do not set it)')
     if not hasattr(os, 'pidfd_open'):
         return 'needs os.pidfd_open (Linux 5.3 or later) to end only its own stand-in'
     try:
@@ -101,6 +154,9 @@ def live_gate():
         return f'no systemd user manager answered ({type(exc).__name__}); start one with a login session or lingering'
     if state not in ('running', 'degraded'):
         return f'the systemd user manager is {state or "not answering"}; it must be running to start transient units'
+    if not runtime_dir().is_dir():
+        return (f'the user manager\'s runtime folder {runtime_dir()} is missing; set XDG_RUNTIME_DIR to it '
+                '(this case keeps its files there so that they go when the case ends)')
     from recursion_core.daemon.launcher import VERBATIM_ARGV_MIN_SYSTEMD
     try:
         text = subprocess.run(['systemd-run', '--version'], capture_output=True, text=True,
@@ -142,6 +198,43 @@ def pidfd_ended(fd):
     return bool(select.select([fd], [], [], 0)[0])
 
 
+def unit_props(unit, names):
+    text = _user_systemctl('show', '-p', ','.join(names), '--', unit).stdout
+    return dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
+
+
+def remove_leftovers():
+    """Remove what an earlier run of this case left when its test process was ended from outside.
+
+    Only names of this case's holders count (``HOLDER_PREFIX``, the test pid, random hex), and only
+    when that test process is gone: a holder of a run of this case that is still going is left
+    alone. Returns the names removed.
+    """
+    removed = []
+    listing = _user_systemctl('list-units', '--all', '--plain', '--no-legend', '--', HOLDER_PREFIX + '*').stdout
+    for line in listing.splitlines():
+        unit = (line.split() or [''])[0]
+        found = _HOLDER_NAME.fullmatch(unit[:-len('.service')] if unit.endswith('.service') else '')
+        if found is None:
+            continue
+        pid = int(found.group(1))
+        if pid == os.getpid() or alive(pid):
+            continue
+        _user_systemctl('stop', '--', unit)
+        _user_systemctl('reset-failed', '--', unit)
+        removed.append(unit)
+    for entry in runtime_dir().glob(HOLDER_PREFIX + '*'):
+        found = _HOLDER_NAME.fullmatch(entry.name)
+        if found is None or entry.is_symlink() or not entry.is_dir() or entry.stat().st_uid != os.getuid():
+            continue
+        pid = int(found.group(1))
+        if pid == os.getpid() or alive(pid):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed.append(str(entry))
+    return removed
+
+
 class _CaseTimeout(Exception):
     pass
 
@@ -162,21 +255,22 @@ class StopOnTheRealPathTests(unittest.TestCase):
         self.addCleanup(signal.signal, signal.SIGALRM, previous)
         self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
 
-        holder = tempfile.TemporaryDirectory(prefix='rc-stop-real-')
-        self.addCleanup(holder.cleanup)
-        self.tmp = Path(holder.name)
-        os.chmod(self.tmp, 0o700)
+        self.leftovers_removed = remove_leftovers()
+        self.tmp = self._start_holder()
         self.mark = 'rc-stop-real-' + secrets.token_hex(8)
         self.units, self.pidfds, self.processes = [], [], []
-        self.survivors = []
         self.addCleanup(self._end_own)
 
+        holder_unit = self.holder_unit
+
         class BoundedUnitManager(launcher.EngineUnitManager):
-            """The product's manager; every run unit also gets the test's TasksMax and RuntimeMaxSec."""
+            """The product's manager; every run unit also gets the test's bounds and is bound to the holder."""
 
             def prepare(self, unit, *, properties=(), working_directory=None):
                 super().prepare(unit, properties=(*properties, f'TasksMax={UNIT_TASKS_MAX}',
-                                                  f'RuntimeMaxSec={UNIT_RUNTIME_MAX_S}'),
+                                                  f'RuntimeMaxSec={UNIT_RUNTIME_MAX_S}',
+                                                  'CollectMode=inactive-or-failed',
+                                                  f'BindsTo={holder_unit}'),
                                 working_directory=working_directory)
 
         self.launcher_module = launcher
@@ -192,6 +286,35 @@ class StopOnTheRealPathTests(unittest.TestCase):
 
     def _timed_out(self, signum, frame):
         raise _CaseTimeout(f'the live Stop case passed {CASE_TIMEOUT_S} s')
+
+    def _start_holder(self):
+        """Start this case's holder unit; its runtime directory is the case's folder, gone with the unit."""
+        name = f'{HOLDER_PREFIX}{os.getpid()}-{secrets.token_hex(6)}'
+        self.holder_unit = name + '.service'
+        folder = runtime_dir() / name
+        done = subprocess.run(
+            ['systemd-run', '--user', '--quiet', '--collect', '--unit=' + self.holder_unit,
+             '--service-type=exec', '--property=RuntimeDirectory=' + name,
+             '--property=RuntimeDirectoryMode=0700', f'--property=TasksMax={HOLDER_TASKS_MAX}',
+             f'--property=RuntimeMaxSec={CASE_TIMEOUT_S + HOLDER_MARGIN_S}',
+             '--', sys.executable, '-I', '-c', HOLDER_WAIT, str(os.getpid())],
+            capture_output=True, text=True, timeout=CALL_TIMEOUT_S, check=False)
+        self.addCleanup(self._stop_holder, folder)
+        if done.returncode != 0 or not folder.is_dir():
+            self.fail(f'the holder unit {self.holder_unit} did not start with its folder {folder}: '
+                      f'{done.stderr.strip() or done.returncode}')
+        info = folder.stat()
+        if folder.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            self.fail(f'{folder} is not a private folder of this user')
+        return folder
+
+    def _stop_holder(self, folder):
+        _user_systemctl('stop', '--', self.holder_unit)
+        _user_systemctl('reset-failed', '--', self.holder_unit)
+        left = unit_props(self.holder_unit, ['LoadState']).get('LoadState')
+        if left != 'not-found' or folder.exists():
+            self.fail(f'after the case the holder unit reads {left} and its folder is '
+                      f'{"still there" if folder.exists() else "gone"}')
 
     def start_run(self, params):
         """The control API's starter: one launch through ProductionLauncher, bound to the API's run id."""
@@ -236,8 +359,7 @@ class StopOnTheRealPathTests(unittest.TestCase):
         for unit in self.units:
             _user_systemctl('stop', '--', unit)
             _user_systemctl('reset-failed', '--', unit)
-        left = [unit for unit in self.units
-                if 'LoadState=not-found' not in _user_systemctl('show', '-p', 'LoadState', '--', unit).stdout]
+        left = [unit for unit in self.units if unit_props(unit, ['LoadState']).get('LoadState') != 'not-found']
         if ended or left:
             self.fail(f'cleanup had to end stand-in pids {ended}; units still loaded: {left}')
 
@@ -255,9 +377,8 @@ class StopOnTheRealPathTests(unittest.TestCase):
         mpid, msid, _mpgrp = self.wait_file(self.tmp / 'standin.pid.main')
         gfd = self.own_pidfd(gpid)
         self.own_pidfd(mpid)
-        props = dict(line.split('=', 1) for line in _user_systemctl(
-            'show', '-p', 'KillMode,KillSignal,TimeoutStopUSec,SendSIGKILL,Delegate', '--', unit).stdout.splitlines()
-            if '=' in line)
+        props = unit_props(unit, ['KillMode', 'KillSignal', 'TimeoutStopUSec', 'SendSIGKILL', 'Delegate',
+                                  'CollectMode', 'BindsTo'])
 
         self.assertTrue(alive(gpid), 'the grandchild must be alive before Stop')
         self.assertEqual((gsid, gpgrp), (gpid, gpid), 'the grandchild must lead a session of its own')
@@ -290,14 +411,18 @@ class StopOnTheRealPathTests(unittest.TestCase):
         self.assertEqual((record.get('stop_attestation') or {}).get('cgroup'), group, record)
         self.assertEqual(self.daemon.registry.get(run_id).state, 'terminated')
 
-        # What systemd reports for the unit is what the product asks for in STOP_PROPERTIES
-        # (KillSignal=SIGINT, TimeoutStopSec=2s, SendSIGKILL=yes) and in EngineUnitManager.start.
-        asked_for = dict(item.split('=', 1) for item in self.launcher_module.STOP_PROPERTIES)
-        self.assertEqual(props.get('KillMode'), 'control-group', props)
-        self.assertEqual(props.get('KillSignal'), str(int(signal.Signals[asked_for['KillSignal']])), props)
-        self.assertEqual(bound, systemd_seconds(asked_for['TimeoutStopSec']), props)
-        self.assertEqual(props.get('SendSIGKILL'), asked_for['SendSIGKILL'], props)
-        self.assertEqual(props.get('Delegate'), 'yes', props)
+        # What systemd reports for the run unit, against the values written out at the top.
+        self.assertEqual(props.get('KillSignal'), str(int(EXPECTED_KILL_SIGNAL)),
+                         f'the first signal of Stop must be SIGINT: {props}')
+        self.assertEqual(bound, EXPECTED_STOP_WAIT_S,
+                         f'the wait before the hard end must be {EXPECTED_STOP_WAIT_S} s: {props}')
+        self.assertEqual(props.get('SendSIGKILL'), EXPECTED_SEND_SIGKILL,
+                         f'the hard end must follow the wait: {props}')
+        self.assertEqual(props.get('KillMode'), EXPECTED_KILL_MODE, props)
+        self.assertEqual(props.get('Delegate'), EXPECTED_DELEGATE, props)
+        # The case's own hygiene: the run unit goes when it ends or fails, and with the case.
+        self.assertEqual(props.get('CollectMode'), 'inactive-or-failed', props)
+        self.assertIn(self.holder_unit, props.get('BindsTo', '').split(), props)
 
 
 if __name__ == '__main__':

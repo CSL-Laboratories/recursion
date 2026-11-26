@@ -45,17 +45,21 @@ the phone door of this lane's later slices keep, so that they are tested before 
   back keeps a record longer; one that moved forward may forget it early.
 * A store that cannot be read at the start fails closed: ``connect`` and ``add`` refuse everything with
   ``revocations_unreadable`` (read again at each try) until it can be read, because a lost record must never
-  admit a revoked id. A revocation whose write fails still holds in memory, and ``revoke`` raises
-  ``RevocationNotWritten`` (its ``connections`` are the ones to close), which says the revocation holds until
-  the daemon stops but was not written; the next revoke of that device writes it again.
+  admit a revoked id. A revocation whose write fails, for any reason the store gives, still holds in memory
+  for as long as the daemon runs, and ``revoke`` raises ``RevocationNotWritten`` (its ``connections`` are the
+  ones to close), whose words say plainly that the device is NOT revoked on disk, that after a restart it
+  would be let in again, what stopped the write, and to revoke it again before any restart. The device is
+  listed in ``status`` before the write can fail, until a write is known to hold it, and every later write
+  carries it. A connection record the store cannot write is left out of the write and named, never the
+  device's revocation, and never another device's write.
 * ``connect`` and ``revoke`` are decided under one lock: a connection is either refused or named by the
   revocation, never admitted and missed. Writes are made outside that lock, one at a time in the order of the
   changes, so ``admit`` and ``check_connection`` never wait on the disk.
 * A record the book hands out is a frozen snapshot: changing it is refused, and the book's own state
   changes only under its lock (a revocation replaces the record).
 * A wrong argument (no grant, a device id that is not a non-empty ``str``, a subclass of ``str`` included,
-  an expiry that is not a finite number, a connection id that cannot be a key, or with a store one it cannot
-  keep) is a typed refusal, never a ``TypeError``.
+  an expiry that is not a finite number, a connection id that cannot be a key, or with a store one the record
+  cannot write and read back the same, ``storable_id``) is a typed refusal, never a ``TypeError``.
 
 How long a device stays paired is capped by the settled values in ``pairing.py`` (record
 20261115-csl238-harness-dr-09-phone-pairing-01): at most 30 days from pairing, and 7 days from
@@ -78,7 +82,8 @@ from dataclasses import dataclass, field
 
 from .pairing import (MANAGE, PAIRING_MAX_AGE_S, PairingGrant, PairingRefused, device_label, device_scopes,
                       pairing_lapsed)
-from .revocation_store import RevocationStore, RevocationStoreError, Revocations, StoredConnection, storable_id
+from .revocation_store import (ID_DEPTH_MAX, ID_INT_DIGITS_MAX, RevocationPartlyWritten, RevocationStore,
+                               RevocationStoreError, Revocations, StoredConnection, storable_id)
 
 
 # How long the book keeps the record of a revoked device's connection after the door's disconnect of it,
@@ -116,6 +121,11 @@ class Admission:
 ADMITTED = Admission(True)
 # The detail of connection_exists for an id a revoked device's connection still holds.
 REVOKED_CONNECTION_HELD = "the id is held by a revoked device's connection: give the new connection a new id"
+# The detail of connection_invalid, with a store, for an id the record of revocations cannot keep.
+STORABLE_ID_WORDS = (f"the record of revocations cannot keep this connection id: a connection id is a str, an int of "
+                     f"at most {ID_INT_DIGITS_MAX} digits, or a tuple of them nested at most {ID_DEPTH_MAX} deep, "
+                     f"that the record writes and reads back unchanged; give the connection such an id "
+                     f"(new_connection_id makes one)")
 
 
 def unreadable_detail(reason: str) -> str:
@@ -130,15 +140,50 @@ def connections_full_detail(held: int) -> str:
             "end one of them first")
 
 
-class RevocationNotWritten(PairingRefused):
-    """The device is revoked in this daemon, but the record could not be written. ``connections`` are the
-    live connections the caller must still close."""
+def unwritten_words(devices: list, connections: int) -> str:
+    """The words of ``status`` for what a write did not hold: what, why it matters, the step."""
+    parts = []
+    if devices:
+        parts.append(f"{len(devices)} revoked phones are NOT revoked on disk ({', '.join(devices)}): they are refused "
+                     "until the daemon stops, and after a restart they would be let in again")
+    if connections:
+        parts.append(f"{connections} records of revoked connections are not on disk: after a restart their ids could "
+                     "be given to another phone")
+    if not parts:
+        return ""
+    return ("; ".join(parts) + ". Mend what stopped the write (the revoke's refusal says what), then revoke each "
+            "phone again, and do not restart the daemon before that is done")
 
-    def __init__(self, connections: tuple, reason: str) -> None:
-        super().__init__("revocation_unwritten",
-                         "the phone is revoked until the daemon stops, but the record could not be written, so "
-                         f"after a restart it would not be: {reason}. Revoke it again once the folder is writable")
+
+class RevocationNotWritten(PairingRefused):
+    """A revoke that could not be recorded. ``on_disk``: whether the device's revocation itself is on disk
+    (``False``: it holds only until the daemon stops). ``connections`` are the live connections the caller must
+    still close; ``unwritten`` counts this device's connection records that are not on disk."""
+
+    def __init__(self, connections: tuple, reason: str, *, on_disk: bool = False, unwritten: int = 0) -> None:
+        if on_disk:
+            words = (f"the phone is revoked on disk, but {unwritten} of its connection records could not be written: "
+                     "they stay refused until the daemon stops, and after a restart their ids could be given to "
+                     f"another phone. What stopped the write: {reason}. Revoke it again once that is mended (the "
+                     "next revoke writes them), and do not restart the daemon before that is done")
+        else:
+            words = ("the phone is revoked until the daemon stops, but the record could not be written, so it is NOT "
+                     "revoked on disk: after a restart it would be let in again. What stopped the write: "
+                     f"{reason}. Revoke it again once that is mended (the next revoke writes it), and do not restart "
+                     "the daemon before that is done")
+        super().__init__("revocation_unwritten", words)
         self.connections = connections
+        self.on_disk = on_disk
+        self.unwritten = unwritten
+
+
+@dataclass(frozen=True)
+class _Failed:
+    """Why a write failed, and what of its change is not on disk (``devices`` None: none of it)."""
+
+    reason: str
+    devices: frozenset | None = None
+    connections: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -215,6 +260,8 @@ class DeviceBook:
     _released: collections.OrderedDict = field(default_factory=collections.OrderedDict, init=False, repr=False)
     _revoked_devices: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _unwritten: set = field(default_factory=set, init=False, repr=False)
+    # Records of revoked connections a write left out (id -> device): carried by every later write.
+    _unwritten_connections: dict = field(default_factory=dict, init=False, repr=False)
     _unreadable: str | None = field(default=None, init=False, repr=False)
     _boot: str = field(default="", init=False, repr=False)
     _counter: int = field(default=0, init=False, repr=False)
@@ -279,18 +326,44 @@ class DeviceBook:
                 self._boot, self._counter = boot, 0
                 return
 
-    def _write(self, change: Revocations | None, forget: tuple = ()) -> str | None:
-        """Called with the write lock held and the book's lock free. Returns why it failed, else None."""
+    def _write(self, change: Revocations | None, forget: tuple = ()) -> _Failed | None:
+        """Called with the write lock held and the book's lock free. Returns what failed and why, else None. A
+        store is anything with the three methods, so any failure of it is a write not made."""
         if self.store is None:
             return None
+        partly = None
         try:
             if change is not None and (change.devices or change.connections or change.boot is not None):
-                self.store.put(change)
+                try:
+                    self.store.put(change)
+                except RevocationPartlyWritten as exc:
+                    partly = _Failed(str(exc), exc.devices, exc.connections)
             if forget:
                 self.store.forget(forget)
         except RevocationStoreError as exc:
-            return str(exc)
-        return None
+            return _Failed(str(exc))
+        except Exception as exc:
+            return _Failed(f"the store of revocations failed ({type(exc).__name__}: {exc})")
+        return partly
+
+    def _settle(self, change: Revocations, failed: _Failed | None, revoking: str | None) -> None:
+        """Called with the book's lock held, after a write of ``change``: what it holds leaves the lists of what
+        is not on disk, what it left out joins them. A write that held none of it lists ``revoking`` only."""
+        if failed is not None and failed.devices is None:
+            if revoking is not None:
+                self._unwritten.add(revoking)
+            return
+        left_devices = failed.devices if failed is not None else frozenset()
+        left_connections = failed.connections if failed is not None else frozenset()
+        self._unwritten.difference_update(d for d in change.devices if d not in left_devices)
+        self._unwritten.update(left_devices)
+        for conn_id, stored in change.connections.items():
+            if conn_id in left_connections:
+                self._unwritten_connections[conn_id] = stored.device_id
+            else:
+                self._unwritten_connections.pop(conn_id, None)
+        for conn_id in [c for c in self._unwritten_connections if c not in self._revoked]:
+            del self._unwritten_connections[conn_id]
 
     def _readable(self) -> str | None:
         """Called with the book's lock held: ``None`` when the store was read, else the refusal's words. An
@@ -377,8 +450,7 @@ class DeviceBook:
         if not _key(conn_id):
             return Admission(False, "connection_invalid")
         if self.store is not None and not storable_id(conn_id):
-            return Admission(False, "connection_invalid", "a connection id the record of revocations can keep is "
-                             "a str, an int or a tuple of them")
+            return Admission(False, "connection_invalid", STORABLE_ID_WORDS)
         with self._lock:
             if self.store is not None:
                 unreadable = self._readable()
@@ -439,7 +511,10 @@ class DeviceBook:
                 forget = forget + self._forgetting()
                 if change is not None and conn_id not in self._revoked:
                     change = None
-            self._write(change, forget)
+            failed = self._write(change, forget)
+            if change is not None and (failed is None or failed.devices is not None):
+                with self._lock:
+                    self._settle(change, failed, None)
 
     def revoke(self, device_id: str) -> tuple[Hashable, ...]:
         """Revoke a device for good and return its live connections, which the caller must close. With a store it
@@ -452,20 +527,37 @@ class DeviceBook:
                 if record.revoked_at is None:
                     self._devices[device_id] = dataclasses.replace(record, revoked_at=self.clock())
                     self._revoked_devices[device_id] = self.wall()
+                elif device_id in self._unwritten:
+                    # Not on disk: its time is read again, so a clock set right since is what is written.
+                    self._revoked_devices[device_id] = self.wall()
                 closing = tuple(self._by_device.pop(device_id, {}))
                 for conn in closing:
                     del self._connections[conn]
                     self._revoked[conn] = _RevokedConnection(device_id)
                 forget = self._forgetting()
-                change = self._change_of(self._unwritten | {device_id}) if self.store is not None else None
-            failed = self._write(change, forget)
+                change = None
+                if self.store is not None:
+                    carried = self._unwritten | set(self._unwritten_connections.values()) | {device_id}
+                    change = self._change_of(carried)
+            if change is None:
+                self._write(None, forget)
+                return closing
+            failed: _Failed | None = _Failed("the write did not finish")
+            try:
+                failed = self._write(change, forget)
+            finally:
+                # Whatever the write did, a failure no one catches included, the device stays listed until a
+                # write is known to hold it.
+                with self._lock:
+                    self._settle(change, failed, device_id)
+            if failed is None:
+                return closing
+            if failed.devices is None or device_id in failed.devices:
+                raise RevocationNotWritten(closing, failed.reason)
             with self._lock:
-                if failed is None:
-                    self._unwritten.difference_update(change.devices if change is not None else ())
-                else:
-                    self._unwritten.add(device_id)
-            if failed is not None:
-                raise RevocationNotWritten(closing, failed)
+                mine = sum(1 for d in self._unwritten_connections.values() if d == device_id)
+            if mine:
+                raise RevocationNotWritten(closing, failed.reason, on_disk=True, unwritten=mine)
             return closing
 
     def list(self) -> list[dict]:
@@ -481,10 +573,14 @@ class DeviceBook:
             passed = max(0, kept - bound) if bound is not None else 0
             words = (f"the bound of {bound} records is passed by {passed}: those are connections still open, which "
                      "are never forgotten" if passed else "")
+            unwritten = sorted(self._unwritten)
             return {"revoked_connections_kept": kept, "revoked_connections_open": open_,
                     "revoked_connection_keep_max": bound, "bound_passed_by": passed, "bound_words": words,
                     "revocations_readable": self._unreadable is None, "revocations_unreadable": self._unreadable or "",
-                    "revocations_unwritten": sorted(self._unwritten)}
+                    "revocations_unwritten": unwritten,
+                    "revoked_connections_unwritten": len(self._unwritten_connections),
+                    "revoked_connections_unwritten_devices": sorted(set(self._unwritten_connections.values())),
+                    "unwritten_words": unwritten_words(unwritten, len(self._unwritten_connections))}
 
     def _held(self, conn_id: Hashable) -> bool:
         """Called with the lock held: whether ``conn_id`` is a revoked device's connection the book still keeps.

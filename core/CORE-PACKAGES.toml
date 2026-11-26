@@ -49,7 +49,8 @@ other_files = []
 # the contract, or a run of run_words words of it (words made of letters only; links and numbers left out), standing in
 # any of them. A message names the file, the line and a count, and none of the words.
 run_words = 6
-# Files or folders, as paths from the repository root; "." is the whole tree. One entry that matches nothing is red.
+# Files or folders, as paths from the repository root; "." is the whole tree. Each is written plainly: no leading ./,
+# no trailing /, no doubled /, no backslash, no . or .. part. One that matches no file the sweep reads is red.
 scan = ["core/CORE-PACKAGES.toml", "core/tests"]
 # Files or folders of the scan that it leaves out. None today.
 leave_out = []

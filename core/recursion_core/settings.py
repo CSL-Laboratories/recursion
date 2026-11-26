@@ -177,8 +177,8 @@ _KEY_PREFIX_FOLDED = re.compile(r"(?<![a-z0-9])(?:%s)\S{%d,}"  # a known key pre
 # Scripts one ordinary word may join (Japanese writes kanji and kana in one word); any other mix of scripts in one
 # word is taken as a disguise. Unicode's names, not a figure.
 _ONE_SCRIPT = MappingProxyType({"HIRAGANA": "CJK", "KATAKANA": "CJK", "HANGUL": "CJK"})
-# What a row may declare it holds (``Setting.holds``): then status, the start log and every note show only
-# whether it is set.
+# What a row may declare it holds (``Setting.holds``): then status, the start log and every note that names it
+# show only whether it is set.
 HOLDS_SECRET = "secret"  # a password, a key or a token
 HOLDS_SIGN_IN = "sign-in"  # a user and its password
 HOLDS_ADDRESS = "address"  # an address that may carry a sign-in
@@ -835,9 +835,9 @@ def load(environ) -> Loaded:
     for name in shown:
         if _holds(name):  # status.shown_names never lifts a declaration
             notes.append(Note(STAYS_HIDDEN, f"{name} is named in {SHOWN_NAMES}, but it holds a "
-                                            f"{DECLARED[name].holds}, so status, the start log and every note show "
-                                            "only whether it is set; naming it there changes nothing, so take it "
-                                            "out"))
+                                            f"{DECLARED[name].holds}, so status, the start log and every note that "
+                                            "names it show only whether it is set; naming it there changes "
+                                            "nothing, so take it out"))
     return Loaded(str(path), MappingProxyType(values), tuple(notes))
 
 

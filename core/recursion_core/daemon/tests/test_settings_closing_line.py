@@ -160,8 +160,8 @@ class NoRequestShowsAHiddenValue(earlier._Folder):
         with mock.patch.object(settings, "SETTINGS", rows), mock.patch.object(settings, "DECLARED", declared):
             shown = "\n".join(settings.lines(settings.load(self.environ)))
         self.assertIn(f"note {settings.STAYS_HIDDEN}: {DECLARED_ROW} is named in status.shown_names, but it holds a "
-                      "secret, so status, the start log and every note show only whether it is set; naming it there "
-                      "changes nothing, so take it out", shown)
+                      "secret, so status, the start log and every note that names it show only whether it is set; "
+                      "naming it there changes nothing, so take it out", shown)
         self.assertNotIn("standin-set5", shown)
 
 

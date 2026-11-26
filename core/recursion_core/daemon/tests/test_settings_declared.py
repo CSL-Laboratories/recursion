@@ -173,8 +173,8 @@ DECLARED_ROW = "plugin_host.standin_login"  # a name with no hidden word, declar
 
 @unittest.skipUnless(hasattr(os, "geteuid"), earlier.POSIX_ONLY)
 class ADeclaredRowShowsOnlyWhetherItIsSet(earlier._Folder):
-    """A row that declares it holds a secret, a sign-in or an address: status, the start log and every note show
-    only whether it is set and its source, for its value and its default, whatever the value's shape or length,
+    """A row that declares it holds a secret, a sign-in or an address: status, the start log and every note that
+    names it show only whether it is set and its source, for its value and its default, whatever the value's shape or length,
     under any cap, and whatever status.shown_names says. The module's one table is extended for the test only."""
 
     @contextlib.contextmanager

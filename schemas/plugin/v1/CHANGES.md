@@ -23,18 +23,23 @@ package with a changed or an extra file (a `__pycache__` folder included), or wi
 other users can write, loaded before as signed and is refused now. No schema changed, and an
 unsigned package is held to nothing new.
 
-Such a load is also refused `package_compiled_file_prefix` while the interpreter keeps its compiled
-files outside the package (`PYTHONPYCACHEPREFIX` or `-X pycache_prefix`, read from
-`sys.pycache_prefix`), because Python would import a compiled file from that prefix in place of a
-checked listed file. The refusal names the prefix and says to start the daemon without it. What it
-breaks: a daemon started with such a prefix loads no signed package from a folder until it is
-started without it.
+Such a load is also refused `package_compiled_file_prefix` when, at the moment of the check, the
+interpreter keeps its compiled files outside the package (`PYTHONPYCACHEPREFIX`, `-X pycache_prefix`
+or a value set in the process, read from `sys.pycache_prefix` once per load, after the package
+checks), because Python would import a compiled file from that prefix in place of a checked listed
+file. The refusal names the prefix and says to start the daemon without it. What it breaks: a
+daemon started with such a prefix loads no signed package from a folder until it is started without
+it.
 
 What the checks do not cover (`README.md`): a listed file changed after the check, which only a
 writer with the daemon user's own rights can do; a module of the same name that Python finds before
 the listed file (one the daemon's process already holds, one built into or frozen in the
-interpreter, or one earlier on the import path than the package folder); and a finder or import hook
-already installed in the daemon's process.
+interpreter, or one earlier on the import path than the package folder); and code already running
+in the daemon's process (the daemon's own start, a site file of the interpreter, or a plugin loaded
+earlier, signed or not and with no grant), which can install a finder or import hook, or set a
+compiled-file prefix after the loader has looked at it, so that Python hands the plugin other code
+for a listed module's name. That code runs under the plugin's signed name and grants, and the
+plugin's record still says every listed file was checked.
 
 ## `manifest.v1.json` is `1.0-draft.2` (2026-11-18)
 

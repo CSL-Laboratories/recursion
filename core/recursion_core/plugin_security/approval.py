@@ -16,7 +16,7 @@ units and an opaque ``payload``. The gate never interprets the payload.
   digest from the effect presented, requires an approved, unexpired, unused approval for
   exactly that digest, and consumes it. A second use is refused (replay).
 
-A veto is final for that intent (CSL-743; Lucas's decision on csl-research #1161 item
+A veto is final for that intent (CSL-743; the owner's decision on csl-research #1161 item
 5): once the operator vetoes an approval, ``request`` refuses the same effect digest
 with ``approval_vetoed``, without drawing it or storing anything. A still-pending
 approval for that digest can no longer be approved, and one approved earlier can no

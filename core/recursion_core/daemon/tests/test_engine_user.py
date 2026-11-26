@@ -1,4 +1,4 @@
-"""Offline tests for the B9 engine-user invariants (Lucas's Nov 8 call).
+"""Offline tests for the B9 engine-user invariants (the owner's Nov 8 call).
 
 Structural only: fake `loginctl`/`systemctl` results and temp socket paths. No
 systemd, logind, host, credential store or provider is touched. Host evidence for

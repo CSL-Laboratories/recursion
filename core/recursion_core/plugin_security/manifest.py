@@ -9,9 +9,10 @@ PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
   every file of the package with its SHA-256, so the signed bytes name the whole package.
   ``csl-plugin-manifest/vNext`` names ``plugin.py`` only; Lucas's rule (Nov 11, 2026) is
   that such a signature is not enough for non-paper authority. Parsing ``files`` does not
-  verify the package: that is ``verify_package`` (lane PLUGIN-SIGN, next slice), and the
-  loader imports only ``plugin.py`` until it uses it. A signed load checks that each
-  listed file is present.
+  verify the package. A signed load from a package folder does (``loader._verify_package``):
+  every listed file present, its SHA-256 the manifest's, it and its folders the operator's
+  alone, and nothing unlisted in the folder, before any plugin code runs. The loader runs
+  only ``plugin.py``; the plugin imports its other files itself, after that check.
 * Grants are bound to the developer key they were given for (review R4, finding 6, under
   Lucas's D0, Nov 12, 2026): a grant naming another developer key grants nothing, and so
   does a manual grant that names none, in either form (grant again). The loader refuses
@@ -142,9 +143,8 @@ _PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)
 _WINDOWS_DEVICE = re.compile(r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?")
 # The install schema's key_id (schemas/plugin/v1/install.v1.json): ed25519: and 32 lower-case hex.
 _KEY_ID = re.compile(r"ed25519:[0-9a-f]{32}")
-# The daemon reads a manifest only up to this many bytes. The same bound sits beside
-# package verification: verify_package is the next slice, and a manifest the daemon
-# will not read is not parsed.
+# The daemon reads a manifest only up to this many bytes, and a manifest the daemon will
+# not read is not parsed.
 MAX_MANIFEST_BYTES = 64 * 1024
 
 
@@ -177,7 +177,7 @@ class Manifest:
         """True when the manifest is version 1 and lists at least one file.
 
         A statement about the manifest, not about the package on disk: only
-        ``verify_package`` shows that the files match it. Only a manifest from
+        ``loader._verify_package`` shows that the files match it. Only a manifest from
         ``parse_manifest`` is known to hold what its signed bytes say; one built by hand
         is not, and one with no files is never taken as naming every file.
         """
@@ -256,8 +256,8 @@ def parse_manifest(raw: bytes) -> Manifest:
     refused, as ``manifest_network_destinations``, where the earlier parser accepted them.
 
     Bytes longer than ``MAX_MANIFEST_BYTES`` (64 KiB, the daemon's manifest bound) are
-    refused ``plugin_file_too_large`` before they are parsed. That bound sits beside
-    ``verify_package``: parsing ``files`` does not verify the package.
+    refused ``plugin_file_too_large`` before they are parsed. Parsing ``files`` does not
+    verify the package (``loader._verify_package`` does, on a signed load).
     """
     if type(raw) is bytes and len(raw) > MAX_MANIFEST_BYTES:
         raise Refused("plugin_file_too_large", "manifest.json")

@@ -53,10 +53,42 @@ manifest requests permissions, whether the manifest is signed or not. A plugin t
 permissions can still load. `order_after_revoked_key` is null or a developer key ID, the same shape
 as `developer_key_id`; any other value is refused.
 
-For a signed version 1 load, every listed path must name a file in the package. The package
-folder itself and every folder on a listed path must be a real folder: no symbolic link is
-followed. The loader checks file presence and the entry digest. The other file digests are
-reserved for a future content check.
+For a signed version 1 load, every listed path must name a file in the package. The package folder
+itself and every folder on a listed path must be a real folder: no symbolic link is followed. Before
+any plugin code runs, the loader then reads every listed file: it and every folder on its path must
+belong to the user the daemon runs as and must not be writable by a group or other users
+(`package_file_untrusted`), and its SHA-256 must be the one the manifest lists
+(`package_file_digest_mismatch`). Nothing else may stand in the package folder or in a folder on a
+listed path (`package_file_unlisted`): only the listed files and, at the top, `manifest.json` and
+`manifest.sig`. A `__pycache__` folder is not exempt, because Python would import its compiled files
+in place of the checked source; once it loads from a package folder, the loader turns off the
+interpreter's writing of compiled files. For the same reason the load is refused
+(`package_compiled_file_prefix`) when, at the moment of the check, the interpreter keeps its
+compiled files outside the package, under a prefix set by `PYTHONPYCACHEPREFIX`, by
+`-X pycache_prefix` or in the process: Python would import a compiled file from there in place of a
+checked listed file, and it checks nothing of who can write that folder. The loader looks at the
+prefix (`sys.pycache_prefix`) once per load, after the package checks and before any plugin code
+runs; Python reads it again at every import the plugin makes, during the load and for as long as
+the plugin runs. Each refusal names the path, or the prefix.
+
+So the signature covers the whole package at the moment of the check, and that is where it stops.
+Three cases still run code the signature does not cover. First, the loader runs only `plugin.py`
+from the bytes it checked; Python reads every other file again when the plugin imports it, after the
+check, and a file changed in between (only a writer with the daemon user's own rights can) runs as
+it is then. Second, Python hands the plugin a module of the same name that it finds before the
+listed file, and never reads the listed file: one the daemon's process already holds (imported
+earlier by another plugin or by the daemon itself), one built into or frozen in the interpreter, or
+one in a folder that comes before the package folder on the import path (where the plugin's own code
+puts its folder after the others). Third, code already running in the daemon's process (the
+daemon's own start, a site file of the interpreter, or a plugin loaded earlier, signed or not and
+with no grant) can install a finder or import hook, or set a compiled-file prefix after the loader
+has looked at it, and Python then hands the plugin other code for a listed module's name. That code
+runs under the plugin's signed name and grants, and the plugin's record still says every listed file
+was checked. No check in the loader can hold against it: such code runs with the daemon's rights and
+could as well change the loader itself. In this build every plugin runs in the daemon's own process,
+so one plugin can run its code under another plugin's signed name and grants until plugins are
+contained. An unsigned package is not held to its listing: only `plugin.py` is compared with the
+manifest's digest.
 
 ## What is not decided
 

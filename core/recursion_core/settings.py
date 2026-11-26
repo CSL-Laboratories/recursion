@@ -722,12 +722,14 @@ def _read(path: Path) -> tuple[dict | None, str | None]:
         return None, f"is larger than {MAX_BYTES} bytes"
     try:
         doc = tomllib.loads(data.decode("utf-8"))
-    except UnicodeDecodeError as exc:
-        return None, f"is not UTF-8 (at byte {exc.start}); save it as UTF-8"
+    except UnicodeDecodeError as exc:  # its line only: a byte's place would tell the length of what stands before it
+        line = data.count(b"\n", 0, exc.start) + 1
+        return None, f"is not UTF-8 (at line {line}); save it as UTF-8"
     except tomllib.TOMLDecodeError as exc:  # its text ends with the line and column, as the reader reports them
         return None, f"is not TOML: {exc}; correct the file there"
-    except (ValueError, RecursionError) as exc:  # the parser raises plain ones too, with no line or column
-        return None, f"holds a value or a nesting the TOML reader cannot take ({exc}); shorten it"
+    except (ValueError, RecursionError):  # plain ones, with no line; their words can count a number's digits
+        return None, ("holds a value or a nesting the TOML reader cannot take (a whole number with more digits than "
+                      "this interpreter reads, or lists, tables or keys nested deeper than it follows); shorten it")
     if "version" not in doc:
         return None, f"has no version line; add `version = {FILE_VERSION}` at its top"
     if type(doc["version"]) is not int or doc["version"] != FILE_VERSION:  # true and 1.0 are not 1

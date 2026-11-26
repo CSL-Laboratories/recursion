@@ -3,8 +3,9 @@
 The notes of an approval (its authority envelope and, once charged, its receipt) are kept while it is
 approved and not yet consumed, because a later carry reads them back. Once consumed they are kept only
 as the figures say (keep for, keep at most, each with 'no limit'), and every write prunes first, the
-oldest consumed notes last of all under the size figure. Only notes still needed for a carry can fill
-the file, and that refusal names the file, how many approvals hold it and how to free it.
+oldest consumed notes last of all under the size figure. Notes still needed for a carry are kept in a
+second file whose size row ships as 'no limit'; only when the person sets that row can it refuse, and
+that refusal names the file, how many approvals hold it and the row to change.
 """
 
 from __future__ import annotations
@@ -58,10 +59,18 @@ class NotesKeptTests(_HostCase):
                                                               authority=self.envelope())
 
     def held_ids(self):
-        if not self.notes.exists():
-            return set()
-        data = json.loads(self.notes.read_bytes())
-        return set(data["envelopes"]) | set(data["receipts"])
+        held = set()
+        for path in (self.notes, self.notes.with_name(getattr(plugins, "EFFECT_NOTES_NEEDED", plugins.EFFECT_NOTES))):
+            if path.exists():
+                data = json.loads(path.read_bytes())
+                held |= set(data["envelopes"]) | set(data["receipts"])
+        return held
+
+    def needed_row(self, size):
+        """Set the needed notes file's size row for this test (it ships as 'no limit'), and put it back after."""
+        old = plugins.NOTES_NEEDED_SIZE_LIMIT_BYTES
+        plugins.NOTES_NEEDED_SIZE_LIMIT_BYTES = size
+        self.addCleanup(setattr, plugins, "NOTES_NEEDED_SIZE_LIMIT_BYTES", old)
 
     def hold_consume(self, host):
         queue = host._approval_queue  # noqa: SLF001 - the composed queue; the stand-in holds its consume step
@@ -112,6 +121,7 @@ class NotesKeptTests(_HostCase):
     def test_when_needed_notes_alone_fill_the_figure_the_refusal_says_what_and_how(self):
         host = self.composed()
         self.figures(size=2500, keep_for=0, keep_at_most=0)
+        self.needed_row(2500)
         self.hold_consume(host)
         refused = None
         for number in range(20):
@@ -130,10 +140,10 @@ class NotesKeptTests(_HostCase):
                 refused = exc
                 break
         self.assertIsNotNone(refused, "the needed notes never filled the figure")
-        self.assertIn(str(self.notes), refused.detail)
+        self.assertIn(str(self.notes.with_name(plugins.EFFECT_NOTES_NEEDED)), refused.detail)
         self.assertIn("%d approval(s)" % (len(self.held_ids()) + 1), refused.detail)  # the waiting ones and this one
         self.assertIn("nothing was charged", refused.detail)
-        self.assertIn("PluginEffectSink.carry", refused.detail)
+        self.assertIn(plugins.NOTES_ROWS["NOTES_NEEDED_SIZE_LIMIT_BYTES"], refused.detail)
         self.assertNotIn(approval_id, {key for key, _ in self.charge_rows()})
 
     def test_keep_at_most_is_honoured_newest_first(self):

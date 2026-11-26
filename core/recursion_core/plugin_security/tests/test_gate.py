@@ -184,7 +184,8 @@ class RevocationTests(unittest.TestCase):
         """Round 3 finding 1: a manual grant (no signer, unsigned order acknowledged) stays
         without order after a restart, with the key on the trusted list or off it."""
         self.assertTrue(self.w.call(self.w.host, "key.revoke", key_id=self.kid)["ok"])
-        manual = Grant("demo.plugin", self.w.grant.artifact_sha256, None, ("read", "propose", "order"), True)
+        manual = Grant("demo.plugin", self.w.grant.artifact_sha256, None, ("read", "propose", "order"), True,
+                       developer_key_id=self.kid)
         for name, trusted in (("on_trusted_list", self.w.trusted), ("off_trusted_list", {})):
             with self.subTest(name):
                 loader, loaded = self._restart_load(trusted, manual)

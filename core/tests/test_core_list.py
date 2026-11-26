@@ -21,8 +21,8 @@ a numbered section) or by a decision cited by role and date. This test is red wh
   6. the number of for_owner rows differs from for_owner_max in the file;
   7. the scan scanned nothing: the core folder, the pin file or the hooks file is missing, or no package
      was found, or a row matches more than one entry.
-  8. a heading of the private contract, or a run of [sweep] run_words words of it, stands in any text file of this
-     repository (the files and folders of [sweep] leave_out and the clone itself are left out). This runs where
+  8. a heading of the private contract, or a run of [sweep] run_words words of it, stands in any text file named in
+     [sweep] scan (the files and folders of [sweep] leave_out and the clone itself are left out). This runs where
      CSL_RESEARCH_VAULT names the clone; where it is unset the test says it did NOT run, on every run. A message
      names the file, the line and a count, and never a word of the contract.
 
@@ -179,7 +179,7 @@ def holds_only_tests(folder: Path):
     stray = []
     for child in sorted(folder.rglob("*")):
         relative = child.relative_to(folder).as_posix()
-        if "__pycache__" in child.relative_to(folder).parts:
+        if "__pycache__" in child.relative_to(folder).parts and child.suffix == ".pyc":
             continue
         if child.is_symlink():
             stray.append(f"{relative}, which is a link")
@@ -1164,6 +1164,12 @@ class TestsOfTheTest(unittest.TestCase):
         tree = self.with_tests_folder(["__init__.py", "data.json"])
         self.red(1, tree, "holds data.json, which is not a test module")
 
+    def test_1_source_in_a_cache_folder_of_a_test_folder_is_read(self):
+        files = {"__init__.py": "", "test_a.py": TEST_BODY, "__pycache__/engine.py": "VALUE = 1\n"}
+        self.red(1, self.with_tests_folder(files), "holds __pycache__/engine.py, which is not a test module")
+        files = {"__init__.py": "", "test_a.py": TEST_BODY, "__pycache__/test_a.cpython-312.pyc": ""}
+        self.assertEqual(analyse(self.with_tests_folder(files))[0], [])
+
     ENGINE = "class Engine:\n    def run(self):\n        return 1\n"
 
     def test_1_product_code_in_a_tests_folder_is_red(self):
@@ -1478,6 +1484,7 @@ class TestsOfTheTest(unittest.TestCase):
 
     def test_5_the_stand_in_clone_is_green(self):
         self.assertEqual(self.vault_case(), [])
+        self.assertEqual(STAND_IN_DIGESTS[0][4], "238ceaf7397628541bbd6dfc7b66047fd39b0dccb888c19fb73cf28c4375303a")
 
     def test_5_a_changed_lane_row_is_red(self):
         problems = self.vault_case(lambda p: p.replace("one zorbwick", "two zorbwicks"))

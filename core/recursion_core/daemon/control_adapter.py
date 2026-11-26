@@ -363,12 +363,7 @@ def _clear_result_temp(tmp):
 
 
 def _discard_opened_result_temp(tmp):
-    """Remove a result temp this write opened, after that write failed.
-
-    A regular file or a symlink is unlinked. A directory is left in place, so a
-    planted directory and its entries stay. The result stays in memory either way.
-    A failure to remove the temp does not replace that in-memory result.
-    """
+    """Unlink the regular file or symlink at the temp name; a directory is left."""
     try:
         info = os.lstat(tmp)
     except OSError:
@@ -766,8 +761,7 @@ class RouteStarter:
             tmp = path.with_name('result.json.tmp')
             # A stale or planted file is replaced: opening a FIFO here would wait for a reader.
             # An empty planted directory is removed too. The result is durable only when this write
-            # succeeds; otherwise it is kept in memory. A temp this write opened is removed on that
-            # failure when it is a regular file or a symlink. A directory at that name is left.
+            # succeeds; otherwise it is kept in memory.
             _clear_result_temp(tmp)
             fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
             opened = True
@@ -967,8 +961,11 @@ class DaemonControl:
         if result is not None:
             # Counted surrogates still sit in the answer. The frame encode refuses them, and a
             # non-finite float, and the socket worker does not turn that into an error reply.
-            result = _frame_scalar(result)
-            run['result'] = _status_result(result) if full else {k: result.get(k) for k in ('status', 'code', 'detail')}
+            # run.list keeps three fields of the result, so only those three are framed.
+            if full:
+                run['result'] = _status_result(_frame_scalar(result))
+            else:
+                run['result'] = _frame_scalar({k: result.get(k) for k in _LIST_RESULT_KEYS})
         if full and isinstance(run_id, str):
             # run.status carries the tail of the engine's stdout, so every surface that can read a
             # status can watch output arrive without a second method (the CLI and TUI share one

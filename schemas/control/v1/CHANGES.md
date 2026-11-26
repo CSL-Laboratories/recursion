@@ -9,13 +9,23 @@ pass unnoticed.
 
 Nothing is frozen yet.
 
+## Stop removal receipt
+
+`run.record` and `run.view` are `1.0-draft.5`. Draft 4 holds proof `const: empty`: proof `removed` was reserved for the lane that owns Stop, and the top description said a stored proof of removed was reserved. Draft 5 adds proof `removed` (proof is `enum: [empty, removed]`): `launch_manifest` stays reserved, and proof `removed` means this Stop removed the cgroup directory after the empty walk. Proof `empty` remains the proof when this Stop did not remove the directory.
+
+This draft number belongs to the removal receipt. The schema change that shares these two files takes `1.0-draft.6` when it lands after this one. If that change lands first, the removal receipt takes `1.0-draft.6` and rewrites the same sentence on that draft.
+
+| What changed | What it breaks |
+|---|---|
+| `x-version` of `run.record.v1.json` and `run.view.v1.json` is `1.0-draft.5`. Proof is `enum: [empty, removed]`, where draft 4 holds `const: empty`. The top description of `run.record` no longer calls proof `removed` reserved | A validator at draft 4, which refuses a stored proof `removed`. A reader that treated the description's reserved sentence as a refusal of a stored proof `removed`. The fixture `b12-the-removed-proof-in-the-store-before-it-is-defined.json` moves from `bad/run.record.v1/` (must be refused) to `good/run.record.v1/` as `h11-a-stored-removed-proof.json` (must be accepted) |
+
 ## Where each schema stands
 
 | Schema | Version |
 |---|---|
 | `common.v1.json` | 1.0-draft.5 |
-| `run.record.v1.json` | 1.0-draft.4 |
-| `run.view.v1.json` | 1.0-draft.4 |
+| `run.record.v1.json` | 1.0-draft.5 |
+| `run.view.v1.json` | 1.0-draft.5 |
 | `stop.result.v1.json` | 1.0-draft.2 |
 | `session.v1.json` | 1.0-draft.3 |
 | `queue.item.v1.json` | 1.0-draft.7 |

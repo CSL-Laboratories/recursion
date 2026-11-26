@@ -11,7 +11,7 @@ control API only sees these two interfaces, and tests fake them. A run record is
      "generation": <int>,
      "cgroup_marker": None | "<inode-like identity of that cgroup>",
      "members": [{"member_id", "pid"}],
-     "stop_attestation": None | {"proof": "empty", "cgroup", "cgroup_marker", "member_ids", "generation"}}
+     "stop_attestation": None | {"proof": "empty" | "removed", "cgroup", "cgroup_marker", "member_ids", "generation"}}
 
 ``start_key`` is stored with the record so start dedupe survives a daemon restart: a durable registry
 must persist it and answer ``find_start`` from what it persisted. A ``starting`` record is the launch
@@ -34,8 +34,12 @@ import threading
 from collections.abc import Callable
 from typing import Protocol
 
-# Answers from KillTree.confirm. Only EMPTY means the run's cgroup holds no process.
+# Answers from KillTree.confirm. EMPTY: the cgroup holds no process and this Stop did not remove
+# its directory. REMOVED: this Stop removed that directory after the empty walk. Only those two
+# attest a stop. POPULATED, TIMEOUT and UNKNOWN do not.
 EMPTY, POPULATED, TIMEOUT, UNKNOWN = "empty", "populated", "timeout", "unknown"
+REMOVED = "removed"
+ATTESTED_PROOFS = (EMPTY, REMOVED)
 
 
 class StaleGeneration(Exception):
@@ -154,11 +158,11 @@ class RunRegistry(Protocol):
 class KillTree(Protocol):
     """cgroup + pidfd cleanup. ``request_stop`` runs the #916 procedure (SIGINT to the run, drain, SIGKILL
     whatever is left after the grace period, via ``cgroup.kill`` and pidfds); ``confirm`` reports whether
-    the run's cgroup is empty. Never ``PR_SET_PDEATHSIG`` or ``preexec_fn``."""
+    the run's cgroup is empty, or whether this Stop removed it. Never ``PR_SET_PDEATHSIG`` or ``preexec_fn``."""
 
     def request_stop(self, cgroup: str) -> None: ...
 
-    def confirm(self, cgroup: str, timeout_s: float) -> str: ...  # EMPTY | POPULATED | TIMEOUT | UNKNOWN
+    def confirm(self, cgroup: str, timeout_s: float) -> str: ...  # EMPTY | REMOVED | POPULATED | TIMEOUT | UNKNOWN
 
 
 class InMemoryRunRegistry:
@@ -211,7 +215,7 @@ class InMemoryRunRegistry:
         if rec.get("state") != "stopped":
             return
         run_id = str(rec.get("run_id") or "")
-        if (not isinstance(attestation, dict) or attestation.get("proof") != "empty"
+        if (not isinstance(attestation, dict) or attestation.get("proof") not in ATTESTED_PROOFS
                 or attestation.get("cgroup") != rec.get("cgroup")):
             raise StopUnattested(run_id, "cgroup_changed")
         marker = attestation.get("cgroup_marker")
@@ -424,7 +428,7 @@ class InMemoryRunRegistry:
             if supplied not in (None, current.get("cgroup_marker")):
                 raise StopUnattested(stored["run_id"], "cgroup_changed")
             attestation = current.get("stop_attestation")
-            if (not isinstance(attestation, dict) or attestation.get("proof") != "empty"
+            if (not isinstance(attestation, dict) or attestation.get("proof") not in ATTESTED_PROOFS
                     or attestation.get("cgroup") != current.get("cgroup")
                     or attestation.get("cgroup_marker") != current.get("cgroup_marker")):
                 raise StopUnattested(stored["run_id"], "cgroup_changed")
@@ -458,7 +462,7 @@ class InMemoryRunRegistry:
     def _attestation_ok(self, record: dict, members: list[dict], expected: int) -> bool:
         self._member_refusal = None
         attestation = record.get("stop_attestation")
-        if not isinstance(attestation, dict) or attestation.get("proof") != "empty":
+        if not isinstance(attestation, dict) or attestation.get("proof") not in ATTESTED_PROOFS:
             return False
         if attestation.get("generation") != expected or attestation.get("cgroup") != record.get("cgroup"):
             return False

@@ -28,6 +28,8 @@ log = logging.getLogger(__name__)
 
 RUN_ID = re.compile(r'[a-zA-Z0-9_-]{1,64}')
 UNIT = re.compile(r'recursion-run-[a-zA-Z0-9_-]{1,64}\.service')
+# systemd-run --user with no Slice= property places the unit in app.slice.
+_SUPERVISED_SLICE = 'app.slice'
 # Terminal states are sticky: once recorded they are never re-observed or re-adopted.
 # terminated: the run's process is attested gone in this boot. A scripted "ended"
 # observation is not enough while a listener is still alive. Attested ends are: the
@@ -47,6 +49,7 @@ TERMINAL = frozenset({'terminated', 'lost_reboot'})
 SCHEMA_VERSION = 1
 # A delegated unit cgroup is shallow. Past either bound the walk is not a
 # positive empty result: callers treat None as unknown, never as terminated.
+# The control API's removal re-read imports these two names. They are the one bound.
 CGROUP_WALK_MAX_DEPTH = 64
 CGROUP_WALK_MAX_NODES = 4096
 # How long to re-read a recorded cgroup after its processes were sent SIGKILL.
@@ -727,6 +730,25 @@ class Registry:
         """
         return self.control_identity(run_id)[1]
 
+    def control_document(self, run_id):
+        """The stored control record as a dict, or None when this run has none.
+
+        A value that is not a JSON object raises ValueError. That is not "no record".
+        """
+        with self.lock:
+            self._ensure_open()
+            table = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                    "AND name='control_runs'").fetchone()
+            if table is None:
+                return None
+            row = self.db.execute('SELECT record FROM control_runs WHERE run_id=?', (run_id,)).fetchone()
+        if row is None:
+            return None
+        record = json.loads(row[0])
+        if not isinstance(record, dict):
+            raise ValueError('control record is not an object')
+        return record
+
     def close(self):
         with self.lock:
             if not self.closed:
@@ -833,6 +855,39 @@ class Daemon:
             if not run.stop_requested:
                 return None  # the walk kills what it finds: never without a recorded Stop
             return self._walk_cgroups(run, [cgroup])
+
+    def remove_cleared_cgroup(self, run_id, cgroup):
+        """Remove the cgroup directory a Stop has already walked empty.
+
+        ``removed`` when this call removed it. ``populated`` when the kernel says the
+        directory is in use. ``absent`` when there is no directory, or this manager
+        does not remove cgroups. ``empty`` when the directory is still there.
+        A symlink is not removed.
+        """
+        remove = getattr(self.manager, 'remove_cleared_cgroup', None)
+        if not callable(remove):
+            return 'absent'
+        with self.lock:
+            self._open()
+            run = self.registry.get(run_id)
+            if not run.stop_requested:
+                return 'empty'
+            try:
+                document = self.registry.control_document(run_id)
+            except (OSError, ValueError, TypeError):
+                log.exception('control record of %s could not be read; its cgroup stays', run_id)
+                return 'empty'
+            if not isinstance(document, dict) or document.get('cgroup') != cgroup:
+                return 'empty'
+            marker = document.get('cgroup_marker')
+            if not isinstance(marker, str) or not marker:
+                return 'empty'
+            try:
+                return remove(run.unit, cgroup, marker=marker,
+                              identity=document.get('cgroup_identity'))
+            except Exception:
+                log.exception('removal of the cgroup of %s failed', run_id)
+                return 'empty'
 
     def _stop_send_due(self, run_id):
         held = self._stop_resend.get(run_id)
@@ -995,6 +1050,114 @@ class Daemon:
         with self.lock:
             self.closed = True
             self.registry.close()
+
+
+def _read_held_file(dir_fd, name):
+    """The text of ``name`` in the directory ``dir_fd`` holds, '' when it is not there.
+
+    Opened relative to ``dir_fd`` with ``O_NOFOLLOW``. Anything but a regular file raises.
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ESRCH):
+            return ''
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, 'not a regular file')
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return b''.join(chunks).decode()
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+
+def read_held_cgroup(parent_fd, name, identity):
+    """Read a cgroup leaf through the parent descriptor a removal used, never by a path.
+
+    The leaf ``name`` is opened relative to ``parent_fd``. Its ``cgroup.procs``, its
+    ``cgroup.events`` and each child directory are opened relative to their own directory's
+    descriptor, each with ``O_NOFOLLOW``, so a path changed after the parent was opened is
+    not read. Returns ``(pids, populated)`` for the leaf and its descendants, ``'absent'``
+    when the held parent no longer holds ``name``, or None when the read cannot be made: a
+    link, a leaf that is not ``identity`` ``(st_dev, st_ino)``, a read error, a cycle, or a
+    tree past the walk bounds.
+    """
+    nofollow = getattr(os, 'O_NOFOLLOW', 0)
+    directory_flag = getattr(os, 'O_DIRECTORY', 0)
+    if not nofollow or not directory_flag:
+        return None
+    flags = os.O_RDONLY | directory_flag | nofollow | getattr(os, 'O_CLOEXEC', 0)
+    try:
+        leaf = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        return 'absent' if exc.errno == errno.ENOENT else None
+    except (ValueError, TypeError, NotImplementedError):
+        return None
+    stack = [(leaf, 0)]
+    seen = set()
+    nodes = 0
+    pids = []
+    populated = False
+    try:
+        info = os.fstat(leaf)
+        if (info.st_dev, info.st_ino) != identity:
+            return None
+        while stack:
+            fd, depth = stack.pop()
+            try:
+                nodes += 1
+                if depth > CGROUP_WALK_MAX_DEPTH or nodes > CGROUP_WALK_MAX_NODES:
+                    return None
+                current = os.fstat(fd)
+                ident = (current.st_dev, current.st_ino)
+                if not stat.S_ISDIR(current.st_mode) or ident in seen:
+                    return None
+                seen.add(ident)
+                for token in _read_held_file(fd, 'cgroup.procs').split():
+                    if not token.isdigit():
+                        return None
+                    pids.append(int(token))
+                events = _read_held_file(fd, 'cgroup.events')
+                fields = dict(line.split() for line in events.splitlines() if line.strip())
+                if fields.get('populated') not in (None, '0', '1'):
+                    return None
+                populated = populated or fields.get('populated') == '1'
+                for entry in os.listdir(fd):
+                    try:
+                        child = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+                    except OSError as exc:
+                        if exc.errno in (errno.ENOENT, errno.ESRCH):
+                            continue
+                        return None
+                    if stat.S_ISLNK(child.st_mode):
+                        return None
+                    if stat.S_ISDIR(child.st_mode):
+                        stack.append((os.open(entry, flags, dir_fd=fd), depth + 1))
+            finally:
+                os.close(fd)
+        return pids, populated
+    except (OSError, ValueError, TypeError, NotImplementedError):
+        return None
+    finally:
+        for fd, _ in stack:
+            os.close(fd)
+
+
+def held_leaf_gone(parent_fd, name):
+    """True only when the held parent descriptor no longer holds ``name``. Any other answer is False."""
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        return exc.errno == errno.ENOENT
+    except (ValueError, TypeError, NotImplementedError):
+        return False
+    return False
 
 
 class SystemdUserManager:
@@ -1214,6 +1377,197 @@ class SystemdUserManager:
             if time.monotonic() >= deadline:
                 return None if live is None else False
             time.sleep(0.05)
+
+    def _identity_matches(self, info, identity):
+        """True when no inode was recorded, or ``info`` is that inode. A bad identity is doubt."""
+        if identity is None:
+            return True
+        if not isinstance(identity, dict):
+            return False
+        dev, ino = identity.get('st_dev'), identity.get('st_ino')
+        if type(dev) is not int or type(ino) is not int or dev < 0 or ino < 0:
+            return False
+        return info.st_dev == dev and info.st_ino == ino
+
+    def _removal_directory(self, unit, group):
+        """The leaf Path, ``absent`` when a proved parent is already gone, or None on doubt.
+
+        The path must sit under this cgroup root, inside the supervised slice, and be this
+        unit. A symlink at any component is doubt. ``..`` is doubt. The leaf itself is
+        stat'd by the caller so a missing leaf can be told from a refused path.
+        """
+        root = self.cgroup_root
+        if not isinstance(root, Path):
+            try:
+                root = Path(root)
+            except TypeError:
+                return None
+        if not root.is_absolute():
+            return None
+        try:
+            root_info = root.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            return None
+        if (not isinstance(group, str) or not group.startswith('/') or '\x00' in group
+                or '..' in Path(group).parts or not UNIT.fullmatch(unit)
+                or Path(group).name != unit):
+            return None
+        parts = [part for part in group.split('/') if part]
+        if not parts or any(part in ('.', '..') for part in parts):
+            return None
+        if _SUPERVISED_SLICE not in parts[:-1]:
+            return None
+        directory = root
+        try:
+            for part in parts[:-1]:
+                directory = directory / part
+                info = directory.lstat()
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    return None
+            directory = directory / parts[-1]
+            directory.relative_to(root)
+        except OSError as exc:
+            return 'absent' if exc.errno == errno.ENOENT else None
+        except ValueError:
+            return None
+        return directory
+
+    def _open_nofollow(self, root, parts):
+        """An fd for ``root / parts``. Each component is opened with ``O_DIRECTORY|O_NOFOLLOW``.
+
+        The caller releases the fd. A symlink at any component raises ``OSError`` and every fd
+        opened on the way is released here.
+        """
+        nofollow = getattr(os, 'O_NOFOLLOW', 0)
+        directory_flag = getattr(os, 'O_DIRECTORY', 0)
+        if not nofollow or not directory_flag:
+            raise OSError(errno.ELOOP, 'directory open would follow a link')
+        flags = os.O_RDONLY | directory_flag | nofollow | getattr(os, 'O_CLOEXEC', 0)
+        fd = os.open(root, flags)
+        try:
+            for part in parts:
+                nxt = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = nxt
+            held = fd
+            fd = -1
+            return held
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def _opened_parent_matches(self, root, parts, parent_fd):
+        """True when the path still names the directory the fd has open."""
+        try:
+            info = root.lstat() if not parts else root.joinpath(*parts).lstat()
+        except OSError:
+            return False
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return False
+        opened = os.fstat(parent_fd)
+        return info.st_dev == opened.st_dev and info.st_ino == opened.st_ino
+
+    def _held_cgroup_live(self, parent_fd, name, info):
+        """The re-read after a refused rmdir, through the held parent fd, never by a path.
+
+        The answers of ``_recorded_cgroup_live``: True when a listed pid is alive, False when
+        the leaf is gone from the held parent or its subtree reads clear, None when the read
+        cannot be made, a populated bit has no confirmed death, or a pid's read did not say.
+        """
+        walked = read_held_cgroup(parent_fd, name, (info.st_dev, info.st_ino))
+        if walked == 'absent':
+            # The kernel removes a cgroup directory only once it holds no process.
+            return False
+        if walked is None:
+            return None
+        pids, populated = walked
+        unknown = False
+        for pid in pids:
+            alive = self.pid_alive(pid)
+            if alive is True:
+                return True
+            if alive is None:
+                unknown = True
+        if unknown or populated:
+            return None
+        return False
+
+    def remove_cleared_cgroup(self, unit, group, *, marker=None, identity=None):
+        """Remove the recorded cgroup directory after a walk found it empty.
+
+        ``removed`` only when this call's ``rmdir`` of the checked inode succeeded, the held
+        parent no longer holds the leaf name, and the recorded path still names that parent.
+        ``absent`` when the proved directory was already gone. This call did not remove it.
+        ``populated`` when a re-read shows a live process, the re-read could not be made, or
+        after the removal call the held parent still holds the leaf name or the recorded path
+        no longer names the held parent.
+        ``empty`` when the directory stays, including every doubt and a clear re-read after
+        ``rmdir`` answers anything other than ``ENOENT``.
+        The parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` and the leaf name is removed
+        relative to that fd, so a symlink swapped in for a parent is not followed. The re-read
+        after a refused rmdir and the check after a done one go through that same fd.
+        A symlink is not removed. Entries inside the directory are not unlinked.
+        """
+        if not isinstance(marker, str) or not marker:
+            return 'empty'
+        found = self._removal_directory(unit, group)
+        if found is None:
+            return 'empty'
+        if found == 'absent':
+            return 'absent'
+        directory = found
+        root = self.cgroup_root
+        if not isinstance(root, Path):
+            try:
+                root = Path(root)
+            except TypeError:
+                return 'empty'
+        try:
+            parents = directory.relative_to(root).parts[:-1]
+        except ValueError:
+            return 'empty'
+        parent_fd = None
+        try:
+            try:
+                parent_fd = self._open_nofollow(root, parents)
+            except OSError as exc:
+                return 'absent' if exc.errno == errno.ENOENT else 'empty'
+            if not self._opened_parent_matches(root, parents, parent_fd):
+                return 'empty'
+            try:
+                info = os.stat(directory.name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                return 'absent' if exc.errno == errno.ENOENT else 'empty'
+            except (ValueError, TypeError):
+                return 'empty'
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                return 'empty'
+            if not self._identity_matches(info, identity):
+                return 'empty'
+            try:
+                os.rmdir(directory.name, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    return 'absent'
+                # ENOENT is the only rmdir error that means the directory is gone.
+                # Every other error is re-read through the held parent fd, never by a path
+                # built again. Only a finished clear re-read is empty.
+                live = self._held_cgroup_live(parent_fd, directory.name, info)
+                if live is False:
+                    return 'empty'
+                return 'populated'
+            except (ValueError, TypeError):
+                return 'empty'
+            if not held_leaf_gone(parent_fd, directory.name):
+                return 'populated'
+            if not self._opened_parent_matches(root, parents, parent_fd):
+                return 'populated'  # the removed leaf's parent is no longer at the recorded path
+            return 'removed'
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
 
     def _recorded_cgroup_live(self, directory, group):
         try:

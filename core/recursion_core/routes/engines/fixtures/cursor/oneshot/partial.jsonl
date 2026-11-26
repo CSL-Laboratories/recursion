@@ -1,0 +1,8 @@
+{"type":"_fixture","written_by":"Claude Opus 5.5 (claude-opus-5-5), lane ENGINE-E6","provenance":"synthetic","shapes_from":"https://cursor.com/docs/cli/reference/output-format, retrieved 2026-11-15 about 01:05 UTC: the three assistant events of --stream-partial-output"}
+{"type":"system","subtype":"init","apiKeySource":"login","cwd":"/work/demo","session_id":"c0ffee00-0000-4000-8000-000000000005","model":"synthetic-model","permissionMode":"default"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Count to two."}]},"session_id":"c0ffee00-0000-4000-8000-000000000005"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"One, "}]},"session_id":"c0ffee00-0000-4000-8000-000000000005","timestamp_ms":1763168700000}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"two."}]},"session_id":"c0ffee00-0000-4000-8000-000000000005","timestamp_ms":1763168700050}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"One, two."}]},"session_id":"c0ffee00-0000-4000-8000-000000000005","timestamp_ms":1763168700060,"model_call_id":"mc-0001"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"One, two."}]},"session_id":"c0ffee00-0000-4000-8000-000000000005"}
+{"type":"result","subtype":"success","duration_ms":80,"duration_api_ms":80,"is_error":false,"result":"One, two.","session_id":"c0ffee00-0000-4000-8000-000000000005"}

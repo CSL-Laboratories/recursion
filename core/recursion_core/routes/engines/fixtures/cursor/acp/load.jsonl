@@ -1,0 +1,10 @@
+{"type":"_fixture","written_by":"Claude Opus 5.5 (claude-opus-5-5), lane ENGINE-E6","provenance":"synthetic","shapes_from":"https://cursor.com/docs/cli/acp (retrieved 2026-11-15 about 01:05 UTC: 'Resume an existing conversation with session/load') and the ACP v1 schema at agentclientprotocol/agent-client-protocol 13b765828f961812f0c78ae577220e994209fa2f (LoadSessionResponse is an object; history is replayed as session/update before the load answer)","guessed":["the initialize answer's capabilities","what Cursor puts in the load answer (written as the minimal object {})","the replayed history's updates"]}
+{"dir":"client","msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[{"id":"cursor_login","name":"Cursor login","description":null}]}}}
+{"dir":"client","msg":{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"acp-session-0001","cwd":"/work/demo","mcpServers":[]}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-session-0001","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Read README.md."}}}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-session-0001","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"I was not allowed to read it."}}}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","id":2,"result":{}}}
+{"dir":"client","msg":{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"acp-session-0001","prompt":[{"type":"text","text":"Try again."}]}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-session-0001","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Still not allowed."}}}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}}

@@ -685,3 +685,13 @@ def _pending_refusal(sock: socket.socket) -> TransportBusy | PeerNotAdmitted | N
     except (OSError, FrameError):
         return None
     return _transport_refusal(reply) if reply is not None else None
+
+
+# Names the remote lane's product code imports from this module.
+__all__ = [
+    "BUSY_FRAME",
+    "NOT_ADMITTED_FRAME",
+    "UnixControlClient",
+    "refuse_remote_bind",
+    "require_unix_transport",
+]

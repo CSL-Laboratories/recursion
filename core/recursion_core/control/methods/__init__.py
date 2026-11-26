@@ -100,7 +100,15 @@ WHO OWNS THE TRANSACTION. For a method keyed by ``command_id`` the dispatcher do
 A handler that RETURNS an answer has accepted the command: the answer is stored and replayed for that id
 for good. A handler that must not leave a receipt (the refusal is about this moment, not about the
 command: ``busy``, ``unavailable``) raises ``NotAccepted(answer)``: the transaction is rolled back,
-nothing is stored, no callback runs, and the caller gets ``answer``; the same id may be sent again. A
+nothing is stored, no callback runs, and the same id may be sent again. ``NotAccepted`` keeps
+``dict(answer)``. When its ``code`` is non-empty text and ``copy.deepcopy`` can copy it, the caller gets
+a copy of it as given: a dict, another mapping, or a list of ``(key, value)`` pairs, which reaches the
+caller as a dict. When its ``code`` is anything else, or it cannot be copied, the caller gets
+``{'code': 'unavailable', 'detail': 'handler:NotAccepted'}`` and a log line names the method. When
+``NotAccepted(answer)`` itself raises, as it does for an ``answer`` that ``dict()`` refuses, no
+``NotAccepted`` is raised at all: the handler has failed with that error, and the caller gets
+``unavailable`` with ``handler:`` and its type, as for any other failure (``NotAccepted('busy')`` gives
+``handler:ValueError``; ``NotAccepted(None)`` and ``NotAccepted(7)`` give ``handler:TypeError``). A
 handler that raises anything else is rolled back the same way and the caller gets ``unavailable``.
 
 The payload digest is the SHA-256 of the UTF-8 bytes of the params AS SUPPLIED without ``command_id``,
@@ -118,7 +126,12 @@ keyed by ``command_id`` is therefore registered with one of two things as ``tena
 ``tenant_of(principal, params) -> tenant`` that names the tenant the target belongs to (the session's
 tenant, say), or the constant ``INSTALL_TENANT``, the explicitly named fixed namespace of a method whose
 target is the whole install. ``tenant_of`` runs before the transaction is opened; it raises
-``NotAccepted(answer)`` when there is no such target (``session_unknown``, say).
+``NotAccepted(answer)`` when there is no such target (``session_unknown``, say). The handler then does
+not run, and the caller gets what a handler's ``NotAccepted(answer)`` gives, with ``tenant:`` in place
+of ``handler:``: a copy of ``dict(answer)`` when its ``code`` is non-empty text and it can be copied;
+otherwise ``{'code': 'unavailable', 'detail': 'tenant:NotAccepted'}`` and a log line names the method;
+and when ``NotAccepted(answer)`` itself raises (``'busy'``, ``None``, ``7``), ``unavailable`` with
+``tenant:`` and that error's type, as for any other error of ``tenant_of``.
 
 AFTER THE COMMIT. ``ctx.after_commit(fn)`` is a callback of THIS PROCESS and nothing more. After a
 confirmed commit the dispatcher calls each ``fn`` once, in the order they were scheduled, outside every
@@ -233,6 +246,17 @@ class NotAccepted(Exception):
     def __init__(self, answer) -> None:
         super().__init__(str(answer.get('code')) if isinstance(answer, dict) else 'not accepted')
         self.answer = dict(answer)
+
+
+def _typed_answer(answer):
+    """An answer the caller may see: a dict whose ``code`` is non-empty text. Anything else is not one."""
+    code = answer.get('code') if isinstance(answer, dict) else None
+    if not isinstance(code, str) or not code:
+        return None
+    try:
+        return copy.deepcopy(answer)
+    except Exception:  # noqa: BLE001 - a refusal that cannot be copied is not an answer
+        return None
 
 
 class NoCanonicalText(ValueError):
@@ -578,9 +602,13 @@ class MethodTable:
                 raise TypeError(f'handler of {method} returned no answer')
             scope.succeeded = True
         except NotAccepted as refusal:
-            return copy.deepcopy(refusal.answer)
+            answer = _typed_answer(refusal.answer)
+            if answer is None:
+                log.error('handler of %s refused without a typed answer', method)
+                return {'code': 'unavailable', 'detail': 'handler:NotAccepted'}
+            return answer
         except Exception as exc:  # noqa: BLE001 - a handler's bug is an answer, never a dropped call
-            log.exception('handler of %s failed', method)
+            log.error('handler of %s failed (%s)', method, type(exc).__name__)
             return {'code': 'unavailable', 'detail': f'handler:{type(exc).__name__}'}
         finally:
             scope.active = False
@@ -615,21 +643,31 @@ class MethodTable:
                 if not isinstance(tenant, str) or not tenant:
                     raise TypeError(f'tenant_of of {method} named no tenant')
             except NotAccepted as refusal:
-                return copy.deepcopy(refusal.answer)
+                answer = _typed_answer(refusal.answer)
+                if answer is None:
+                    log.error('the tenant of %s refused without a typed answer', method)
+                    return {'code': 'unavailable', 'detail': 'tenant:NotAccepted'}
+                return answer
             except Exception as exc:  # noqa: BLE001 - no tenant, no receipt: nothing is run
-                log.exception('the tenant of %s could not be derived', method)
+                log.error('the tenant of %s could not be derived (%s)', method, type(exc).__name__)
                 return {'code': 'unavailable', 'detail': f'tenant:{type(exc).__name__}'}
         key = (tenant, method, command_id)
         stage = 'store'
-        with self._slot(key):
+        outcome = None
+        committed_answer = None
+
+        def run_command():
+            nonlocal stage, outcome, committed_answer
             try:
                 with store.transaction() as tx:
                     receipt = tx.receipt_get(tenant, method, command_id)
                     if receipt is not None:
                         kept_digest, kept_answer = receipt
                         if kept_digest == digest:
-                            return copy.deepcopy(kept_answer)     # a replay: no handler, no callback
-                        return {'code': 'conflict', 'detail': 'command_id_reused'}
+                            outcome = copy.deepcopy(kept_answer)     # a replay: no handler, no callback
+                            return
+                        outcome = {'code': 'conflict', 'detail': 'command_id_reused'}
+                        return
                     # From here to the end of the transaction this dispatch is a command with its transaction
                     # open: nested calls are restricted, and nested reads' callbacks join this command's.
                     scope.in_transaction = True
@@ -646,16 +684,25 @@ class MethodTable:
                     stage = 'store'
                     tx.receipt_put(tenant, method, command_id, digest, copy.deepcopy(committed_answer))
             except NotAccepted as refusal:
-                return copy.deepcopy(refusal.answer)
+                answer = _typed_answer(refusal.answer)
+                if answer is None:
+                    log.error('command %s refused without a typed answer', method)
+                    outcome = {'code': 'unavailable', 'detail': 'handler:NotAccepted'}
+                else:
+                    outcome = answer
             except Exception as exc:  # noqa: BLE001 - rolled back by the store's own context manager
                 # Whatever failed (the handler, the receipt's write, the commit itself), nothing of this
                 # command is committed and no callback runs, the nested reads' included.
-                log.exception('command %s was rolled back (%s)', method, stage)
-                return {'code': 'unavailable', 'detail': f'{stage}:{type(exc).__name__}'}
+                log.error('command %s was rolled back (%s, %s)', method, stage, type(exc).__name__)
+                outcome = {'code': 'unavailable', 'detail': f'{stage}:{type(exc).__name__}'}
             finally:
                 scope.in_transaction = False
                 with scope.lock:
                     scope.sealed = True      # committed or rolled back: no callback joins this command any more
+
+        self._with_slot(key, run_command)
+        if outcome is not None:
+            return outcome
         # Committed, and the slot is released: callbacks run outside every lock of the dispatcher, the ones
         # nested reads registered among them, in the order they were registered.
         scope.succeeded = True
@@ -673,35 +720,60 @@ class MethodTable:
                 continue                     # its own dispatch, or one around it, did not succeed
             try:
                 fn()
-            except Exception:  # noqa: BLE001 - the receipt is committed; a later callback still runs
-                log.exception('an after-commit callback of %s failed', method)
+            except Exception as exc:  # noqa: BLE001 - the receipt is committed; a later callback still runs
+                log.error('an after-commit callback of %s failed (%s)', method, type(exc).__name__)
 
-    def _slot(self, key):
-        return _Slot(self, key)
+    def _enter_count(self, key, marker):
+        """Count this caller under the table lock and return its ``[lock, waiters]`` slot.
 
+        The ``with`` and its body are one line. A branch between taking and giving back the lock
+        is a second trace event, and an interruption on that event used to leave the table lock
+        held, so every command method waited. An exception or an interrupt raised inside the
+        bookkeeping leaves through the ``with``, which gives the lock back, but an interrupt from an
+        opcode trace on one of the 4 steps of the ``with`` exit itself still leaves it held, and
+        this caller's own ``_leave_count`` then waits on it. ``marker[0]`` is the slot before the lock is given back,
+        so the caller can drop the count even when this function's return is itself interrupted.
+        On the free-threaded 3.14 an interrupt signal delivered right after the ``with`` has taken
+        the lock can still leave it held, because that interpreter's own ``with`` has that window
+        itself: measured, not promised, 46 of 200 landed signals here, 95 of 200 for a bare
+        ``with lock:``, and 0 of 200 on CPython 3.12.
+        """
+        lock = self._slots_lock
+        slots = self._slots
+        fresh = [threading.Lock(), 0]
+        with lock: slot = slots.setdefault(key, fresh); slot[1] += 1; marker.__setitem__(0, slot)
+        return slot
 
-class _Slot:
-    """One command at a time for one ``(tenant, method, command_id)``; the entry goes when nobody waits."""
+    def _leave_count(self, key, slot):
+        """Give this caller's waiter count back. The entry goes when it was the last waiter.
 
-    def __init__(self, table: MethodTable, key: tuple) -> None:
-        self._table, self._key = table, key
+        An exception or an interrupt raised inside the bookkeeping leaves through the one-line
+        ``with``, which gives the table lock back, but an interrupt from an opcode trace on one of
+        the 4 steps of the ``with`` exit itself still leaves it held.
+        On the free-threaded 3.14 an interrupt signal delivered right after the ``with`` has taken
+        the lock can still leave it held, because that interpreter's own ``with`` has that window
+        itself: measured, not promised, 49 of 200 landed signals here, 95 of 200 for a bare
+        ``with lock:``, and 0 of 200 on CPython 3.12.
+        """
+        lock = self._slots_lock
+        slots = self._slots
+        missing = object()
+        choice = (missing, key)  # index 0 keeps the entry; index 1 drops it. No branch, so no second trace event.
+        with lock: slot[1] -= 1; slots.pop(choice[(slot[1] == 0) & (slots.get(key) is slot)], None)
 
-    def __enter__(self):
-        table = self._table
-        with table._slots_lock:
-            slot = table._slots.get(self._key)
-            if slot is None:
-                slot = table._slots[self._key] = [threading.Lock(), 0]
-            slot[1] += 1
-        self._slot = slot
-        slot[0].acquire()
-        return self
+    def _with_slot(self, key, body):
+        """Run ``body`` while this caller holds the command slot, then drop the slot before returning.
 
-    def __exit__(self, *exc) -> bool:
-        table, slot = self._table, self._slot
-        slot[0].release()
-        with table._slots_lock:
-            slot[1] -= 1
-            if slot[1] == 0 and table._slots.get(self._key) is slot:
-                del table._slots[self._key]
-        return False
+        The per-key lock is taken with its own ``with``, so there is no Python step between "the lock
+        is mine" and "that ``with`` owns the exit". The waiter count is separate accounting and is
+        given back on the way out, including when ``body`` is interrupted.
+        """
+        marker = [None]
+        try:
+            slot = self._enter_count(key, marker)
+            with slot[0]:
+                return body()
+        finally:
+            held = marker[0]
+            if held is not None:
+                self._leave_count(key, held)

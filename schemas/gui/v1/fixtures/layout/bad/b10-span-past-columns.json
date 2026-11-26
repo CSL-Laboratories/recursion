@@ -1,0 +1,9 @@
+{
+  "schema": "gui.layout/1",
+  "name": "overflow",
+  "title": "Span past the columns",
+  "columns": 2,
+  "slots": [
+    {"panel": "routes", "column": 2, "span": 2, "order": 0, "collapsed": false}
+  ]
+}

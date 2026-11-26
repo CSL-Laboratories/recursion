@@ -39,19 +39,71 @@ from urllib.parse import parse_qs, quote
 
 from .client import ACTIONS, READS, ControlClient, ControlError
 from .inventory import BARS, SIGN_IN_REJECTED, assess, coverage_gaps, project
+from .layouts import load_user_layout
 from .panels import PAPER_BOOK, filter_venue_rows, panel_registry
+from .themes import active_theme_css
 
 __all__ = ["Application", "withhold_venue_data"]
 
+# Phone layout is the prefix: max-width 72rem, the 24px target, the focus outline.
+# The layout grid and the theme floor follow that prefix in the one core sheet.
+# A grid item's zero minimum and the summary target use min-inline-size, so this
+# sheet still has one min-width: (the shared 24px target on a, button and input).
+# Theme variables have no fallback, so an unset token leaves that declaration unused.
+# Visibility, interventions, and the core chrome name canvas colours, never --theme-*.
 _CSS = ("body{font:16px/1.5 system-ui,sans-serif;margin:0 auto;max-width:72rem;padding:0 1rem}"
         ".skip{position:absolute;left:-999px}.skip:focus{left:1rem;top:1rem;background:#fff;padding:.5rem}"
         "a,button,input{min-height:24px;min-width:24px}button{padding:.25rem .75rem}"
         ":focus{outline:3px solid #1a5fb4;outline-offset:2px}table{border-collapse:collapse}"
         "th,td{border:1px solid #666;padding:.25rem .5rem;text-align:left}"
-        ".badge{font-weight:700;border:2px solid currentColor;padding:0 .25rem}")
+        ".badge{font-weight:700;border:2px solid currentColor;padding:0 .25rem}"
+        "body{box-sizing:border-box}"
+        "input,button,pre,table,.layout,.slot{max-width:100%;box-sizing:border-box}"
+        "pre{white-space:pre-wrap;overflow-wrap:anywhere}"
+        "table{display:block;overflow-x:auto}"
+        "summary{min-height:24px;min-inline-size:24px}"
+        ".layout{display:grid;grid-auto-flow:dense;grid-template-columns:minmax(0,1fr)}"
+        ".cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}"
+        ".cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}"
+        ".slot{min-inline-size:0;padding:.5rem}"
+        ".slot-1-1{grid-column:1}.slot-2-1{grid-column:2}.slot-3-1{grid-column:3}"
+        ".slot-1-2{grid-column:1/span 2}.slot-2-2{grid-column:2/span 2}.slot-1-3{grid-column:1/span 3}"
+        "@media (max-width:767px){.layout,.cols-2,.cols-3{grid-template-columns:minmax(0,1fr)}"
+        ".slot-1-1,.slot-2-1,.slot-3-1,.slot-1-2,.slot-2-2,.slot-1-3{grid-column:auto}}"
+        "[data-theme-scope]{background:var(--theme-bg);color:var(--theme-fg)}"
+        "[data-theme-scope] a{color:var(--theme-accent)}"
+        '[data-theme-scope] [role="note"]{color:var(--theme-muted)}'
+        "[data-theme-scope] th,[data-theme-scope] td{border-color:var(--theme-border)}"
+        "[data-theme-scope] table{border-radius:var(--theme-radius)}"
+        '[data-theme-scope] section[aria-label="Visibility"],'
+        '[data-theme-scope] section[aria-label="Visibility"] *,'
+        '[data-theme-scope] section[aria-labelledby="actions-h"],'
+        '[data-theme-scope] section[aria-labelledby="actions-h"] *'
+        "{color:canvastext;background:canvas}"
+        'header,footer,nav,#core-approval,section[aria-labelledby="stop-h"]'
+        "{color:canvastext;background:canvas}")
 _CSS_HASH = base64.b64encode(hashlib.sha256(_CSS.encode()).digest()).decode()
-_CSP = ("default-src 'none'; style-src 'sha256-%s'; form-action 'self'; frame-ancestors 'none'; "
-        "base-uri 'none'" % _CSS_HASH)
+
+
+def _content_security_policy(theme_css: str) -> str:
+    """style-src is the core sheet, plus the compiled theme when one is embedded."""
+    sources = ["'sha256-%s'" % _CSS_HASH]
+    if theme_css:
+        digest = base64.b64encode(hashlib.sha256(theme_css.encode("utf-8")).digest()).decode("ascii")
+        sources.append("'sha256-%s'" % digest)
+    return ("default-src 'none'; style-src %s; form-action 'self'; frame-ancestors 'none'; "
+            "base-uri 'none'" % " ".join(sources))
+
+
+# Stop sits in the page chrome, outside <main data-theme-scope>, on every response.
+_STOP = ('<section aria-labelledby="stop-h"><h2 id="stop-h">Stop a run</h2>'
+         '<form method="post" action="/stop"><p><label for="run-id">Run id</label> '
+         '<input id="run-id" name="run_id" required autocomplete="off" maxlength="128" '
+         'pattern="[A-Za-z0-9_.:\\-]{1,128}" aria-describedby="run-id-help"></p>'
+         '<p id="run-id-help">The control API stops the run; the result shows as it reports it.</p>'
+         '<p><input type="checkbox" id="confirm-stop" name="confirm" value="explicit" required>'
+         '<label for="confirm-stop">I confirm stopping this run</label></p>'
+         '<button type="submit">Request stop</button></form></section>')
 _MAX_BODY = 4096
 # O7 operator-response.schema.json: the visibility object is closed to these four keys and values
 # (the downstream plugin draft #318, docs/replacement/outcomes/O7). The GUI renders only these fixed strings.
@@ -148,13 +200,15 @@ def _withheld_note(venue: str) -> str:
 
 class Application:
     def __init__(self, client: ControlClient, door: Callable[[dict], bool], hosts: frozenset,
-                 origins: frozenset, required: dict | None = None, panels=()) -> None:
+                 origins: frozenset, required: dict | None = None, panels=(), *, theme_root=None) -> None:
         self._client = client
         self._required = required
         self._panels = panel_registry(panels)
         self._door = door
         self._hosts = frozenset(hosts)
         self._origins = frozenset(origins)
+        # None reads the operator gui directory. A caller may pass a directory for tests.
+        self._theme_root = theme_root
 
     # -- door ---------------------------------------------------------------------------
     def _refusal(self, env: dict, method) -> str | None:
@@ -184,63 +238,83 @@ class Application:
         return None
 
     def __call__(self, env: dict, start_response) -> list[bytes]:
+        # The same compiled theme on every answer of this request, including a refusal,
+        # so the style hash matches the sheet. A theme that cannot be read is no theme.
+        theme_css = self._theme_css()
         # The request line first, before anything compares it: a method or path that is not a str
         # exactly could raise in, or lie to, a comparison (DeepSeek rounds 4 and 5).
         method, path = env.get("REQUEST_METHOD"), env.get("PATH_INFO", "")
         if type(method) is not str or type(path) is not str:
             return self._send(start_response, "400 Bad Request",
-                              self._page("Bad request", "<p>Bad request: request line</p>"))
+                              self._page("Bad request", "<p>Bad request: request line</p>", theme_css), theme_css)
         refusal = self._refusal(env, method)
         if refusal is not None:
             status = "401 Unauthorized" if refusal == "device_not_authenticated" else "403 Forbidden"
-            return self._send(start_response, status, self._page("Refused", "<p>Refused: %s</p>" % escape(refusal)))
+            return self._send(start_response, status,
+                              self._page("Refused", "<p>Refused: %s</p>" % escape(refusal), theme_css), theme_css)
         routes = {("GET", "/"): self._home, ("GET", "/read"): self._read, ("GET", "/panel"): self._panel,
                   ("POST", "/action"): self._action, ("POST", "/stop"): self._stop}
         handler = routes.get((method, path))
         if handler is None:
             known = path in {p for _, p in routes}
             return self._send(start_response, "405 Method Not Allowed" if known else "404 Not Found",
-                              self._page("Not available", "<p>Not available.</p>"))
+                              self._page("Not available", "<p>Not available.</p>", theme_css), theme_css)
         try:
             title, body = handler(env)
-            html = self._page(title, body)
+            html = self._page(title, body, theme_css)
         except _BadRequest as exc:
             return self._send(start_response, "400 Bad Request",
-                              self._page("Bad request", "<p>Bad request: %s</p>" % escape(str(exc))))
+                              self._page("Bad request", "<p>Bad request: %s</p>" % escape(str(exc)), theme_css),
+                              theme_css)
         except Exception as exc:  # noqa: BLE001 - every answer this module gives carries the same headers
             # Only the exception's type is named, never its text. Nothing here says whether a request
             # that was sent took effect.
             return self._send(start_response, "500 Internal Server Error", self._page(
                 "Not available", '<p role="status">Not available: the page could not finish this request '
                 "(%s). It does not know whether anything that was sent took effect; check the run before "
-                "sending it again.</p>" % escape(type(exc).__name__)))
-        return self._send(start_response, "200 OK", html)
+                "sending it again.</p>" % escape(type(exc).__name__), theme_css), theme_css)
+        return self._send(start_response, "200 OK", html, theme_css)
+
+    def _theme_css(self) -> str:
+        try:
+            css = active_theme_css(self._theme_root)
+        except Exception:  # noqa: BLE001 - a theme on disk must not take the page down
+            return ""
+        return css if type(css) is str else ""
 
     @staticmethod
-    def _send(start_response, status: str, html: str) -> list[bytes]:
+    def _send(start_response, status: str, html: str, theme_css: str = "") -> list[bytes]:
         raw = html.encode("utf-8")
         start_response(status, [
             ("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(raw))),
-            ("Cache-Control", "no-store"), ("Content-Security-Policy", _CSP),
+            ("Cache-Control", "no-store"),
+            ("Content-Security-Policy", _content_security_policy(theme_css)),
             ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "same-origin"),
             ("X-Frame-Options", "DENY")])
         return [raw]
 
     # -- pages --------------------------------------------------------------------------
     @staticmethod
-    def _page(title: str, main: str) -> str:
+    def _page(title: str, main: str, theme_css: str = "") -> str:
+        # The core sheet has no attributes, so the unthemed page still has one <style>.
+        # The compiled theme, when there is one, is a second sheet and a second hash.
+        styles = "<style>" + _CSS + "</style>"
+        if theme_css:
+            styles += '<style id="theme">' + theme_css + "</style>"
         return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
                 '<meta name="viewport" content="width=device-width, initial-scale=1">'
-                "<title>%s - Recursion operator</title><style>%s</style></head><body>"
+                "<title>" + escape(title) + " - Recursion operator</title>" + styles + "</head><body>"
                 '<a class="skip" href="#main">Skip to main content</a>'
                 "<header><h1>Recursion operator</h1><p>Every route is BETA unless all six bars pass with "
                 "recorded evidence, and a route the control API tags beta stays BETA. No live demos. This page cannot place, approve or size orders.</p></header>"
                 '<nav aria-label="Sections"><ul><li><a href="/">Overview</a></li>'
                 '<li><a href="/#routes-h">Routes</a></li><li><a href="/#reads-h">Reads</a></li>'
                 '<li><a href="/#actions-h">Interventions</a></li><li><a href="/#stop-h">Stop a run</a></li>'
-                '</ul></nav><main id="main" tabindex="-1">%s</main>'
-                "<footer><p>Results are shown as the control API returned them. A stop that is not "
-                "confirmed shows as pending.</p></footer></body></html>") % (escape(title), _CSS, main)
+                '</ul></nav><main id="main" data-theme-scope tabindex="-1">' + main + "</main>"
+                '<aside id="core-approval" aria-label="Approval request, drawn by the core"></aside>'
+                + _STOP
+                + "<footer><p>Results are shown as the control API returned them. A stop that is not "
+                "confirmed shows as pending.</p></footer></body></html>")
 
     def _routes_table(self) -> str:
         try:
@@ -277,21 +351,42 @@ class Application:
             '<label for="confirm-%d">I confirm this request</label> <button type="submit">Send: %s</button>'
             "</fieldset></form>" % (escape(_LABELS[c]), escape(c), i, i, escape(_LABELS[c]))
             for i, c in enumerate(ACTIONS))
-        stop = ('<section aria-labelledby="stop-h"><h2 id="stop-h">Stop a run</h2>'
-                '<form method="post" action="/stop"><p><label for="run-id">Run id</label> '
-                '<input id="run-id" name="run_id" required autocomplete="off" maxlength="128" '
-                'pattern="[A-Za-z0-9_.:\\-]{1,128}" aria-describedby="run-id-help"></p>'
-                '<p id="run-id-help">The control API stops the run; the result shows as it reports it.</p>'
-                '<p><input type="checkbox" id="confirm-stop" name="confirm" value="explicit" required>'
-                '<label for="confirm-stop">I confirm stopping this run</label></p>'
-                '<button type="submit">Request stop</button></form></section>')
+        # Stop is _STOP, drawn once after </main>, so a layout cannot cover it and the
+        # core bytes stay the unthemed page's. The layout, when one loads, replaces only
+        # the workspace inside <main data-theme-scope>.
+        layout = load_user_layout(self._panels)
+        if layout is not None:
+            slots = "".join(self._layout_slot(slot, reads, actions) for slot in layout["slots"])
+            return layout["title"], '<div class="layout cols-%d">%s</div>' % (layout["columns"], slots)
         panels = ('<section aria-labelledby="panels-h"><h2 id="panels-h">Plugin panels</h2><ul>'
                   + "".join('<li><a href="/panel?id=%s">%s</a></li>' % (quote(pid), escape(p["title"]))
                             for pid, p in self._panels.items()) + "</ul></section>")
         main = (panels + self._routes_table() + '<section aria-labelledby="reads-h"><h2 id="reads-h">Reads</h2><ul>'
                 + reads + '</ul></section><section aria-labelledby="actions-h"><h2 id="actions-h">'
-                "Interventions</h2>" + actions + "</section>" + stop)
+                "Interventions</h2>" + actions + "</section>")
         return "Overview", main
+
+    def _layout_slot(self, slot, reads: str, actions: str) -> str:
+        panel_id = slot["panel"]
+        title, inner = self._view_body(panel_id, reads, actions)
+        kind = "details" if slot["collapsed"] else "section"
+        tag = ('<%s class="slot slot-%d-%d" data-column="%d" data-panel="%s" data-collapsed="%s">'
+               % (kind, slot["column"], slot["span"], slot["column"], escape(panel_id, quote=True),
+                  "true" if slot["collapsed"] else "false"))
+        if slot["collapsed"]:
+            return tag + "<summary>%s</summary>%s</details>" % (escape(title), inner)
+        return tag + inner + "</section>"
+
+    def _view_body(self, panel_id: str, reads: str, actions: str) -> tuple[str, str]:
+        if panel_id == "routes":
+            return "Routes", self._routes_table()
+        if panel_id == "reads":
+            return "Reads", ('<section aria-labelledby="reads-h"><h2 id="reads-h">Reads</h2><ul>'
+                             + reads + "</ul></section>")
+        if panel_id == "interventions":
+            return "Interventions", ('<section aria-labelledby="actions-h"><h2 id="actions-h">'
+                                     "Interventions</h2>" + actions + "</section>")
+        return self._panels[panel_id]["title"], self._panel_body(self._panels[panel_id])
 
     @staticmethod
     def _query(env: dict) -> dict:
@@ -391,6 +486,9 @@ class Application:
         if set(form) != {"id"} or len(form["id"]) != 1 or form["id"][0] not in self._panels:
             raise _BadRequest("panel_not_registered")
         panel = self._panels[form["id"][0]]
+        return panel["title"], self._panel_body(panel)
+
+    def _panel_body(self, panel) -> str:
         body = "<h2>%s</h2><p>Read-only plugin panel.</p>" % escape(panel["title"])
         if panel["venue_use"] is not None:
             body += ('<p role="note">Declared venue use: <code>%s</code> (a label). '
@@ -423,7 +521,7 @@ class Application:
             except ControlError as exc:
                 body += '<p role="status">Unavailable: %s</p>' % escape(exc.code)
             body += "</section>"
-        return panel["title"], body
+        return body
 
     def _action(self, env: dict) -> tuple[str, str]:
         form = self._form(env, {"command", "confirm"})

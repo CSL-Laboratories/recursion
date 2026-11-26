@@ -1,0 +1,12 @@
+{
+  "schema": "gui.theme/2",
+  "name": "bad",
+  "title": "Bad",
+  "tokens": {
+    "bg": "#ffffff",
+    "fg": "#1a1a1a",
+    "muted": "#595959",
+    "accent": "#1a5fb4",
+    "border": "#666666"
+  }
+}

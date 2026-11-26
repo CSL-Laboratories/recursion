@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "layout.v1.json",
+  "title": "gui.layout/1",
+  "description": "One operator layout: one to three columns, and which panel or core view sits in each slot. No pixels, no overlay, no core-region name. Column numbers start at 1. A slot's column and span must stay inside the columns of this layout.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "name", "title", "columns", "slots"],
+  "properties": {
+    "schema": {"const": "gui.layout/1"},
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "pattern": "\\S"
+    },
+    "columns": {"type": "integer", "minimum": 1, "maximum": 3},
+    "slots": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/slot"}
+    }
+  },
+  "$defs": {
+    "slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["panel", "column", "span", "order", "collapsed"],
+      "properties": {
+        "panel": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]{1,96}$",
+          "not": {"enum": ["stop", "approval", "header", "footer"]}
+        },
+        "column": {"type": "integer", "minimum": 1, "maximum": 3},
+        "span": {"type": "integer", "minimum": 1, "maximum": 3},
+        "order": {"type": "integer"},
+        "collapsed": {"type": "boolean"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"columns": {"const": 1}},
+        "required": ["columns"]
+      },
+      "then": {
+        "properties": {
+          "slots": {
+            "items": {
+              "properties": {"column": {"const": 1}, "span": {"const": 1}}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"columns": {"const": 2}},
+        "required": ["columns"]
+      },
+      "then": {
+        "properties": {
+          "slots": {
+            "items": {
+              "anyOf": [
+                {
+                  "properties": {"column": {"const": 1}, "span": {"enum": [1, 2]}},
+                  "required": ["column", "span"]
+                },
+                {
+                  "properties": {"column": {"const": 2}, "span": {"const": 1}},
+                  "required": ["column", "span"]
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"columns": {"const": 3}},
+        "required": ["columns"]
+      },
+      "then": {
+        "properties": {
+          "slots": {
+            "items": {
+              "anyOf": [
+                {
+                  "properties": {"column": {"const": 1}, "span": {"enum": [1, 2, 3]}},
+                  "required": ["column", "span"]
+                },
+                {
+                  "properties": {"column": {"const": 2}, "span": {"enum": [1, 2]}},
+                  "required": ["column", "span"]
+                },
+                {
+                  "properties": {"column": {"const": 3}, "span": {"const": 1}},
+                  "required": ["column", "span"]
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

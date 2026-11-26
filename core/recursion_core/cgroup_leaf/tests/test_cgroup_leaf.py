@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -499,6 +500,209 @@ class RealCgroupTests(unittest.TestCase):
                 gc = int(wait_file(Path(work) / 'gc'))
             self.assertEqual(run.outcome.state, 'leaf_empty')
             self.assertFalse(alive(gc))
+
+    @unittest.skipUnless(os.environ.get('RECURSION_CGROUP_ROOT'), 'no delegated cgroup root')
+    def test_real_double_forked_setsid_grandchild_stays_in_the_leaf_and_dies_with_it(self):
+        # The kernel keeps a process in its cgroup through fork, setsid() and the exit of its
+        # parent, so cgroup.kill reaches a grandchild that killpg of the main process misses.
+        root = DelegatedRoot(os.environ['RECURSION_CGROUP_ROOT'])
+        name = f'run-detached{os.getpid()}'
+        leaf = root.leaf(name)
+        with tempfile.TemporaryDirectory() as work:
+            gc = None
+            try:
+                with root.launch(name, detached_tree_argv(Path(work) / 'gc', leaf), cwd=work) as run:
+                    gc = int(wait_file(Path(work) / 'gc'))
+                    assert_detached(self, gc, run.pid)
+                    self.assertEqual(root.fs.member(gc), leaf)  # setsid() did not leave the leaf
+                self.assertEqual(run.outcome.state, 'leaf_empty')
+                self.assertFalse(alive(gc))
+                self.assertFalse(leaf.exists())
+            finally:
+                if gc is not None:
+                    end_own(gc, leaf)
+
+
+# A run whose process forks a child that forks a grandchild and exits; the grandchild calls
+# setsid() and lives on (what a browser's helper processes do). Every stand-in ends by itself
+# after TREE_LIFE_S seconds, a test value, so nothing outlives a failed test for long. The last
+# argument is the leaf's mark: a forked process keeps its parent's command line, so the
+# inherited-membership fake below reads membership from it (no stand-in calls exec).
+DETACHED_TREE = '''import os, sys, time
+gc_file, life = sys.argv[1], float(sys.argv[2])
+middle = os.fork()
+if middle == 0:
+    me = os.getpid()
+    if os.fork() == 0:
+        os.setsid()
+        deadline = time.monotonic() + life
+        while os.getppid() == me and time.monotonic() < deadline:
+            time.sleep(0.005)
+        with open(gc_file + '.part', 'w') as out:
+            out.write(str(os.getpid()))
+        os.rename(gc_file + '.part', gc_file)
+        time.sleep(max(0.0, deadline - time.monotonic()))
+        os._exit(0)
+    os._exit(0)
+os.waitpid(middle, 0)
+time.sleep(life)
+'''
+TREE_LIFE_S = '60'
+LEAF_MARK = 'csl-test-leaf='
+
+
+def detached_tree_argv(gc_file, leaf):
+    """Three processes at most: the main, the middle (exits at once) and the grandchild."""
+    return [sys.executable, '-I', '-S', '-c', DETACHED_TREE, str(gc_file), TREE_LIFE_S,
+            f'{LEAF_MARK}{leaf}']
+
+
+def stat_fields(pid):
+    """state, ppid, pgrp, session, ... of pid (fields 3 onward of /proc/<pid>/stat)."""
+    return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+
+
+def marked(pid, leaf):
+    try:
+        parts = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+    except OSError:
+        return False
+    return f'{LEAF_MARK}{leaf}'.encode() in parts
+
+
+def end_own(pid, leaf):
+    """SIGKILL pid only while it carries this leaf's mark: a stand-in of this test, never another process.
+
+    The pidfd pins the process, so the mark read after opening it belongs to the process signalled.
+    """
+    try:
+        fd = os.pidfd_open(pid)
+    except OSError:
+        return
+    try:
+        if marked(pid, leaf):
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def assert_detached(case, gc, main):
+    """gc is in a session and process group of its own, and its parent is not the main process."""
+    _, ppid, pgrp, session = stat_fields(gc)[:4]
+    main_session = stat_fields(main)[3]
+    case.assertEqual(int(session), gc)
+    case.assertEqual(int(pgrp), gc)
+    case.assertNotEqual(session, main_session)
+    case.assertNotEqual(int(ppid), main)
+
+
+class InheritedCgroup(FakeCgroup):
+    """Membership the way cgroup v2 keeps it: inherited at fork, kept through setsid() and through
+    the exit of a parent. FakeCgroup models the leaf as the main's process group, so a setsid()
+    grandchild is outside it there; here it stays inside. A process is a member while its command
+    line carries the leaf's mark (detached_tree_argv). kill() ends every member, as cgroup.kill does.
+    ``empty_reads`` records, for each populated() that answered False, whether ``watch`` was alive.
+    """
+    def __init__(self, mount):
+        super().__init__(mount)
+        self.watch = None
+        self.empty_reads = []
+
+    def members(self, leaf):
+        found = []
+        for entry in Path('/proc').iterdir():
+            if entry.name.isdigit() and marked(int(entry.name), leaf) and alive(int(entry.name)):
+                found.append(int(entry.name))
+        return found
+
+    def kill(self, leaf):
+        if self.interrupts:
+            self.interrupts -= 1
+            raise KeyboardInterrupt('second interrupt during cleanup')
+        if self.kill_broken:
+            raise OSError('cgroup.kill refused')
+        for pid in self.members(leaf):
+            end_own(pid, leaf)
+
+    def populated(self, leaf):
+        if self.events_broken:
+            return None
+        if self.members(leaf):
+            return True
+        if self.watch is not None:
+            self.empty_reads.append(alive(self.watch))
+        return False
+
+
+@unittest.skipIf(NOT_LINUX, LINUX_ONLY)
+class DetachedGrandchildLeafTests(unittest.TestCase):
+    """The double fork with the middle process exited, on every Linux host (fake cgroupfs)."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        base = Path(os.path.realpath(self.temp.name))
+        self.mount = base / 'cgroup'
+        self.root_path = self.mount / 'user.slice' / 'delegated'
+        self.root_path.mkdir(parents=True)
+        for name in ('cgroup.procs', 'cgroup.kill', 'cgroup.controllers'):
+            (self.root_path / name).touch()
+        self.work = base / 'work'
+        self.work.mkdir()
+        self.fs = InheritedCgroup(self.mount)
+        self.root = DelegatedRoot(self.root_path, self.fs)
+        self.leaf = self.root.leaf('run-a')
+
+    def tearDown(self):
+        for pid in self.fs.members(self.leaf):
+            end_own(pid, self.leaf)
+        self.temp.cleanup()
+
+    def launch(self, **kw):
+        run = self.root.launch('run-a', detached_tree_argv(self.work / 'gc', self.leaf),
+                               cwd=self.work, **kw)
+        gc = int(wait_file(self.work / 'gc'))
+        self.fs.watch = gc
+        return run, gc
+
+    def leaves(self):
+        return sorted(p.name for p in self.root_path.iterdir() if p.is_dir())
+
+    def test_double_forked_setsid_grandchild_ends_with_the_leaf(self):
+        run, gc = self.launch()
+        with run:
+            assert_detached(self, gc, run.pid)
+            self.assertEqual(sorted(self.fs.members(self.leaf)), sorted([run.pid, gc]))
+            self.assertTrue(self.fs.populated(self.leaf))
+        self.assertEqual(run.outcome.state, 'leaf_empty')
+        self.assertIs(run.outcome.populated, False)
+        self.assertTrue(run.outcome.main_exit_seen)
+        self.assertFalse(alive(gc))
+        self.assertTrue(self.fs.empty_reads)
+        self.assertFalse(any(self.fs.empty_reads))  # empty was read only once gc was gone
+        self.assertEqual(self.leaves(), [])
+
+    def test_spared_grandchild_keeps_the_leaf_running_until_a_later_kill(self):
+        # The cut: the kill of the tree spares the grandchild; only the main's pidfd is signalled.
+        run, gc = self.launch(kill_timeout=0.3)
+        with patch.object(self.fs, 'kill', lambda leaf: None), \
+             self.assertLogs('recursion_core.cgroup_leaf', level='ERROR'):
+            with self.assertRaises(CleanupIncomplete) as caught:
+                with run:
+                    assert_detached(self, gc, run.pid)
+        outcome = caught.exception.outcome
+        self.assertEqual(outcome.state, 'running')
+        self.assertIs(outcome.populated, True)
+        self.assertTrue(outcome.main_exit_seen)
+        self.assertTrue(alive(gc))
+        self.assertEqual(self.fs.empty_reads, [])
+        self.assertEqual(self.leaves(), ['run-a'])  # a populated leaf is never removed
+        retried = run.close()  # the kill restored: the next close reaches the grandchild
+        self.assertEqual(retried.state, 'leaf_empty')
+        self.assertFalse(alive(gc))
+        self.assertTrue(self.fs.empty_reads)
+        self.assertFalse(any(self.fs.empty_reads))
+        self.assertEqual(self.leaves(), [])
 
 
 if __name__ == '__main__':

@@ -29,7 +29,7 @@
 [summary]
 # The number of for_owner rows. The test is red when it differs from the count of those rows, so the number
 # always equals the count and a new waiting package shows as a raised number in the change.
-for_owner_max = 6
+for_owner_max = 7
 # What a passed leave_by does: "red" (the test is red) or "print" (the printed state line names the row and its date).
 leave_by_passed = "red"
 
@@ -149,6 +149,17 @@ what = "The operator GUI served by the daemon over the control client."
 builds_it = [
   { kind = "lane", ref = "G1", contract = "pinned" },
   { kind = "lane", ref = "G6", contract = "pinned" },
+]
+
+# settings came under the core with the merge of the person's one settings file on 2026-11-25. No line of the
+# public tree places it in the core, so its place under the core waits for the owner's decision; until a lane of
+# the pinned contract is cited for it, builds_it cites that merge by role and date.
+[[package]]
+name = "settings"
+section = "for_owner"
+what = "A person's own settings: one owner-only file read at daemon start, each trade-off a setting with a default."
+builds_it = [
+  { kind = "decision", ref = "the owner, 2026-11-25" },
 ]
 
 [[package]]

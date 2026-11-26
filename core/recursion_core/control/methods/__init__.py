@@ -368,8 +368,8 @@ def canonical_text(value, depth: int = 0) -> str:
     raise NoCanonicalText('type')
 
 
-# The command_id of SPINE's control records (``common.v1.json``, ``$defs/command_id``, in the schema drafts that
-# are not on master yet), and the grammar the event store checks for a receipt key (events/db.py): a test holds
+# The command_id of SPINE's control records (``schemas/control/v1/common.v1.json``, ``$defs/command_id``), and
+# the grammar the event store checks for a receipt key (events/db.py): a test holds
 # the two copies equal. ASCII only and matched whole, so no line end, NUL or DEL passes.
 _COMMAND_ID = re.compile(r'[A-Za-z0-9._:-]{8,128}')
 

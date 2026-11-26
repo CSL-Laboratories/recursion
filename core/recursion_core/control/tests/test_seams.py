@@ -3060,6 +3060,25 @@ class NestedDispatchTest(unittest.TestCase):
         self.nested_without_params('session.turn', dict(TURN))
         self.assertEqual(self.store.commits, 1, 'the command around the nested calls committed')
 
+    def test_a_built_in_called_without_params_gets_what_the_caller_passed(self) -> None:
+        """Only a read of this table gets an empty mapping in place of params left out (the half ``inner not in
+        BUILT_IN``): a built-in is the composition's to answer and receives what the handler passed, None included."""
+        given = []
+
+        def status(ctx, params):
+            return {'code': 'ok', 'runs': [ctx.call('run.list'), ctx.call('run.list', None), ctx.call('run.list', {})]}
+        table = table_with(self.store, **{'session.status': status})
+
+        def call(method, params=None):
+            if method in methods.BUILT_IN:
+                given.append((method, params))
+                return self.built_in(method, params)
+            return table.dispatch(method, params, H.OWNER, call)
+        answer = table.dispatch('session.status', {}, H.OWNER, call)
+        self.assertEqual(answer['runs'], [{'code': 'ok', 'runs': []}] * 3)
+        self.assertEqual(given, [('run.list', None), ('run.list', None), ('run.list', {})],
+                         'the built-in got the params as given: None stays None')
+
 
 class CallbackOwnershipTest(unittest.TestCase):
     """The second reads' B1: a callback belongs to the dispatch that registered it, not to a place in a list."""

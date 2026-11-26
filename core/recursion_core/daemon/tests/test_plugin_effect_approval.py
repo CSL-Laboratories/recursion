@@ -101,6 +101,26 @@ class _HostCase(unittest.TestCase):
         self.breaker = stored
         return made
 
+    def loaded_host(self, *, anchor):
+        """A host whose plugin is loaded holding ``order`` (unsigned, acknowledged) and whose run is bound.
+
+        A charge passes the core's checks only for such a plugin, so a test that replaces the ledger's
+        ``charge`` reaches its replacement only on this host.
+        """
+        fx.write_install(self.config, trusted={}, authority_anchor=anchor,
+                         grants=[fx.grant_for(SOURCE, permissions=("order",), unsigned_order_acknowledged=True)])
+        fx.write_plugin(self.plugins_dir / "fixture", SOURCE, permissions=("order",))
+        stored, _created = breaker_module.open_breaker_store(self.state, clock=lambda: 0.0)
+        self.addCleanup(stored.close)
+        create_ledger(str(self.ledger), anchor)
+        made = plugins.PluginHost(self.config, self.state, stored, gil_probe=FakeGilProbe(), clock=CLOCK,
+                                  device_token_path=self.token_path, verification_available=lambda: True)
+        self.addCleanup(made.close)
+        self.breaker = stored
+        self.assertEqual(made.records[0]["state"], "loaded", made.records[0])
+        stored.bind_run(RUN_ID, CONNECTION, PLUGIN_ID, PROVIDER, MODEL)
+        return made
+
     def owner(self):
         return plugins.OwnerSocketPeer(os.geteuid(), os.getpid())
 
@@ -172,7 +192,7 @@ class PluginEffectApprovalTests(_HostCase):
 
     def test_a_denial_and_an_interruption_leave_the_effect_uncharged(self):
         anchor = "ab" * 32
-        host = self.host(anchor=anchor)
+        host = self.loaded_host(anchor=anchor)
         effect = _effect()
         peer = self.owner()
         denied_id = host.request_plugin_effect(effect)
@@ -195,7 +215,7 @@ class PluginEffectApprovalTests(_HostCase):
 
     def test_a_refused_charge_leaves_the_approval_approved(self):
         anchor = "cd" * 32
-        host = self.host(anchor=anchor)
+        host = self.loaded_host(anchor=anchor)
         effect = _effect()
         approval_id = host.request_plugin_effect(effect)
 

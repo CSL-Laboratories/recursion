@@ -43,7 +43,10 @@ or not.
 
 A plugin effect is approved by the OS user who owns the daemon, over the owner-only socket, or by
 the device token, and only through ``approval.answer`` and then ``PluginEffectSink.carry`` (the
-effect is charged, then the approval is consumed, once). The in-memory gate still names no
+effect is charged, then the approval is consumed, once). The charge goes through the core's one
+charge path, ``CoreService.authorize_effect``, with every check a plugin's own charge passes: core
+health, the permission a key revocation removes, the run and its connection, the commit fence a
+halt drains, and the queue record still approved, read again inside that fence. The in-memory gate still names no
 principal, so a decision there authorizes nothing. Not here: a plugin principal and a plugin-owned
 run (every run is bound to ``host``), the O7 interventions, and an installer (the authority ledger
 is never created by the daemon; without it an order effect refuses ``authority_unconfigured``).
@@ -412,6 +415,86 @@ class _EffectNotes:
             os.close(dir_fd)
 
 
+# What a person reads when an approved charge is stopped: what stopped it, that nothing was charged,
+# and what to do next. The code stays the refusing check's own; ``{detail}`` is that check's detail.
+_RUN_NOT_BOUND = ('the run named by the effect is not bound to this plugin on this connection; nothing was '
+                  'charged; bind the run, then request the effect again')
+_CHARGE_STOPPED = {
+    'core_poisoned_restart_required': 'the plugin core is poisoned ({detail}), so no plugin effect can be charged; '
+                                      'nothing was charged; restart the daemon, then request the effect again',
+    'permission_required': "the plugin does not hold the '{detail}' permission now (its signing key was revoked, or "
+                           'its grant does not give it); nothing was charged; install a grant that gives it again, '
+                           'then request the effect again',
+    'run_faulted': 'the run was halted by a run fault; nothing was charged; start a new run, then request the '
+                   'effect again',
+    'connection_tripped': "the connection's breaker tripped before or during this charge; nothing was charged; "
+                          'reset the connection with a leased probe, then request the effect again',
+    'run_unknown': _RUN_NOT_BOUND, 'run_not_owned': _RUN_NOT_BOUND, 'run_connection_mismatch': _RUN_NOT_BOUND,
+    'approval_not_approved': 'the approval is no longer approved (it is {detail} now); nothing was charged; '
+                             'request the effect again if it is still wanted',
+    'core_unavailable': 'no plugin core is composed in this daemon (it has no breaker store), so no plugin effect '
+                        'can be charged; nothing was charged; restart the daemon once its state directory opens',
+    'authority_unconfigured': 'no authority ledger is installed, so no order can be charged; nothing was charged; '
+                              'create the ledger with the installer, then request the effect again',
+    'effect_replayed': 'this approval was charged earlier and its receipt is not held here; nothing was charged '
+                       'again; read the charge in the authority ledger',
+}
+_CHARGE_STOPPED_OTHER = ('the charge was refused ({code}{detail}); nothing was charged; correct what the code names, '
+                         'then request the effect again')
+
+
+def _charge_stopped(refused):
+    """The same refusal, its code unchanged, with the words a person reads."""
+    detail = refused.detail or ''
+    words = _CHARGE_STOPPED.get(refused.code)
+    if words is None:
+        words = _CHARGE_STOPPED_OTHER.format(code=refused.code, detail=': ' + detail if detail else '')
+    else:
+        words = words.format(detail=detail or 'unknown')
+    return Refused(refused.code, words)
+
+
+class _QueuedApproval:
+    """The approval queue's record of one approved plugin effect, as the core's one charge path carries it.
+
+    ``take`` reads the record after the core's checks; ``recheck`` reads it again inside the commit
+    fence, so a record that stopped being approved in between is not charged. ``consumed`` passes
+    as well: the sink consumes only after a charge, so the ledger then refuses ``effect_replayed``
+    and the stored receipt is returned (a later process carrying it again).
+    """
+
+    __slots__ = ('_queue', '_approval_id', '_seen')
+
+    def __init__(self, queue):
+        self._queue = queue
+        self._approval_id = self._seen = None
+
+    def _read(self):
+        from recursion_core.approvals import store as approval_rows
+        from recursion_core.approvals.model import ApprovalRefused
+        store = self._queue.store
+        if store is None:
+            raise Refused('approval_not_approved', 'unreadable: no approval store')
+        try:
+            with store.transaction() as tx:
+                record = approval_rows.load(tx, self._approval_id)
+        except ApprovalRefused as refused:  # a record that does not read whole is not an approved one
+            raise Refused('approval_not_approved', f'unreadable: {refused.code}') from None
+        state = record.get('state') if type(record) is dict else None
+        if state not in ('approved', 'consumed'):
+            raise Refused('approval_not_approved', state if type(state) is str else 'unknown')
+        return record['revision'], record['digest']
+
+    def take(self, approval_id, _effect):
+        self._approval_id = approval_id
+        self._seen = self._read()
+        return self._seen[1]
+
+    def recheck(self):
+        if self._read() != self._seen:
+            raise Refused('approval_not_approved', 'changed')
+
+
 class PluginEffectApprover:
     """The daemon's owner, or the device token, answering a plugin effect through ``approval.answer``.
 
@@ -522,43 +605,25 @@ class PluginEffectApprover:
 
         self._notes.update(put)
 
-    def _charge_fields(self, effect):
-        breaker, loader = self._host._breaker, self._host.loader
-        if breaker is None or loader is None or type(effect) is not dict:
-            raise Refused('authority_unconfigured')
-        run = breaker.check(effect['run_id'], effect['connection'], effect['plugin_id'])
-        artifact = loader.artifact(effect['plugin_id'])
-        if type(artifact) is not str:
-            raise Refused('profile_plugin_mismatch')
-        return {'plugin_id': effect['plugin_id'], 'artifact_sha256': artifact, 'scope': effect['scope'],
-                'kind': effect['kind'], 'provider': run['provider'], 'model_version': run['model_version'],
-                'currency': effect['currency'], 'amount_minor': effect['amount_minor']}
-
     def charge(self, effect, approval_id):
-        """``Authority.charge`` for this approval id. ``effect_replayed`` returns the receipt already stored."""
-        authority = self._host.authority
-        if authority is None:
-            raise Refused('authority_unconfigured')
+        """Charge this approval through the core's one charge path (``CoreService.authorize_effect``).
+
+        Every refusal of a check is raised as itself (its code), with words that say what stopped the
+        charge and that nothing was charged. ``effect_replayed`` returns the receipt already stored.
+        """
+        core = self._host.core
+        if core is None:
+            raise _charge_stopped(Refused('core_unavailable'))
         envelope = self._envelope_for(approval_id)
         try:
-            fields = self._charge_fields(effect)
-        except Refused:
-            # The run is not bound. Still call the authority object: a test, or a caller, may have
-            # replaced ``charge``, and that replacement is the charge the sink is waiting on.
-            fields = {'plugin_id': effect.get('plugin_id') if type(effect) is dict else '',
-                      'artifact_sha256': '', 'scope': effect.get('scope') if type(effect) is dict else {},
-                      'kind': effect.get('kind') if type(effect) is dict else '', 'provider': '',
-                      'model_version': '', 'currency': effect.get('currency') if type(effect) is dict else '',
-                      'amount_minor': effect.get('amount_minor') if type(effect) is dict else 0}
-        try:
-            receipt = authority.charge(envelope, idempotency_key=approval_id, **fields)
+            outcome = core.authorize_effect(effect, approval_id, envelope, approval=_QueuedApproval(self._queue))
         except Refused as refused:
-            if refused.code != 'effect_replayed':
-                raise
-            prior = self._receipt_for(approval_id)
-            if prior is None:
-                raise
-            return prior
+            if refused.code == 'effect_replayed':
+                prior = self._receipt_for(approval_id)
+                if prior is not None:
+                    return prior
+            raise _charge_stopped(refused) from None
+        receipt = outcome['charge']
         self._remember_receipt(approval_id, receipt)
         return receipt
 

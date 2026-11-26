@@ -151,15 +151,13 @@ builds_it = [
   { kind = "lane", ref = "G6", contract = "pinned" },
 ]
 
-# settings came under the core with the merge of the person's one settings file on 2026-11-25. No line of the
-# public tree places it in the core, so its place under the core waits for the owner's decision; until a lane of
-# the pinned contract is cited for it, builds_it cites that merge by role and date.
+# settings came under the core with the merge of the person's one settings file: the owner, 2026-11-25.
 [[package]]
 name = "settings"
 section = "for_owner"
 what = "A person's own settings: one owner-only file read at daemon start, each trade-off a setting with a default."
 builds_it = [
-  { kind = "decision", ref = "the owner, 2026-11-25" },
+  { kind = "lane", ref = "D1", contract = "pinned" },
 ]
 
 [[package]]

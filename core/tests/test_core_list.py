@@ -456,6 +456,10 @@ def check_form(data):
                                     "row to core."))
             if not builds:
                 problems.append((4, f"{tag}: a for_owner row needs builds_it, the lane that builds the package."))
+            if any(isinstance(cite, dict) and cite.get("kind") == "decision" for cite in builds):
+                problems.append((4, f"{tag}: builds_it names the lane or section that builds the package, and a "
+                                    "decision names neither. Cite the lane or the section; the role and date of "
+                                    "the decision that brought the package here go in a comment beside the row."))
         if section == "leaving":
             if not placed:
                 problems.append((4, f"{tag}: a leaving row needs the cite of the decision that moves it out."))
@@ -1233,6 +1237,15 @@ class TestsOfTheTest(unittest.TestCase):
         self.red(4, self.tree(list_body=list_text(beta_row="")), "a for_owner row needs builds_it")
         beta = f'builds_it = [{cite_text("lane", "D1")}]\nplaced_by = [{cite_text("lane", "F3")}]'
         self.red(4, self.tree(list_body=list_text(beta_row=beta)), "a for_owner row has no placing line")
+
+    def test_4_a_decision_in_the_builds_it_of_a_for_owner_row_is_red(self):
+        # builds_it names the lane or section that builds the package; a decision names neither.
+        needle = "builds_it names the lane or section that builds the package"
+        for beta in (f"builds_it = [{DECISION}]", f'builds_it = [{cite_text("lane", "D1")}, {DECISION}]'):
+            self.red(4, self.tree(list_body=list_text(beta_row=beta)), needle)
+        for kind, ref in (("lane", "D1"), ("section", "3.3")):
+            beta = f"builds_it = [{cite_text(kind, ref)}]"
+            self.assertEqual(analyse(self.tree(list_body=list_text(beta_row=beta)))[0], [])
 
     def test_4_a_leaving_row_without_moves_to_or_leave_by_is_red(self):
         for fields, needle in (('leave_by = "2027-01-01"\n', "needs moves_to"), ('moves_to = "a plugin"\n', "needs leave_by")):

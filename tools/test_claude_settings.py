@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SETTINGS = ROOT / ".claude" / "settings.json"
@@ -52,20 +53,43 @@ CODE_RULE_PREFIXES = tuple(f"Bash({py} -X utf8 -B " for py in PYTHONS)
 GIT_TIMEOUT = 30  # seconds per git call, the same bound as the guard call below
 
 
+def git_reason(stderr):
+    """The line of git's error that says why: the first that begins with 'fatal:', else the
+    first that is not empty. Never the last: git ends some errors with a hint to change its
+    global settings, which is not the reason."""
+    lines = [line.strip() for line in stderr.decode("utf-8", "replace").splitlines()]
+    lines = [line for line in lines if line]
+    return next((line for line in lines if line.startswith("fatal:")), lines[0] if lines else "")
+
+
 def tracked_tool_files(root):
-    """The files git tracks under root/tools, as posix paths, or the reason git could not say."""
+    """The files git tracks under root/tools, as posix paths, and None; or None and, when git
+    could not say, the cause and what a person can do next, each case in its own words."""
     git = shutil.which("git")
     if git is None:
-        return None, "git is not on PATH"
+        return None, ("git is not on PATH", "put git on PATH and run this test again")
     try:
+        # LC_ALL=C keeps git's error in the words this function tells apart.
         result = subprocess.run([git, "-C", str(root), "ls-files", "-z", "--", "tools"],
+                                env=dict(os.environ, LC_ALL="C"),
                                 capture_output=True, timeout=GIT_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        return None, (f"git ls-files ran past the limit of {GIT_TIMEOUT} seconds",
+                      "run this test again when the machine is less busy")
     except (OSError, subprocess.SubprocessError) as exc:
-        return None, f"git ls-files did not run ({exc})"
-    if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
-        return None, "git ls-files failed" + (f" ({detail[-1]})" if detail else "")
-    return {path for path in result.stdout.decode("utf-8", "replace").split("\0") if path}, None
+        return None, (f"git could not be started ({exc})",
+                      "check that the git on PATH runs, then run this test again")
+    if result.returncode == 0:
+        return {path for path in result.stdout.decode("utf-8", "replace").split("\0") if path}, None
+    reason = git_reason(result.stderr)
+    said = f"git says: {reason}" if reason else f"git ended with status {result.returncode} and said nothing"
+    if "dubious ownership" in reason:
+        return None, (f"git refuses this checkout: another user owns it ({said})",
+                      "run this test as the user who owns the checkout")
+    if "not a git repository" in reason:
+        return None, (f"{root} is not a git checkout, as with an exported copy ({said})",
+                      "run this test in a git checkout of the repository")
+    return None, (f"git ls-files failed ({said})", "act on git's reason, then run this test again")
 
 
 def is_tool_test_rule(rule):
@@ -90,8 +114,9 @@ def stale_tool_test_rules(allow, root):
         elif not (Path(root) / "tools" / name).is_file():
             stale.append((rule, f"{path} is not a file in this checkout"))
         elif tracked is None:
-            stale.append((rule, f"{why_not}, so it cannot be told whether git tracks {path}; "
-                                "run this test in a git checkout"))
+            cause, next_step = why_not
+            stale.append((rule, f"{cause}, so it cannot be told whether git tracks {path}; "
+                                f"{next_step}"))
         elif path not in tracked:
             stale.append((rule, f"git does not track {path}; add the file to git or remove the line"))
     return stale
@@ -317,12 +342,96 @@ class CopyPolicyTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     check_policy(self, self.root)
 
-    def test_without_git_a_tools_test_rule_fails_with_words(self):
+    def words_for_one_rule(self):
+        """The words for one tracked tools-test rule when git cannot say what it tracks."""
+        rule = "Bash(python -X utf8 -B tools/test_ci_gate.py)"
+        stale = stale_tool_test_rules([rule], self.root)
+        message = stale_rules_message(stale)
+        if stale:
+            self.assertIn(json.dumps(rule), message)
+            self.assertIn("so it cannot be told whether git tracks tools/test_ci_gate.py", message)
+        return stale, message
+
+    def assert_no_checkout_advice(self, message):
+        self.assertNotIn("run this test in a git checkout", message)
+
+    def test_an_exported_copy_says_it_is_not_a_checkout(self):
         self.root = self.copy_tree()
-        message = stale_rules_message(stale_tool_test_rules(
-            ["Bash(python -X utf8 -B tools/test_ci_gate.py)"], self.root))
-        self.assertIn('"Bash(python -X utf8 -B tools/test_ci_gate.py)"', message)
-        self.assertIn("git", message)
+        stale, message = self.words_for_one_rule()
+        self.assertTrue(stale)
+        self.assertIn("is not a git checkout, as with an exported copy "
+                      "(git says: fatal: not a git repository", message)
+        self.assertIn("; run this test in a git checkout of the repository", message)
+
+    def test_a_checkout_git_refuses_shows_gits_reason_not_its_hint(self):
+        # git's own test switch makes this checkout look owned by another user,
+        # for the tracking call only; no settings of the person's git are read.
+        switch = {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                  "GIT_CONFIG_NOSYSTEM": "1"}
+        with mock.patch.dict(os.environ, switch):
+            stale, message = self.words_for_one_rule()
+        if not stale:
+            self.skipTest("this git does not honour GIT_TEST_ASSUME_DIFFERENT_OWNER")
+        self.assertIn("git refuses this checkout: another user owns it "
+                      "(git says: fatal: detected dubious ownership", message)
+        self.assertIn("run this test as the user who owns the checkout", message)
+        self.assertNotIn("safe.directory", message)
+        self.assertNotIn("git config --global", message)
+        self.assert_no_checkout_advice(message)
+
+    def test_no_git_on_path_says_so(self):
+        empty = self.root / "no-git-here"
+        empty.mkdir()
+        with mock.patch.dict(os.environ, {"PATH": str(empty)}):
+            stale, message = self.words_for_one_rule()
+        self.assertTrue(stale)
+        self.assertIn("because git is not on PATH, so", message)
+        self.assertIn("put git on PATH and run this test again", message)
+        self.assert_no_checkout_advice(message)
+
+    def test_git_past_the_time_limit_says_so(self):
+        late = subprocess.TimeoutExpired(["git", "ls-files"], GIT_TIMEOUT)
+        with mock.patch.object(subprocess, "run", side_effect=late):
+            stale, message = self.words_for_one_rule()
+        self.assertTrue(stale)
+        self.assertIn(f"git ls-files ran past the limit of {GIT_TIMEOUT} seconds", message)
+        self.assertIn("run this test again when the machine is less busy", message)
+        self.assert_no_checkout_advice(message)
+
+    def test_git_that_cannot_start_says_so(self):
+        with mock.patch.object(subprocess, "run", side_effect=OSError(8, "Exec format error")):
+            stale, message = self.words_for_one_rule()
+        self.assertTrue(stale)
+        self.assertIn("git could not be started ([Errno 8] Exec format error)", message)
+        self.assertIn("check that the git on PATH runs, then run this test again", message)
+        self.assert_no_checkout_advice(message)
+
+    def test_any_other_git_failure_shows_gits_reason_not_its_hint(self):
+        done = subprocess.CompletedProcess(
+            ["git"], 128, b"",
+            b"warning: a first line\nfatal: index file corrupt\nhint: git config --global x y\n")
+        with mock.patch.object(subprocess, "run", return_value=done):
+            stale, message = self.words_for_one_rule()
+        self.assertTrue(stale)
+        self.assertIn("git ls-files failed (git says: fatal: index file corrupt)", message)
+        self.assertIn("act on git's reason, then run this test again", message)
+        self.assertNotIn("hint:", message)
+        self.assertNotIn("git config --global", message)
+        self.assert_no_checkout_advice(message)
+
+
+class GitReasonTests(unittest.TestCase):
+    def test_the_reason_is_the_first_fatal_line_else_the_first_line(self):
+        for stderr, reason in (
+                (b"fatal: detected dubious ownership in repository at '/r'\n"
+                 b"To add an exception for this directory, call:\n\n"
+                 b"\tgit config --global --add safe.directory /r\n",
+                 "fatal: detected dubious ownership in repository at '/r'"),
+                (b"warning: one\n  fatal: two\nhint: three\n", "fatal: two"),
+                (b"\n\n  warning: only this\nhint: and this\n", "warning: only this"),
+                (b"", "")):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(git_reason(stderr), reason)
 
 
 class GuardTests(unittest.TestCase):

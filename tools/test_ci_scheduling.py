@@ -1120,6 +1120,11 @@ class CrossLaneAdmissionTests(unittest.TestCase):
 # --- the gate runs inside a slice of the runner user's own systemd user manager ---
 USER_MANAGER_STEP = "Start the user service manager"
 GATE_SCOPE = "systemd-run --user --scope --quiet --slice=gate.slice -- python -X utf8 -B tools/ci_gate.py --force"
+# The setup step prints the cgroup a scope of gate.slice reports, so the hosted log itself names the slice.
+SCOPE_CGROUP_PROBE = ('cgroup="$(XDG_RUNTIME_DIR="$runtime" timeout 5 systemd-run --user --scope --quiet '
+                      '--slice=gate.slice -- cat /proc/self/cgroup 2>/dev/null)" &&')
+SCOPE_CGROUP_CHECK = '[[ "$cgroup" == *"/user@$uid.service/gate.slice/"* ]]; then'
+SCOPE_CGROUP_LINE = 'echo "A scope of gate.slice runs in $cgroup; the gate runs in a scope beside it."'
 # Master's text of the two jobs that must not change with this one (the job_block body of each).
 WINDOWS_BLOCK = (
     "    name: windows\n"
@@ -1209,7 +1214,12 @@ _STAND_INS = {
     # timeout drops its bound and runs the rest (macOS has no timeout of its own).
     "timeout": 'printf "timeout %s\\n" "$1" >> "$STAND_IN_LOG"; shift; exec "$@"\n',
     "systemctl": 'printf "systemctl %s XDG=%s\\n" "$*" "${XDG_RUNTIME_DIR:-}" >> "$STAND_IN_LOG"; exit "${FAKE_MANAGER_RC:-0}"\n',
-    "systemd-run": 'printf "systemd-run %s XDG=%s\\n" "$*" "${XDG_RUNTIME_DIR:-}" >> "$STAND_IN_LOG"; exit "${FAKE_SCOPE_RC:-0}"\n',
+    # systemd-run reports the cgroup a scope of gate.slice would have; it starts nothing.
+    "systemd-run": ('printf "systemd-run %s XDG=%s\\n" "$*" "${XDG_RUNTIME_DIR:-}" >> "$STAND_IN_LOG"\n'
+                    'rc="${FAKE_SCOPE_RC:-0}"\n'
+                    'if [ "$rc" = 0 ]; then printf "%s\\n" '
+                    '"${FAKE_CGROUP:-0::/user.slice/user-$(id -u).slice/user@$(id -u).service/gate.slice/run-u7.scope}"; fi\n'
+                    'exit "$rc"\n'),
     "sleep": 'printf "sleep %s\\n" "$*" >> "$STAND_IN_LOG"\n',
 }
 
@@ -1236,13 +1246,19 @@ class UserManagerTests(unittest.TestCase):
         for needle in ('sudo -n timeout 30 loginctl enable-linger "$user"',
                        'sudo -n timeout 30 systemctl start "user@$uid.service"',
                        'XDG_RUNTIME_DIR="$runtime" timeout 5 systemctl --user show-environment',
-                       'XDG_RUNTIME_DIR="$runtime" timeout 5 systemd-run --user --scope --quiet --slice=gate.slice -- true',
+                       SCOPE_CGROUP_PROBE,
+                       SCOPE_CGROUP_CHECK,
+                       SCOPE_CGROUP_LINE,
                        'echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"'):
             self.assertIn(needle, script)
         # Every call that can wait carries its own bound; the job's own backstop stays 15 minutes.
         for line in script.splitlines():
             if re.search(r"\b(systemctl|loginctl|systemd-run)\b", line) and not line.lstrip().startswith("echo"):
                 self.assertIn("timeout ", line, line)
+        # The cgroup line is printed only once the manager is up, before the runtime folder is handed on.
+        self.assertLess(script.index("exit 1"), script.index(SCOPE_CGROUP_LINE))
+        self.assertLess(script.index(SCOPE_CGROUP_LINE), script.index('>> "$GITHUB_ENV"'))
+        self.assertEqual(script.count("/proc/self/cgroup"), 1)
         self.assertIn("tries=30\n", script)
         self.assertIn('for try in $(seq "$tries"); do', script)
         # The runtime folder reaches later steps through the job's environment file, never the gate's env.
@@ -1277,6 +1293,7 @@ class UserManagerTests(unittest.TestCase):
             "sudo refused": ({"FAKE_SUDO_RC": "1"}, 1),
             "manager never answers": ({"FAKE_MANAGER_RC": "1"}, 1),
             "scope refused": ({"FAKE_SCOPE_RC": "1"}, 1),
+            "scope outside gate.slice": ({"FAKE_CGROUP": f"0::/user.slice/user-{uid}.slice/session-2.scope"}, 1),
         }
         for label, (extra, want) in cases.items():
             with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
@@ -1306,16 +1323,20 @@ class UserManagerTests(unittest.TestCase):
                     self.assertTrue(set(line.split("=", 1)[0] for line in written)
                                     <= {"XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"}, written)
                     self.assertIn(f"systemctl --user show-environment XDG=/run/user/{uid}", calls)
-                    self.assertIn(f"systemd-run --user --scope --quiet --slice=gate.slice -- true XDG=/run/user/{uid}",
-                                  calls)
+                    self.assertIn("systemd-run --user --scope --quiet --slice=gate.slice -- cat /proc/self/cgroup "
+                                  f"XDG=/run/user/{uid}", calls)
+                    self.assertIn(f"A scope of gate.slice runs in 0::/user.slice/user-{uid}.slice/user@{uid}.service"
+                                  "/gate.slice/run-u7.scope; the gate runs in a scope beside it.",
+                                  proc.stdout.splitlines())
                 else:
                     self.assertNotEqual(proc.returncode, 0)
                     self.assertEqual(len(errors), 1, proc.stdout)
                     self.assertEqual(written, [])
+                    self.assertNotIn("A scope of gate.slice runs in", proc.stdout)
                 if label == "sudo refused":
                     self.assertFalse(any(line.startswith("systemctl --user") for line in calls), calls)
                     self.assertFalse(any(line.startswith("sleep") for line in calls), calls)
-                if label in ("manager never answers", "scope refused"):
+                if label in ("manager never answers", "scope refused", "scope outside gate.slice"):
                     # The wait is bounded by its count of tries, one pause less than the tries.
                     self.assertEqual(sum(line.startswith("sleep") for line in calls), 29, calls)
 

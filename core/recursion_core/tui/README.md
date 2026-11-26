@@ -85,8 +85,11 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   Stop: answered and confirmed; answered and NOT confirmed (a failed call, `pending`, or an answer for another run:
   the run may still be running); sent with no answer yet; or not begun, which is sent only if the Stop ahead of it
   ends within what is left of the bound, and else is not sent. Each run whose Stop is not confirmed is named with
-  `run status` as what to do. In full screen the close line is printed again after the screen is left. It also
-  names every other request not sent; other runs keep going, and reopening reattaches. An API client that cannot be built is `control_api_unavailable` on
+  `run status` as what to do. It also names every other request not sent, and a request still in its call. In
+  full screen the close line is printed again after the screen is left whenever it names any of these (a Stop, a
+  request not sent, a request in its call); the line with nothing to tell is not printed again. A Stop still queued
+  when the bound runs out is not sent, and the TUI decides that in the same step that would begin it, so the line
+  that says it is not sent stays true. Other runs keep going, and reopening reattaches. An API client that cannot be built is `control_api_unavailable` on
   stderr with exit 1, as in the CLI.
 - Keys (all from the keymap, so a binding file can change them; `?` lists the ones in force, and the
   prompt row's hints follow the keymap):

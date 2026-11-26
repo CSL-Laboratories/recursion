@@ -305,7 +305,9 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
         try:
             for line in app.errors:  # the error log survives leaving the alternate screen
                 print(f"error: {line}", file=err)
-            if "the Stop of" in app.end_line:  # what became of a Stop: the last frame only said it was waited for
+            # The close line names a Stop, a request not sent or one still in its call: the last frame did not say
+            # it. The app's own value decides, set when it built the line; a line with nothing to tell is not printed.
+            if app.end_line_tells:
                 print(app.end_line, file=err)
         except OSError as exc:  # the same hung-up terminal; anything else is raised
             if exc.errno != errno.EIO:

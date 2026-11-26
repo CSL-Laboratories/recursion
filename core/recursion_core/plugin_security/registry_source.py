@@ -155,13 +155,12 @@ def split_registry(value: object) -> tuple[str, str, str | None]:
     return "folder", value, None
 
 
-def _checked_install(config, root, plugin_id, given, commit, **options) -> dict:
+def _checked_install(config, root, plugin_id, given, commit, kind, **options) -> dict:
     """``install_plugin`` on ``root``; a registry that fails its check is refused with each file named."""
     try:
         # install_plugin decides on every call whether the chosen release may be installed; the registry is
         # named in its words as the person named it, and its kind is the way the release was chosen.
-        return install_plugin(config, root, plugin_id, registry_name=given,
-                              registry_kind="folder" if commit is None else "pinned", **options)
+        return install_plugin(config, root, plugin_id, registry_name=given, registry_kind=kind, **options)
     except InstallRefused as exc:
         findings = getattr(exc, "findings", None)
         if not findings:
@@ -176,17 +175,21 @@ def _checked_install(config, root, plugin_id, given, commit, **options) -> dict:
 
 def install_from_registry(config: os.PathLike | str, plugin_id: str, *, registry: str | None = None,
                           version: str | None = None, state: os.PathLike | str | None = None,
-                          **install_options) -> dict:
+                          plain_folder: bool = False, **install_options) -> dict:
     """Install ``plugin_id`` from the registry named for this call, after every check, or refuse.
 
-    ``install_options`` are ``install_plugin``'s own keywords and are passed on unchanged.
+    ``install_options`` are ``install_plugin``'s own keywords and are passed on unchanged. ``plain_folder``
+    True reads a registry folder as a folder read as it is, the way the command line reads
+    ``--registry <folder>``: a withdrawn release named by its version is installed and said to be withdrawn.
+    False (the default) reads it as a registry folder: such a release is refused, as from a registry at a
+    commit, unless ``allow_withdrawn`` names it. A registry at a commit is read as a registry either way.
     """
     # The id and the version first, from the arguments alone: no registry is named, fetched or read for them.
     _refuse_by_arguments(plugin_id, version)
     kind, address, commit = split_registry(registry)
     if kind == "folder":
-        result = _checked_install(config, address, plugin_id, registry, None, version=version, state=state,
-                                  **install_options)
+        result = _checked_install(config, address, plugin_id, registry, None, "plain" if plain_folder is True
+                                  else "folder", version=version, state=state, **install_options)
         result["registry"] = {"given": registry, "kind": "local", "address": address, "commit": None}
         return result
     try:
@@ -195,8 +198,8 @@ def install_from_registry(config: os.PathLike | str, plugin_id: str, *, registry
         raise _refused("registry_address_refused", given=registry) from None
     try:
         with registry_checkout(address, commit) as root:
-            result = _checked_install(config, root, plugin_id, registry, commit, version=version, state=state,
-                                      **install_options)
+            result = _checked_install(config, root, plugin_id, registry, commit, "pinned", version=version,
+                                      state=state, **install_options)
     except SourceRefused as exc:
         code = _FROM_SOURCE.get(exc.code, "registry_unreachable")
         raise _refused(code, given=registry, address=resolved, commit=commit, path=exc.path) from None

@@ -323,7 +323,9 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
     A withdrawn release that goes on is said to be withdrawn before the install goes on: the words go to
     ``report_kept`` when it is given and into the result as ``withdrawn``. ``registry_name`` is the registry
     as the person named it, for those words (without it they name ``registry_root``); ``registry_kind`` is
-    ``pinned`` for a registry read at a commit and ``folder`` (or None) otherwise.
+    ``pinned`` for a registry read at a commit, ``folder`` for a registry folder read by
+    ``install_from_registry``, and ``plain`` (or None) for a folder read as it is: a direct call, or the
+    command line's ``--registry <folder>``. Any other value is decided as a registry folder.
 
     ``git_repository`` is a local bare path. The fetch, and every refusal of
     that fetch, finishes before the profile lock. A refusal does not fall
@@ -785,17 +787,26 @@ class _Road:
         """The key of ``_WITHDRAWN_RULE`` for this road."""
         if self.version is None:
             return "chosen_for_the_person"
-        return "named_at_a_registry_commit" if self.registry_kind == "pinned" else "named_by_version"
+        if self.registry_kind == "pinned":
+            return "named_at_a_registry_commit"
+        if self.registry_kind in (None, "plain"):
+            return "named_in_a_plain_folder"
+        # "folder", and any value that is not a known kind, takes the registry folder's way.
+        return "named_in_a_registry_folder"
 
 
 # What a withdrawn release does on each way it can be chosen, when the person gave no --allow-withdrawn:
 # "refuse" refuses release_withdrawn with the reason, the newest release that is not withdrawn and the one
 # step; "say" installs it and says, before the install goes on, that it is withdrawn, why, and what is newer.
 # A change of this policy changes this one rule. A pin and a range are "chosen_for_the_person" when they come.
+# Each value is the behaviour of the base of this rule for that way: a registry at a commit and a registry
+# folder read by install_from_registry refused a named withdrawn release; a folder read as it is (a direct
+# call of install_plugin, or the command line's --registry <folder>) installed it, and now says so.
 _WITHDRAWN_RULE = {
     "chosen_for_the_person": "refuse",
     "named_at_a_registry_commit": "refuse",
-    "named_by_version": "say",
+    "named_in_a_registry_folder": "refuse",
+    "named_in_a_plain_folder": "say",
 }
 
 
@@ -856,7 +867,8 @@ def _withdrawn_words(chosen, report, road: _Road, *, installed: bool) -> str:
         how = ("you allowed it for this one install with --allow-withdrawn" if road.allow_withdrawn is not None
                else "you named it by its version")
         return f"{head} It is installed because {how}. {instead}"
-    return (f"{head} Nothing was installed. {instead} . To install {version} anyway, at your own risk and for "
+    # Each printed command ends its line: nothing follows it, so it can be copied as printed.
+    return (f"{head} Nothing was installed. {instead}\nTo install {version} anyway, at your own risk and for "
             f"this one install only, run: {_install_command(road, chosen.plugin_id, chosen.version, chosen.version)}")
 
 

@@ -16,6 +16,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import unittest
 
 from recursion_core.plugin_security.tests.support import Key, needs_crypto
@@ -96,16 +97,21 @@ class EveryRoadTests(RegistryCase):
                                   words=("Nothing was installed.", "--version 0.9.0 --allow-withdrawn 0.9.0"))
         self.said_withdrawn(err, registry)
 
-    # (d) the API's folder road: the same decision and words as the command line's
-    def test_d_install_from_registry_folder_says_it(self):
+    # (d) the API's registry folder road: refused with the words, as it was before the one decision
+    def test_d_install_from_registry_folder_refuses_it_with_the_words(self):
+        from recursion_core.plugin_security.install import InstallRefused
         from recursion_core.plugin_security.registry_source import install_from_registry
 
         registry = self.two()
+        before = self.listing()
         seen = []
-        result = install_from_registry(self.config, _PLUGIN, registry=registry, version="0.9.0", state=self.state,
-                                       report_kept=seen.append)
-        self.said_withdrawn(seen[0], registry)
-        self.assertEqual("named_version", result["withdrawn_by"])
+        with self.assertRaises(InstallRefused) as caught:
+            install_from_registry(self.config, _PLUGIN, registry=registry, version="0.9.0", state=self.state,
+                                  report_kept=seen.append)
+        self.assertEqual("release_withdrawn", caught.exception.code)
+        self.said_withdrawn(caught.exception.detail, registry)
+        self.assertIn("Nothing was installed.", caught.exception.detail)
+        self.assertEqual(([], before), (seen, self.listing()))
 
     # (e) an id alone never takes a withdrawn release
     def test_e_id_alone_takes_the_newest_active_and_nothing_withdrawn(self):
@@ -284,6 +290,356 @@ class StructureTests(unittest.TestCase):
         other["plugin_security/_entrypoints.py"] = other.get("plugin_security/_entrypoints.py", "") + (
             "\n\ndef _around(config, root):\n    return install_plugin(config, root, 'x')\n")
         self.assertNotEqual([], road_faults(other))
+
+
+
+# The table of every road and every way of naming a release. For each row: what the base of this rule did
+# (the commit before the one decision; each value written as a run of this same table against that commit
+# printed it) and what this head does. "installed V, no word" is an install that carries no status of a
+# withdrawn release; "status in result" is one whose result (the command's stdout) carries the status and
+# that says nothing on stderr or to report_kept; "status line" is the line printed on stderr after an install
+# from a registry at a commit; "WITHDRAWN" is the line said before the install goes on.
+_FIXTURES = {
+    "two": ("0.9.0", "withdrawn", _REASON), "newest": ("1.1.0", "withdrawn", _REASON),
+    "lone": ("0.9.0", "withdrawn", _REASON),
+}
+_NAMINGS = {
+    "id alone": ("two", None, None),
+    "named withdrawn": ("two", "0.9.0", None),
+    "named active": ("two", "1.0.0", None),
+    "named withdrawn, allowed": ("two", "0.9.0", "0.9.0"),
+    "named withdrawn, another allowed": ("two", "0.9.0", "1.0.0"),
+    "id alone, a withdrawn allowed": ("two", None, "0.9.0"),
+    "id alone, the newest withdrawn": ("newest", None, None),
+    "named the newest, withdrawn": ("newest", "1.1.0", None),
+    "id alone, none active": ("lone", None, None),
+    "named withdrawn, none active": ("lone", "0.9.0", None),
+}
+_FORMS = {
+    # road, registry form, namings tried (every naming, or the two that reach a registry at all)
+    "command, registry at a commit": ("command", "commit", tuple(_NAMINGS)),
+    "command, registry folder": ("command", "folder", tuple(_NAMINGS)),
+    "command, a file": ("command", "file", ("id alone", "named withdrawn")),
+    "command, a folder with no registry": ("command", "empty", ("id alone", "named withdrawn")),
+    "install_from_registry, registry at a commit": ("install_from_registry", "commit", tuple(_NAMINGS)),
+    "install_from_registry, registry folder": ("install_from_registry", "folder", tuple(_NAMINGS)),
+    "install_from_registry, a file": ("install_from_registry", "file", ("id alone", "named withdrawn")),
+    "install_from_registry, a folder with no registry": ("install_from_registry", "empty", ("id alone", "named withdrawn")),
+    "install_plugin, plain folder": ("install_plugin", "folder", tuple(_NAMINGS)),
+    "install_plugin, a file": ("install_plugin", "file", ("id alone", "named withdrawn")),
+    "install_plugin, a folder with no registry": ("install_plugin", "empty", ("id alone", "named withdrawn")),
+}
+_ROWS = [(form, naming) for form, (_road, _where, namings) in _FORMS.items() for naming in namings]
+
+# (form, naming): (the base, this head)
+ROAD_TABLE = {
+    ('command, registry at a commit', 'id alone'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('command, registry at a commit', 'named withdrawn'):
+        ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('command, registry at a commit', 'named active'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('command, registry at a commit', 'named withdrawn, allowed'):
+        ('installed 0.9.0, status line', 'installed 0.9.0, WITHDRAWN'),
+    ('command, registry at a commit', 'named withdrawn, another allowed'):
+        ('refused release_withdrawn', 'refused release_withdrawn allow_withdrawn_unmatched'),
+    ('command, registry at a commit', 'id alone, a withdrawn allowed'):
+        ('installed 1.0.0, no word', 'refused allow_withdrawn_unmatched'),
+    ('command, registry at a commit', 'id alone, the newest withdrawn'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('command, registry at a commit', 'named the newest, withdrawn'):
+        ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('command, registry at a commit', 'id alone, none active'):
+        ('refused release_not_active', 'refused release_not_active'),
+    ('command, registry at a commit', 'named withdrawn, none active'):
+        ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('command, registry folder', 'id alone'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('command, registry folder', 'named withdrawn'):
+        ('installed 0.9.0, status in result', 'installed 0.9.0, WITHDRAWN'),
+    ('command, registry folder', 'named active'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('command, registry folder', 'named withdrawn, allowed'):
+        ('installed 0.9.0, status in result', 'installed 0.9.0, WITHDRAWN'),
+    ('command, registry folder', 'named withdrawn, another allowed'):
+        ('installed 0.9.0, status in result', 'refused release_withdrawn allow_withdrawn_unmatched'),
+    ('command, registry folder', 'id alone, a withdrawn allowed'):
+        ('installed 1.0.0, no word', 'refused allow_withdrawn_unmatched'),
+    ('command, registry folder', 'id alone, the newest withdrawn'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('command, registry folder', 'named the newest, withdrawn'):
+        ('installed 1.1.0, status in result', 'installed 1.1.0, WITHDRAWN'),
+    ('command, registry folder', 'id alone, none active'):
+        ('refused release_not_active', 'refused release_not_active'),
+    ('command, registry folder', 'named withdrawn, none active'):
+        ('installed 0.9.0, status in result', 'installed 0.9.0, WITHDRAWN'),
+    ('command, a file', 'id alone'):
+        ('refused root_unavailable', 'refused root_unavailable'),
+    ('command, a file', 'named withdrawn'):
+        ('refused root_unavailable', 'refused root_unavailable'),
+    ('command, a folder with no registry', 'id alone'):
+        ('refused registry_missing', 'refused registry_missing'),
+    ('command, a folder with no registry', 'named withdrawn'):
+        ('refused registry_missing', 'refused registry_missing'),
+    ('install_from_registry, registry at a commit', 'id alone'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('install_from_registry, registry at a commit', 'named withdrawn'):
+        ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('install_from_registry, registry at a commit', 'named active'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('install_from_registry, registry at a commit', 'named withdrawn, allowed'):
+        ('installed 0.9.0, status in result', 'installed 0.9.0, WITHDRAWN'),
+    ('install_from_registry, registry at a commit', 'named withdrawn, another allowed'):
+        ('refused release_withdrawn', 'refused release_withdrawn allow_withdrawn_unmatched'),
+    ('install_from_registry, registry at a commit', 'id alone, a withdrawn allowed'):
+        ('installed 1.0.0, no word', 'refused allow_withdrawn_unmatched'),
+    ('install_from_registry, registry at a commit', 'id alone, the newest withdrawn'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('install_from_registry, registry at a commit', 'named the newest, withdrawn'):
+        ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('install_from_registry, registry at a commit', 'id alone, none active'):
+        ('refused release_not_active', 'refused release_not_active'),
+    ('install_from_registry, registry at a commit', 'named withdrawn, none active'):
+        ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('install_from_registry, registry folder', 'id alone'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('install_from_registry, registry folder', 'named withdrawn'):
+        ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('install_from_registry, registry folder', 'named active'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('install_from_registry, registry folder', 'named withdrawn, allowed'):
+        ('installed 0.9.0, status in result', 'installed 0.9.0, WITHDRAWN'),
+    ('install_from_registry, registry folder', 'named withdrawn, another allowed'):
+        ('refused release_withdrawn', 'refused release_withdrawn allow_withdrawn_unmatched'),
+    ('install_from_registry, registry folder', 'id alone, a withdrawn allowed'):
+        ('installed 1.0.0, no word', 'refused allow_withdrawn_unmatched'),
+    ('install_from_registry, registry folder', 'id alone, the newest withdrawn'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('install_from_registry, registry folder', 'named the newest, withdrawn'):
+        ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('install_from_registry, registry folder', 'id alone, none active'):
+        ('refused release_not_active', 'refused release_not_active'),
+    ('install_from_registry, registry folder', 'named withdrawn, none active'):
+        ('refused release_withdrawn', 'refused release_withdrawn'),
+    ('install_from_registry, a file', 'id alone'):
+        ('refused root_unavailable', 'refused root_unavailable'),
+    ('install_from_registry, a file', 'named withdrawn'):
+        ('refused root_unavailable', 'refused root_unavailable'),
+    ('install_from_registry, a folder with no registry', 'id alone'):
+        ('refused registry_missing', 'refused registry_missing'),
+    ('install_from_registry, a folder with no registry', 'named withdrawn'):
+        ('refused registry_missing', 'refused registry_missing'),
+    ('install_plugin, plain folder', 'id alone'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('install_plugin, plain folder', 'named withdrawn'):
+        ('installed 0.9.0, status in result', 'installed 0.9.0, WITHDRAWN'),
+    ('install_plugin, plain folder', 'named active'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('install_plugin, plain folder', 'named withdrawn, allowed'):
+        ('installed 0.9.0, status in result', 'installed 0.9.0, WITHDRAWN'),
+    ('install_plugin, plain folder', 'named withdrawn, another allowed'):
+        ('installed 0.9.0, status in result', 'refused release_withdrawn allow_withdrawn_unmatched'),
+    ('install_plugin, plain folder', 'id alone, a withdrawn allowed'):
+        ('installed 1.0.0, no word', 'refused allow_withdrawn_unmatched'),
+    ('install_plugin, plain folder', 'id alone, the newest withdrawn'):
+        ('installed 1.0.0, no word', 'installed 1.0.0, no word'),
+    ('install_plugin, plain folder', 'named the newest, withdrawn'):
+        ('installed 1.1.0, status in result', 'installed 1.1.0, WITHDRAWN'),
+    ('install_plugin, plain folder', 'id alone, none active'):
+        ('refused release_not_active', 'refused release_not_active'),
+    ('install_plugin, plain folder', 'named withdrawn, none active'):
+        ('installed 0.9.0, status in result', 'installed 0.9.0, WITHDRAWN'),
+    ('install_plugin, a file', 'id alone'):
+        ('refused root_unavailable', 'refused root_unavailable'),
+    ('install_plugin, a file', 'named withdrawn'):
+        ('refused root_unavailable', 'refused root_unavailable'),
+    ('install_plugin, a folder with no registry', 'id alone'):
+        ('refused registry_missing', 'refused registry_missing'),
+    ('install_plugin, a folder with no registry', 'named withdrawn'):
+        ('refused registry_missing', 'refused registry_missing'),
+}
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class RoadTableCase(RegistryCase):
+    """One row of ``ROAD_TABLE``, run in its own profile and its own registry."""
+
+    two = EveryRoadTests.two
+
+    def observe(self, form, naming):
+        """What the row does on the code under test, in the words of ``ROAD_TABLE``."""
+        from recursion_core.plugin_security.install import InstallRefused, install_plugin
+        from recursion_core.plugin_security.registry_source import install_from_registry
+
+        road, where, _namings = _FORMS[form]
+        fixture, version, allow = _NAMINGS[naming]
+        if fixture == "two":
+            self.two()
+        elif fixture == "newest":
+            self.two(first=("1.0.0", "active", None), second=("1.1.0", "withdrawn", _REASON))
+        else:
+            self.write_registry(_PLUGIN, version="0.9.0", release_over=_over("withdrawn", _REASON))
+        if where == "commit":
+            bare, commit = self.commit_registry()
+            registry = f"{bare}@{commit}"
+        elif where == "folder":
+            registry = str(self.registry)
+        elif where == "file":
+            registry = str(self.tmp / "a-file")
+            Path(registry).write_text("not a registry\n")
+        else:
+            registry = str(self.tmp / "no-registry")
+            os.mkdir(registry, 0o700)
+        before = self.listing()
+        if road == "command":
+            argv = [_PLUGIN, "--registry", registry] + (["--version", version] if version else []) + (
+                ["--allow-withdrawn", allow] if allow else [])
+            status, out, err = self.run_cli(*argv)
+            if status == 0:
+                result = json.loads(out)
+                word = ("WITHDRAWN" if "WITHDRAWN:" in err else
+                        "status line" if "This release is withdrawn" in err else
+                        "status in result" if result.get("status") == "withdrawn" else "no word")
+                return f"installed {result['version']}, {word}"
+            self.assertEqual(self.listing(), before, err)
+            codes = [line[len("refused: "):] for line in err.splitlines() if line.startswith("refused: ")]
+            return f"refused {' '.join(codes) or status}"
+        seen = []
+        options = dict(version=version, state=self.state, report_kept=seen.append)
+        if allow:
+            options["allow_withdrawn"] = allow
+        try:
+            if road == "install_from_registry":
+                result = install_from_registry(self.config, _PLUGIN, registry=registry, **options)
+            else:
+                result = install_plugin(self.config, registry, _PLUGIN, **options)
+        except InstallRefused as exc:
+            self.assertEqual(self.listing(), before)
+            return "refused " + " ".join(getattr(exc, "codes", None) or [exc.code])
+        word = ("WITHDRAWN" if any(str(line).startswith("WITHDRAWN:") for line in seen) else
+                "status in result" if result.get("status") == "withdrawn" else "no word")
+        return f"installed {result['version']}, {word}"
+
+
+def _row_test(form, naming):
+    def test(self):
+        self.assertEqual(ROAD_TABLE[(form, naming)][1], self.observe(form, naming))
+    return test
+
+
+for _number, (_form, _naming) in enumerate(_ROWS, 1):
+    setattr(RoadTableCase, f"test_row_{_number:02d}", _row_test(_form, _naming))
+
+
+class RoadTableRuleTests(unittest.TestCase):
+    def test_every_road_and_naming_has_its_row(self):
+        self.assertEqual(sorted(_ROWS), sorted(ROAD_TABLE))
+
+    def test_no_row_goes_from_refused_to_installed(self):
+        moved = [row for row, (base, head) in ROAD_TABLE.items()
+                 if base.startswith("refused") and head.startswith("installed")]
+        self.assertEqual([], moved)
+
+    def test_every_withdrawn_release_installed_here_is_said_before_the_install(self):
+        withdrawn = {version for version, status, _reason in _FIXTURES.values() if status == "withdrawn"}
+        silent = [row for row, (_base, head) in ROAD_TABLE.items() if head.startswith("installed")
+                  and head.split()[1].rstrip(",") in withdrawn and not head.endswith("WITHDRAWN")]
+        self.assertEqual([], silent)
+
+
+_COMMAND = "recursion plugin install "
+
+
+def assert_stops(case, text):
+    """No stop after white space, no doubled stop, and nothing after a printed command on its line."""
+    case.assertNotRegex(text, r"\s\.", text)
+    case.assertNotRegex(text, r"\.\s*\.", text)
+    commands = 0
+    for line in text.splitlines():
+        at = line.find(_COMMAND)
+        if at < 0:
+            continue
+        commands += 1
+        command = line[at:]
+        case.assertEqual(command, command.rstrip(), line)
+        case.assertFalse(command.endswith((".", ",", ";", ":")), line)
+        words = shlex.split(command)
+        case.assertEqual(command, " ".join(shlex.quote(word) for word in words), line)
+        # After the id, only options with their values: a word or a stop after the last value is caught.
+        options = words[4:]
+        case.assertEqual(0, len(options) % 2, line)
+        case.assertTrue(all(word.startswith("--") for word in options[0::2]), line)
+        case.assertFalse(any(word.startswith("--") for word in options[1::2]), line)
+    return commands
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class WordsTests(RegistryCase):
+    two = EveryRoadTests.two
+
+    # The refusal's words, with and without an active release, and the words of an install that goes on.
+    def test_the_refusal_with_no_active_release_has_one_stop_and_each_command_ends_its_line(self):
+        self.write_registry(_PLUGIN, version="0.9.0", release_over=_over("withdrawn", _REASON))
+        bare, commit = self.commit_registry()
+        err = self.assert_refused("release_withdrawn", _PLUGIN, "--registry", f"{bare}@{commit}",
+                                  "--version", "0.9.0", words=("none can be taken in its place.",))
+        self.assertEqual(1, assert_stops(self, err))
+
+    def test_the_refusal_with_an_active_release_has_one_stop_and_each_command_ends_its_line(self):
+        self.two()
+        bare, commit = self.commit_registry()
+        err = self.assert_refused("release_withdrawn", _PLUGIN, "--registry", f"{bare}@{commit}",
+                                  "--version", "0.9.0")
+        self.assertEqual(2, assert_stops(self, err))
+
+    def test_the_refusal_of_install_from_registry_on_a_folder_has_the_same_stops(self):
+        from recursion_core.plugin_security.install import InstallRefused
+        from recursion_core.plugin_security.registry_source import install_from_registry
+
+        registry = self.two()
+        with self.assertRaises(InstallRefused) as caught:
+            install_from_registry(self.config, _PLUGIN, registry=registry, version="0.9.0", state=self.state)
+        self.assertEqual("release_withdrawn", caught.exception.code)
+        self.assertEqual(2, assert_stops(self, str(caught.exception.detail)))
+
+    def test_a_step_for_another_release_has_the_same_stops(self):
+        registry = self.two()
+        err = self.assert_refused("allow_withdrawn_unmatched", _PLUGIN, "--registry", registry, "--version", "0.9.0",
+                                  "--allow-withdrawn", "1.0.0")
+        self.assertEqual(2, assert_stops(self, err))
+
+    def test_the_words_of_an_install_that_goes_on_have_the_same_stops(self):
+        registry = self.two()
+        status, _out, err = self.run_cli(_PLUGIN, "--registry", registry, "--version", "0.9.0")
+        self.assertEqual(status, 0, err)
+        self.assertEqual(1, assert_stops(self, err))
+
+    def test_the_guard_catches_each_stray_stop(self):
+        command = f"{_COMMAND}{_PLUGIN} --registry /r --version 1.0.0"
+        for label, text in {
+            "a stop after white space": f"None can be taken in its place. . To install it run: {command}",
+            "a stop set apart after a command": f"To install it run: {command} . To install 0.9.0 anyway",
+            "a doubled stop": "who give this reason: A made-up reason to withdraw..",
+            "a stop glued to a command": f"To install it run: {command}.",
+            "words after a command": f"To install it run: {command} and then",
+        }.items():
+            with self.subTest(label):
+                with self.assertRaises(AssertionError):
+                    assert_stops(self, text)
+
+    # The newest release that is not withdrawn, when the withdrawn one named is itself the newest of all.
+    def test_the_newest_not_withdrawn_is_named_when_the_withdrawn_one_is_the_newest_of_all(self):
+        newer = ("1.1.0", "withdrawn", _REASON)
+        registry = self.two(first=("1.0.0", "active", None), second=newer)
+        status, _out, err = self.run_cli(_PLUGIN, "--registry", registry, "--version", "1.1.0")
+        self.assertEqual(status, 0, err)
+        self.assertIn(f"The newest release of {_PLUGIN} there that is not withdrawn is 1.0.0; to install it run: "
+                      f"{_COMMAND}{_PLUGIN} --registry {registry} --version 1.0.0", err)
+        self.assertNotIn("that is not withdrawn is 1.1.0", err)
+        bare, commit = self.commit_registry()
+        err = self.assert_refused("release_withdrawn", _PLUGIN, "--registry", f"{bare}@{commit}", "--version", "1.1.0")
+        self.assertIn("there that is not withdrawn is 1.0.0; to install it run: ", err)
+        self.assertNotIn("that is not withdrawn is 1.1.0", err)
 
 
 if __name__ == "__main__":

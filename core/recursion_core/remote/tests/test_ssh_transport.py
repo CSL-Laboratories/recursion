@@ -982,6 +982,7 @@ class ReplyIdAndCloseGraceTests(unittest.TestCase):
         self.assertFalse(worker.is_alive(), "the call outlived the watchdog")
         return outcome[0], time.monotonic() - started
 
+    @unittest.skipUnless(POSIX, "the stand-in daemon needs the AF_UNIX control socket (POSIX)")
     def test_a_relay_and_client_at_a_small_frame_size_read_an_answer_too_large_as_carried_out(self) -> None:
         from recursion_core.remote.relay import Relay
         daemon = support.SocketDaemon(self)

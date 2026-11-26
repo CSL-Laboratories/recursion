@@ -42,6 +42,10 @@ What it checks:
   machine (``relay/refusals.jsonl`` under the daemon's state folder), at most ``record_max`` lines kept,
   newest last, and is also told to ``record`` (``main`` writes it on stderr, which sshd hands to the
   client, never on stdout).
+* The key's window and the record are kept under POSIX file locks. On a host without them (Windows) the
+  start refuses before a file of the relay's folder is made, opened or read (``RelayStateRefused``, code
+  ``relay_state_no_file_locks``); a relay that keeps nothing (``cap_scope`` ``session``, ``record_max``
+  ``0``) needs no file and no lock.
 
 What waits for the core: the relay connects to the socket as the owner's uid, as before. Until the core
 checks rights at its socket (a paired device's identity presented on the connection, and that device's
@@ -91,7 +95,7 @@ from .codec import (BUSY_MESSAGE, DELIVERED_VALUES, HELLO_OP, NOT_ADMITTED_MESSA
                     RELAY_VERSION, UNAVAILABLE, Message, RefusedFrame, ascii_text, copyable_id, daemon_reply, fitted,
                     frame_refusal, read_message, relay_error, relay_error_of, write_message)
 from .pairing import DEVICE_SCOPES, PairingRefused, device_scopes
-from .relay_store import KeyWindow, RefusalRecord, relay_folder
+from .relay_store import KeyWindow, RefusalRecord, RelayStateRefused, relay_folder
 from .rights import NEEDS_ALL, key_rights, needs
 
 # What the client asks sshd to run; under a forced command it arrives as SSH_ORIGINAL_COMMAND.
@@ -569,7 +573,9 @@ def main(
                                                  file=err, flush=True))
     except (RemoteBindRefused, InsecureSocketPath, PlatformNotSupported, ValueError, OSError) as exc:
         # OSError: a socket directory that cannot be looked at (its parent is a file, or not searchable).
-        print(f"recursion relay: refused: {type(exc).__name__}: {exc}", file=err)
+        # A refusal with a code (a host without POSIX file locks) names it before its words.
+        code = exc.code if isinstance(exc, RelayStateRefused) and exc.code else None
+        print(f"recursion relay: refused: {type(exc).__name__}: {code + ': ' if code else ''}{exc}", file=err)
         return EXIT_REFUSED
     for name, value in (("max_frames", relay.max_frames), ("max_frame_bytes", relay.max_frame_bytes),
                         ("record_max", relay.record_max)):

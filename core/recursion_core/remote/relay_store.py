@@ -13,17 +13,25 @@ across sessions is kept here, each file under an exclusive ``flock`` while it is
 * ``RefusalRecord``: one JSON line per refusal the relay's rights and caps made (``refusals.jsonl``),
   newest last, at most ``max_entries`` lines kept (older lines are dropped first; ``None`` keeps every
   line, ``0`` keeps none). The person reads it with any text tool.
+
+Both need POSIX file locks (``fcntl``). This module imports where they are absent (Windows); there the
+folder, the window and the record refuse (``RelayStateRefused``, code ``FILE_LOCKS_ABSENT``) before a
+file is made, opened or read. Nothing is ever kept without its lock.
 """
 
 from __future__ import annotations
 
 import errno
-import fcntl
 import json
 import math
 import os
 import stat
 from collections.abc import Callable
+
+try:  # the one place this module takes POSIX file locks from
+    import fcntl
+except ImportError:  # a host without them (Windows): require_file_locks refuses, never an unlocked file
+    fcntl = None
 
 RELAY_STATE_DIR = "relay"  # <state folder>/relay
 WINDOW_FILE = "window-{key}.json"
@@ -32,12 +40,34 @@ FOLDER_MODE, FILE_MODE = 0o700, 0o600
 _OPEN_FLAGS = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
 
+# The code of the refusal on a host without POSIX file locks (a word a program reads; the words are for people).
+FILE_LOCKS_ABSENT = "relay_state_no_file_locks"
+
+
 class RelayStateRefused(ValueError):
-    """The relay's folder on the daemon's machine is not a real owner-only directory of this uid."""
+    """The relay's state on the daemon's machine cannot be kept safely: its folder is not a real owner-only
+    directory of this uid, or this host has no POSIX file locks (``code`` ``FILE_LOCKS_ABSENT``)."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def require_file_locks() -> None:
+    """Refuse on a host without POSIX file locks. Every session of a key shares its window and the record,
+    each kept under an exclusive lock; without one, sessions at the same time would lose each other's
+    writes, so there is no weaker way to keep them and none is taken."""
+    if fcntl is None:
+        raise RelayStateRefused(
+            "this host has no POSIX file locks (fcntl), which the relay's state needs to stay whole between "
+            "sessions: run the relay on a Linux or macOS host", code=FILE_LOCKS_ABSENT)
 
 
 def relay_folder(state_dir: str, *, uid: int | None = None) -> str:
-    """``<state_dir>/relay``, made owner-only when it is missing and checked every time."""
+    """``<state_dir>/relay``, made owner-only when it is missing and checked every time.
+
+    On a host without POSIX file locks it refuses first, before anything is made (``require_file_locks``)."""
+    require_file_locks()
     if not os.path.isabs(state_dir):
         raise RelayStateRefused(f"the state folder {state_dir!r} is not an absolute path")
     os.makedirs(state_dir, mode=FOLDER_MODE, exist_ok=True)
@@ -64,6 +94,7 @@ class _Locked:
         self.path = path
 
     def __enter__(self) -> int:
+        require_file_locks()  # before the file is opened (and so made): never a file without its lock
         self.fd = os.open(self.path, _OPEN_FLAGS, FILE_MODE)
         try:
             fcntl.flock(self.fd, fcntl.LOCK_EX)

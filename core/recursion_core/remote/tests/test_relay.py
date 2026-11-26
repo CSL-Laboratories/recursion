@@ -9,7 +9,6 @@ socket's own rights check, which is not built.
 from __future__ import annotations
 
 import ast
-import fcntl
 import io
 import json
 import os
@@ -33,6 +32,11 @@ except ImportError:  # pragma: no cover - the tree before this round
     state_directory = relay_store = None
 from recursion_core.remote.relay import EXIT_OK, EXIT_REFUSED, EXIT_STREAM, RELAY_COMMAND, Relay, main
 from recursion_core.remote.tests import support
+
+try:  # POSIX file locks: only the tests that take a lock themselves use it, each under the POSIX guard
+    import fcntl
+except ImportError:  # a host without them, as Windows is
+    fcntl = None
 
 POSIX = os.name != "nt"
 REMOTE_DIR = Path(__file__).resolve().parents[1]
@@ -513,6 +517,63 @@ class NoListenerTests(unittest.TestCase):
                     self.assertNotIn(node.module, self.FORBIDDEN_MODULES, f"{path.name}:{node.lineno}")
                 if isinstance(node, ast.Attribute):
                     self.assertNotIn(node.attr, self.FORBIDDEN_CALLS, f"{path.name}:{node.lineno}")
+
+
+class RelayWithoutFileLocksTests(unittest.TestCase):
+    """A host without POSIX file locks (fcntl), as Windows is: the relay's store still imports, and every
+    path that would keep the relay's state refuses, with a code and words a person can act on, before it
+    makes, opens or reads a file. Nothing is ever kept without its lock."""
+
+    @staticmethod
+    def _store_without_fcntl():
+        import importlib.util
+        from unittest import mock
+
+        spec = importlib.util.spec_from_file_location("relay_store_without_fcntl", REMOTE_DIR / "relay_store.py")
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, {"fcntl": None}):  # importing fcntl raises ImportError, as on Windows
+            spec.loader.exec_module(module)
+        return module
+
+    def test_the_store_imports_without_fcntl_and_refuses_before_making_anything(self) -> None:
+        store = self._store_without_fcntl()
+        self.assertIsNone(store.fcntl)
+        scratch = support.scratch_dir(self)
+        with self.assertRaises(store.RelayStateRefused) as caught:
+            store.relay_folder(os.path.join(scratch, "state"))
+        self.assertEqual(caught.exception.code, "relay_state_no_file_locks")
+        self.assertEqual(caught.exception.code, store.FILE_LOCKS_ABSENT)
+        self.assertIn("this host has no POSIX file locks (fcntl)", str(caught.exception))
+        self.assertIn("run the relay on a Linux or macOS host", str(caught.exception))
+        keepers = {"window": lambda: store.KeyWindow(scratch, "unnamed").take(time.monotonic, 1, 1.0),
+                   "record": lambda: store.RefusalRecord(scratch, None).add({"refused": "scope_refused"})}
+        for name, keep in keepers.items():
+            with self.subTest(keeper=name), self.assertRaises(store.RelayStateRefused) as caught:
+                keep()
+            self.assertEqual(caught.exception.code, store.FILE_LOCKS_ABSENT)
+        self.assertEqual(os.listdir(scratch), [])  # no folder made, no file opened for writing
+
+    @unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
+    def test_the_relays_start_refuses_without_file_locks_and_leaves_its_folder_empty(self) -> None:
+        from unittest import mock
+
+        state, runtime = support.scratch_dir(self), support.scratch_dir(self)
+        environ = {"XDG_STATE_HOME": state, "XDG_RUNTIME_DIR": runtime}
+        with mock.patch.object(relay_store, "fcntl", None):
+            with self.assertRaises(relay_store.RelayStateRefused) as caught:
+                Relay(environ=environ)
+            self.assertEqual(caught.exception.code, relay_store.FILE_LOCKS_ABSENT)
+            out, err = io.BytesIO(), io.StringIO()
+            code = main(["relay", "--key-label", "laptop"], environ=environ,
+                        stdin=io.BytesIO(frames({"op": "relay_hello", "relay_version": 1})), stdout=out, stderr=err)
+            self.assertEqual(code, EXIT_REFUSED)
+            self.assertEqual(out.getvalue(), b"")
+            self.assertIn("recursion relay: refused: RelayStateRefused: relay_state_no_file_locks: this host has no "
+                          "POSIX file locks (fcntl)", err.getvalue())
+            self.assertIn("run the relay on a Linux or macOS host", err.getvalue())
+            # Nothing to keep (a window per session, no record): no file of the relay's state, so no lock needed.
+            self.assertIsNone(Relay(environ=environ, cap_scope="session", record_max=0).state_folder)
+        self.assertEqual(os.listdir(state), [])  # the folder it was given: still empty
 
 
 DEVICE_REFUSED = {"config.set": "all", "plugins.install": "all", "daemon.shutdown": "all",

@@ -1,0 +1,166 @@
+{
+ "engine_session_id": null,
+ "drafts": [
+  {
+   "type": "input.accepted",
+   "payload": {
+    "delivery_id": "dlv-b1",
+    "turn_id": "turn-b1",
+    "how": "new_turn"
+   }
+  },
+  {
+   "type": "input.accepted",
+   "payload": {
+    "delivery_id": "dlv-b2",
+    "turn_id": "turn-b1",
+    "how": "mid_turn"
+   }
+  },
+  {
+   "type": "usage",
+   "payload": {
+    "connection_id": "subscription:pi-chatgpt",
+    "model": "openai/model-synthetic",
+    "bucket": null,
+    "span": "call",
+    "input_tokens": {
+     "value": 1000,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "output_tokens": {
+     "value": 20,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "reasoning_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+     "value": 0,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "cache_write_tokens": {
+     "value": 0,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "cost_usd": {
+     "value": 0.0021,
+     "quality": "known",
+     "provenance": "modelled"
+    }
+   }
+  },
+  {
+   "type": "usage",
+   "payload": {
+    "connection_id": "subscription:pi-chatgpt",
+    "model": "openai/model-synthetic",
+    "bucket": null,
+    "span": "call",
+    "input_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "output_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "reasoning_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cache_write_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cost_usd": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    }
+   }
+  },
+  {
+   "type": "input.accepted",
+   "payload": {
+    "delivery_id": "dlv-b3",
+    "turn_id": "turn-b2",
+    "how": "new_turn"
+   }
+  },
+  {
+   "type": "usage",
+   "payload": {
+    "connection_id": "subscription:pi-chatgpt",
+    "model": "openai/model-synthetic",
+    "bucket": null,
+    "span": "call",
+    "input_tokens": {
+     "value": 1000,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "output_tokens": {
+     "value": 20,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "reasoning_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+     "value": 0,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "cache_write_tokens": {
+     "value": 0,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "cost_usd": {
+     "value": 0.0021,
+     "quality": "known",
+     "provenance": "modelled"
+    }
+   }
+  }
+ ],
+ "signals": [
+  {
+   "signal": "settled",
+   "aborted": true,
+   "stop_reason": "aborted",
+   "text": ""
+  },
+  {
+   "signal": "response",
+   "command": "abort",
+   "token": "e8-3",
+   "success": true
+  },
+  {
+   "signal": "settled",
+   "aborted": false,
+   "stop_reason": "stop",
+   "text": "Starting over."
+  }
+ ]
+}

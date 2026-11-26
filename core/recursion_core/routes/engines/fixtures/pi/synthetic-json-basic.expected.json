@@ -1,0 +1,71 @@
+{
+ "engine_session_id": "019a5b2e-1111-7000-8000-00000000e801",
+ "drafts": [
+  {
+   "type": "input.accepted",
+   "payload": {
+    "delivery_id": "dlv-1",
+    "turn_id": "turn-1",
+    "how": "new_turn"
+   }
+  },
+  {
+   "type": "usage",
+   "payload": {
+    "connection_id": "subscription:pi-chatgpt",
+    "model": "openai/model-synthetic",
+    "bucket": null,
+    "span": "call",
+    "input_tokens": {
+     "value": 1200,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "output_tokens": {
+     "value": 3,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "reasoning_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+     "value": 800,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "cache_write_tokens": {
+     "value": 0,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "cost_usd": {
+     "value": 0.00163,
+     "quality": "known",
+     "provenance": "modelled"
+    }
+   }
+  },
+  {
+   "type": "result",
+   "payload": {
+    "code": null,
+    "detail": ""
+   }
+  }
+ ],
+ "signals": [
+  {
+   "signal": "session",
+   "engine_session_id": "019a5b2e-1111-7000-8000-00000000e801"
+  },
+  {
+   "signal": "settled",
+   "aborted": false,
+   "stop_reason": "stop",
+   "text": "Hello"
+  }
+ ]
+}

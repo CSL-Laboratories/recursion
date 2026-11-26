@@ -1,0 +1,123 @@
+{
+ "engine_session_id": "019a5b2e-1111-7000-8000-00000000e801",
+ "drafts": [
+  {
+   "type": "input.accepted",
+   "payload": {
+    "delivery_id": "dlv-a1",
+    "turn_id": "turn-a1",
+    "how": "new_turn"
+   }
+  },
+  {
+   "type": "usage",
+   "payload": {
+    "connection_id": "api_key:openai-key-1",
+    "model": "openai/model-synthetic",
+    "bucket": null,
+    "span": "call",
+    "input_tokens": {
+     "value": 1000,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "output_tokens": {
+     "value": 20,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "reasoning_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+     "value": 0,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "cache_write_tokens": {
+     "value": 0,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "cost_usd": {
+     "value": 0.0021,
+     "quality": "known",
+     "provenance": "modelled"
+    }
+   }
+  },
+  {
+   "type": "input.accepted",
+   "payload": {
+    "delivery_id": "dlv-a2",
+    "turn_id": "turn-a2",
+    "how": "new_turn"
+   }
+  },
+  {
+   "type": "usage",
+   "payload": {
+    "connection_id": "api_key:openai-key-1",
+    "model": "openai/model-synthetic",
+    "bucket": null,
+    "span": "call",
+    "input_tokens": {
+     "value": 1000,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "output_tokens": {
+     "value": 20,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "reasoning_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+     "value": 0,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "cache_write_tokens": {
+     "value": 0,
+     "quality": "known",
+     "provenance": "observed"
+    },
+    "cost_usd": {
+     "value": 0.0021,
+     "quality": "known",
+     "provenance": "modelled"
+    }
+   }
+  }
+ ],
+ "signals": [
+  {
+   "signal": "session",
+   "engine_session_id": "019a5b2e-1111-7000-8000-00000000e801"
+  },
+  {
+   "signal": "response",
+   "command": "get_state",
+   "token": "e8-1",
+   "success": true
+  },
+  {
+   "signal": "settled",
+   "aborted": false,
+   "stop_reason": "stop",
+   "text": "The first answer."
+  },
+  {
+   "signal": "settled",
+   "aborted": false,
+   "stop_reason": "stop",
+   "text": "The second answer."
+  }
+ ]
+}

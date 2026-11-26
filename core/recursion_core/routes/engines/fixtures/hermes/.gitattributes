@@ -1,0 +1,3 @@
+# The streams are byte-exact: offsets into them are tested. Keep LF on every checkout.
+*.jsonl text eol=lf
+*.json text eol=lf

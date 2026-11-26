@@ -1,0 +1,10 @@
+{"type": "system", "subtype": "init", "model": "", "session_id": "", "timestamp": 1794700000000}
+{"type": "tool_use", "name": "web_search", "input": {"query": "a"}, "timestamp": 1794700000010}
+{"type": "tool_use", "name": "web_search", "input": {"query": "b"}, "timestamp": 1794700000011}
+{"type": "tool_result", "name": "web_search", "output": "one of a or b", "duration_ms": 12, "is_error": false, "timestamp": 1794700000020}
+{"type": "tool_use", "name": "web_search", "input": {"query": "c"}, "timestamp": 1794700000021}
+{"type": "tool_result", "name": "web_search", "output": "another", "duration_ms": 12, "is_error": false, "timestamp": 1794700000030}
+{"type": "tool_result", "name": "web_search", "output": "the last of the three", "duration_ms": 12, "is_error": false, "timestamp": 1794700000031}
+{"type": "tool_use", "name": "web_search", "input": {"query": "d"}, "timestamp": 1794700000040}
+{"type": "tool_result", "name": "web_search", "output": "d", "duration_ms": 12, "is_error": false, "timestamp": 1794700000050}
+{"type": "result", "session_id": "20261114_170000_a1b2c3", "exit_code": 0, "text": "ok", "tokens": {"input": 0, "output": 9, "total": 9, "cache_read": 0, "cache_write": 0}, "duration_ms": 2100, "timestamp": 1794700000060}

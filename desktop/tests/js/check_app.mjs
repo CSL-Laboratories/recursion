@@ -443,3 +443,37 @@ test("a start that is refused by the daemon is not acknowledged as started", asy
   assert.match(text(doc, "start-conditions"), /start error: launch_refused breaker_admission_missing/);
   assert.doesNotMatch(text(doc, "start-conditions"), /STARTED/);
 });
+
+// Round 5 of #390 (GPT-6.1 Sol, two regression-test gaps): the duplicate a started answer names is the answer's
+// own, and a refusal stays the latest of its action while another action begins.
+test("a retried Start shows duplicate=True from its answer", async () => {
+  const answer = recorded("c01-run-start-started.json");
+  answer.duplicate = true;
+  const doc = windowDocument();
+  await startWindow(doc, replayTransport([
+    { method: "run.list", params: {}, answer: { code: "ok", runs: [] } },
+    { method: "route.list", params: {}, answer: { code: "ok", routes: [] } },
+    { method: "run.start", params: { tenant: "t1", engine: "codex", prompt: "hi" }, answer },
+  ]));
+  await press(doc, nav(doc, "start"));
+  fillStart(doc, "t1");
+  await press(doc, byId(doc, "start-run"));
+  assert.ok(text(doc, "start-conditions").includes(`STARTED run=${answer.run.run_id} started duplicate=True`),
+    text(doc, "start-conditions"));
+  assert.doesNotMatch(text(doc, "start-conditions"), /duplicate=False/);
+});
+
+test("another action beginning while a Start is in flight does not make that Start's refusal obsolete", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const doc = windowDocument();
+  await startWindow(doc, startWindowWith([], gate));
+  await press(doc, nav(doc, "start"));
+  fillStart(doc, "t-unrecorded");
+  const pending = press(doc, byId(doc, "start-run"));
+  // Showing the runs view begins a run.list call while the Start is still in flight.
+  await press(doc, nav(doc, "runs"));
+  release();
+  await pending;
+  assert.equal(text(doc, "status-line"), "Not sent: no recorded exchange for run.start.");
+});

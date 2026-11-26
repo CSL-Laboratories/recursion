@@ -15,15 +15,27 @@ never a bare ``OSError``.
 The file holds, for each revoked device, its id and the wall-clock time of its revocation, and for each
 connection a revocation named: its id, its device and the wall-clock time the door's disconnect of it came
 (``None``: not yet). A connection id is kept as what the door gave: a ``str``, an ``int`` of at most
-``ID_INT_DIGITS_MAX`` digits, or a tuple of them at most ``ID_DEPTH_MAX`` deep. ``storable_id`` proves an id by
-writing it with the file's own encoding and reading it back, and the book asks it at connect, so no id reaches a
-write unproven.
+``ID_INT_DIGITS_MAX`` digits, or a tuple of them at most ``ID_DEPTH_MAX`` deep.
+
+ONE RULE holds for every key and every value the file holds: written with the file's own encoding and read back
+with its own decoding, it comes back IDENTICAL, equal, of the same types all the way down and with the same code
+points (``comes_back_identical``). JSON's decoder reads two lone surrogates in a row back as the one character
+they would form, so a device id made of them would come back as another id: such an id is refused.
+``storable_id`` asks the rule of a connection id as the file encodes it; the book asks ``storable_id`` at connect,
+and ``comes_back_identical`` of a device id at add, connect, admit and revoke, so no id reaches a write unproven.
 
 Nothing the next start cannot read is written. A write checks every row of its change with the checks a read
 makes; a row that fails them (a time that is not a wall-clock time, an id that does not come back the same) is
 left out of the write and named, never the rest: a device's revocation is never held back by one of its
-connection records. The bytes are then read back through the same checks before they replace the file. A write
-that left rows out raises ``RevocationPartlyWritten`` once the rest is on disk.
+connection records. The bytes are then read back through the same checks before they replace the file, and the
+record read back must be the record meant, identical, or nothing is written. A write that left rows out raises
+``RevocationPartlyWritten`` once the rest is on disk.
+
+A file an earlier writer left may hold an id written as two lone surrogates in a row. It is read as the character
+they form, and that id stays revoked; the two-surrogate id itself is refused at every door of the book, so
+neither form of it pairs again. Two rows such a file holds for what reads back as one connection id are kept as
+the one that holds longer (a connection not yet released before one released, else the later release), so no
+revocation of an id is lost where they meet.
 
 A missing file is an empty record only while no revocation was ever written in that folder. The first write
 whose record holds a revoked device then writes a mark beside the file, ``.revocations.json.recorded``, all or
@@ -121,6 +133,41 @@ def _dumps(doc: object) -> bytes:
     return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def _identical(back: object, value: object, floor: bool) -> bool:
+    """Whether ``back`` is ``value`` again: equal, of the same types all the way down, the same code points; with
+    ``floor``, every whole number of at most ``ID_INT_DIGITS_MAX`` digits."""
+    if type(back) is not type(value):
+        return False
+    if type(value) is list:
+        return len(back) == len(value) and all(_identical(b, v, floor) for b, v in zip(back, value))  # type: ignore[arg-type]
+    if type(value) is dict:
+        return len(back) == len(value) and all(  # type: ignore[arg-type]
+            type(k) is str and k in back and _identical(back[k], v, floor) for k, v in value.items())  # type: ignore[index, operator]
+    if type(value) is float:
+        return back.hex() == value.hex()  # type: ignore[attr-defined]
+    if type(value) is int and floor and not -_INT_BOUND < value < _INT_BOUND:
+        return False
+    return back == value
+
+
+def comes_back_identical(value: object) -> bool:
+    """The one rule of every key and every value the record writes: written with the record's own encoding and read
+    back with its own decoding, ``value`` comes back IDENTICAL: equal, of the same types all the way down (a tuple
+    comes back a list, a subclass of ``str`` a ``str``, a whole-number key a ``str`` key: none is identical), with
+    the same code points (two lone surrogates in a row come back as the one character they form: not identical),
+    and every whole number of at most ``ID_INT_DIGITS_MAX`` digits, so that it reads back under any setting of the
+    interpreter's limit. Anything the encoding or the decoding refuses is not identical either."""
+    try:
+        return _identical(json.loads(_dumps(value)), value, True)
+    except (ValueError, TypeError, RecursionError, OverflowError, MemoryError):
+        return False
+
+
+def shown_id(device_id: object) -> str:
+    """An id as words show it: as it is when every character of it can be printed, else as escapes."""
+    return device_id if type(device_id) is str and device_id.isprintable() else ascii(device_id)
+
+
 def _same(back: object, conn_id: object) -> bool:
     if type(back) is not type(conn_id):
         return False
@@ -130,11 +177,13 @@ def _same(back: object, conn_id: object) -> bool:
 
 
 def storable_id(conn_id: object) -> bool:
-    """Whether a connection id can be kept in the file: written with the file's own encoding and read back with
-    its own decoding, it comes back the same id, of the same types. So a ``str``, an ``int`` (not a ``bool``) of
-    at most ``ID_INT_DIGITS_MAX`` digits, or a tuple of them at most ``ID_DEPTH_MAX`` deep."""
+    """Whether a connection id can be kept in the file: its encoding in the file comes back identical
+    (``comes_back_identical``) and decodes to the same id, of the same types. So a ``str`` that comes back the
+    same, an ``int`` (not a ``bool``) of at most ``ID_INT_DIGITS_MAX`` digits, or a tuple of them at most
+    ``ID_DEPTH_MAX`` deep."""
     try:
-        return _same(_decode_id(json.loads(_dumps(_encode_id(conn_id)))), conn_id)  # type: ignore[arg-type]
+        encoded = _encode_id(conn_id)  # type: ignore[arg-type]
+        return comes_back_identical(encoded) and _same(_decode_id(encoded), conn_id)
     except (ValueError, TypeError, RecursionError, OverflowError, MemoryError):
         return False
 
@@ -187,9 +236,20 @@ def _device_fault(device_id: object, at: object) -> str | None:
     return None
 
 
+def _device_row_fault(device_id: object, at: object) -> str | None:
+    """What is wrong with a device's row for a write, by the read's own checks and the one rule: ``"id"``,
+    ``"time"``, or ``None``."""
+    if type(device_id) is not str or not device_id or not comes_back_identical({device_id: 0.0}):
+        return "id"
+    if _device_fault(device_id, at) is not None or not comes_back_identical({device_id: at}):
+        return "time"
+    return None
+
+
 def _writable_device(device_id: object, at: object) -> bool:
-    """The check a write makes on a device's row before it is written: the read's own."""
-    return _device_fault(device_id, at) is None
+    """The check a write makes on a device's row before it is written: the read's own, and the row comes back
+    identical."""
+    return _device_row_fault(device_id, at) is None
 
 
 def _connection_fault(entry: object, devices: Mapping) -> str | None:
@@ -202,6 +262,25 @@ def _connection_fault(entry: object, devices: Mapping) -> str | None:
     except (ValueError, RecursionError):
         return "it holds a connection id of an unknown shape"
     return None
+
+
+def _holds_longer(entry: dict, held: dict) -> bool:
+    """Whether a connection row holds its id longer than another row of the same id: not yet released before
+    released, else the later release."""
+    if held["released"] is None:
+        return False
+    return entry["released"] is None or entry["released"] > held["released"]
+
+
+def _connection_rows(entries: list) -> dict:
+    """The connection rows of a checked record by their id. Two rows for what reads back as one id (an earlier
+    writer wrote them apart) are kept as the one that holds longer, so no revocation of that id is lost."""
+    rows: dict = {}
+    for entry in entries:
+        conn_id = _decode_id(entry["id"])
+        if conn_id not in rows or _holds_longer(entry, rows[conn_id]):
+            rows[conn_id] = entry
+    return rows
 
 
 def _document(raw: bytes) -> dict:
@@ -305,7 +384,8 @@ class FileRevocationStore:
                 doc = self._read()
         except CredentialStoreError as exc:
             raise self._refused(str(exc)) from None
-        connections = {_decode_id(e["id"]): StoredConnection(e["device"], e["released"]) for e in doc["connections"]}
+        connections = {conn_id: StoredConnection(e["device"], e["released"])
+                       for conn_id, e in _connection_rows(doc["connections"]).items()}
         return Revocations(dict(doc["devices"]), connections, doc["boot"])
 
     # -- writing ------------------------------------------------------------------------------------
@@ -314,10 +394,11 @@ class FileRevocationStore:
         try:
             with owner_file_lock(self._lock_path, self._uid, self._timeout):
                 doc = self._read()
-                kept = {_decode_id(e["id"]): e for e in doc["connections"]}
+                kept = _connection_rows(doc["connections"])
                 for conn_id in gone:
                     kept.pop(conn_id, None)
-                left_devices, left_connections = set(), set()
+                left_devices: dict = {}
+                left_connections: set = set()
                 if change is not None:
                     # Every row is checked as the next start's read will check it; a row that fails is left
                     # out and named, and the rest is written: a revocation never waits on its connections.
@@ -326,11 +407,12 @@ class FileRevocationStore:
                         if _writable_device(device_id, at):
                             doc["devices"][device_id] = at
                         else:
-                            left_devices.add(device_id)
+                            left_devices[device_id] = _device_row_fault(device_id, at) or "time"
                     for conn_id, record in change.connections.items():
                         entry = {"id": _encode_id(conn_id) if storable_id(conn_id) else None,
                                  "device": record.device_id, "released": record.released_wall}
-                        if entry["id"] is None or _connection_fault(entry, doc["devices"]) is not None:
+                        if entry["id"] is None or _connection_fault(entry, doc["devices"]) is not None \
+                                or not comes_back_identical(entry):
                             left_connections.add(conn_id)
                         else:
                             kept[conn_id] = entry
@@ -339,7 +421,9 @@ class FileRevocationStore:
                 doc["connections"] = list(kept.values())
                 try:
                     data = _dumps(doc)
-                    _document(data)   # read back as the next start will read it, before it replaces the file
+                    # Read back as the next start will read it, before it replaces the file; what it holds must
+                    # be the record meant, identical, so no revocation is written under another id.
+                    same = _identical(_document(data), doc, False)
                 except _Unreadable as exc:
                     raise RevocationStoreError(f"{self.path}: the record of revoked phones was not written: what "
                                                f"would be written could not be read back at the next start ({exc}); "
@@ -347,6 +431,10 @@ class FileRevocationStore:
                 except (ValueError, TypeError, RecursionError, OverflowError, MemoryError) as exc:
                     raise RevocationStoreError(f"{self.path}: the record of revoked phones was not written: it could "
                                                f"not be encoded ({type(exc).__name__}); the file is as it was") from None
+                if not same:
+                    raise RevocationStoreError(f"{self.path}: the record of revoked phones was not written: what would "
+                                               f"be written does not read back the same, so a revocation could come back "
+                                               f"under another id; the file is as it was")
                 replace_file(self.path, data)
                 if doc["devices"] and not self._marked():
                     # After the record, so that a write of it is never undone by the mark's. A stop between
@@ -361,10 +449,17 @@ class FileRevocationStore:
             raise RevocationStoreError(f"{self.path}: the record of revoked phones could not be written ({exc}); "
                                        f"the folder must be writable by the daemon's user") from None
 
-    def _partly(self, devices: set, connections: set) -> str:
+    def _partly(self, devices: dict, connections: set) -> str:
         parts = []
-        if devices:
-            parts.append(f"{len(devices)} revocations were not written ({', '.join(sorted(devices))}): the time of "
+        by_id = sorted(shown_id(d) for d, why in devices.items() if why == "id")
+        by_time = sorted(shown_id(d) for d, why in devices.items() if why == "time")
+        if by_id:
+            parts.append(f"{len(by_id)} revocations were not written ({', '.join(by_id)}): the id of each does not "
+                         f"come back the same from the record's encoding (two lone surrogates in a row are read back "
+                         f"as the one character they form, which is another id), and no door of the book takes such "
+                         f"an id; give each phone an id the pairing door makes")
+        if by_time:
+            parts.append(f"{len(by_time)} revocations were not written ({', '.join(by_time)}): the time of "
                          f"each is not a wall-clock time (a finite number of seconds, 0 or more), so the machine's "
                          f"clock must be set right")
         if connections:
@@ -379,6 +474,10 @@ class FileRevocationStore:
         for record in change.connections.values():
             if record.device_id not in change.devices:
                 raise RevocationStoreError("a revoked connection is written with its device's revocation")
+        if change.boot is not None and (type(change.boot) is not str or not comes_back_identical(change.boot)):
+            raise RevocationStoreError(f"{self.path}: the record of revoked phones was not written: its boot id "
+                                       f"{shown_id(change.boot)} does not come back the same from the record's "
+                                       f"encoding; the file is as it was")
         self._change(change, ())
 
     def forget(self, conn_ids: Iterable[Hashable]) -> None:

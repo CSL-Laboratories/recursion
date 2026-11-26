@@ -59,7 +59,10 @@ the phone door of this lane's later slices keep, so that they are tested before 
   changes only under its lock (a revocation replaces the record).
 * A wrong argument (no grant, a device id that is not a non-empty ``str``, a subclass of ``str`` included,
   an expiry that is not a finite number, a connection id that cannot be a key, or with a store one the record
-  cannot write and read back the same, ``storable_id``) is a typed refusal, never a ``TypeError``.
+  cannot write and read back the same, ``storable_id``) is a typed refusal, never a ``TypeError``. With a store,
+  a device id the record would not read back identical (``comes_back_identical``: two lone surrogates in a row
+  come back as the one character they form) is refused at ``add`` (``grant_invalid``) and named at ``connect``,
+  ``admit`` and ``revoke`` (``device_unknown``), with words that say why.
 
 How long a device stays paired is capped by the settled values in ``pairing.py`` (record
 20261115-csl238-harness-dr-09-phone-pairing-01): at most 30 days from pairing, and 7 days from
@@ -83,7 +86,8 @@ from dataclasses import dataclass, field
 from .pairing import (MANAGE, PAIRING_MAX_AGE_S, PairingGrant, PairingRefused, device_label, device_scopes,
                       pairing_lapsed)
 from .revocation_store import (ID_DEPTH_MAX, ID_INT_DIGITS_MAX, RevocationPartlyWritten, RevocationStore,
-                               RevocationStoreError, Revocations, StoredConnection, storable_id)
+                               RevocationStoreError, Revocations, StoredConnection, comes_back_identical,
+                               shown_id, storable_id)
 
 
 # How long the book keeps the record of a revoked device's connection after the door's disconnect of it,
@@ -126,6 +130,12 @@ STORABLE_ID_WORDS = (f"the record of revocations cannot keep this connection id:
                      f"at most {ID_INT_DIGITS_MAX} digits, or a tuple of them nested at most {ID_DEPTH_MAX} deep, "
                      f"that the record writes and reads back unchanged; give the connection such an id "
                      f"(new_connection_id makes one)")
+# The detail of grant_invalid at add, and of device_unknown at connect, admit and revoke, with a store, for a device
+# id the record of revocations cannot keep.
+DEVICE_ID_WORDS = ("the record of revocations cannot keep this device id: written with the record's encoding and read "
+                   "back, it does not come back the same (two lone surrogates in a row are read back as the one "
+                   "character they form, which is another id), so its revocation would be on disk under another id; "
+                   "give the device an id the record writes and reads back unchanged (the pairing door makes one)")
 
 
 def unreadable_detail(reason: str) -> str:
@@ -144,7 +154,8 @@ def unwritten_words(devices: list, connections: int) -> str:
     """The words of ``status`` for what a write did not hold: what, why it matters, the step."""
     parts = []
     if devices:
-        parts.append(f"{len(devices)} revoked phones are NOT revoked on disk ({', '.join(devices)}): they are refused "
+        parts.append(f"{len(devices)} revoked phones are NOT revoked on disk ({', '.join(map(shown_id, devices))}): "
+                     "they are refused "
                      "until the daemon stops, and after a restart they would be let in again")
     if connections:
         parts.append(f"{connections} records of revoked connections are not on disk: after a restart their ids could "
@@ -412,6 +423,8 @@ class DeviceBook:
             raise PairingRefused("grant_invalid", "a device is added from a PairingGrant")
         if type(grant.device_id) is not str or not grant.device_id:
             raise PairingRefused("grant_invalid", "a device id is a non-empty string")
+        if self.store is not None and not comes_back_identical(grant.device_id):
+            raise PairingRefused("grant_invalid", DEVICE_ID_WORDS)
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at):
             raise PairingRefused("expiry_invalid", "a device's expiry is a finite number on the book's clock")
         scopes = device_scopes(grant.scopes)
@@ -523,6 +536,8 @@ class DeviceBook:
             with self._lock:
                 record = self._devices.get(device_id) if type(device_id) is str else None
                 if record is None:
+                    if self.store is not None and type(device_id) is str and not comes_back_identical(device_id):
+                        raise PairingRefused("device_unknown", DEVICE_ID_WORDS)
                     raise PairingRefused("device_unknown")
                 if record.revoked_at is None:
                     self._devices[device_id] = dataclasses.replace(record, revoked_at=self.clock())
@@ -612,6 +627,8 @@ class DeviceBook:
         if record is None:
             if type(device_id) is str and device_id in self._revoked_devices:
                 return Admission(False, "device_revoked"), None, None
+            if self.store is not None and type(device_id) is str and not comes_back_identical(device_id):
+                return Admission(False, "device_unknown", DEVICE_ID_WORDS), None, None
             return Admission(False, "device_unknown"), None, None
         if record.revoked_at is not None:
             return Admission(False, "device_revoked"), None, None

@@ -127,7 +127,6 @@ class StarMatcherEquivalenceTests(unittest.TestCase):
             self.assertFalse(policy._no_proxy_hit("*a*a*a*q", ("a" * 30 + ".example",)))
 
 
-@unittest.skipIf(os.name == "nt", "POSIX rules")
 class StarMatcherTimeTests(unittest.TestCase):
     """Devin rt343 MEDIUM-1: at 8682b37a the 18-character entry took 8.6 s here and the 22-character one over 130 s."""
 
@@ -164,6 +163,7 @@ class StarMatcherTimeTests(unittest.TestCase):
             return refused.name, refused.cause, refused.position, str(refused)
         return "launched"
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_build_child_env_is_fast_and_decides_as_before(self) -> None:
         home = cells.owned_tmpdir("csl839-home-")
         self.addCleanup(shutil.rmtree, home, True)

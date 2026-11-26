@@ -1,4 +1,4 @@
-"""Structural tests for the B6 evidence contract (Lucas, 2026-11-08).
+"""Structural tests for the B6 evidence contract (the owner, 2026-11-08).
 
 The records here are hand-built fixtures, not host evidence. They check the evidence
 schema and the contract's logic; they say nothing about kernel or systemd behaviour.

@@ -1,0 +1,10 @@
+{
+  "type": "call",
+  "id": 1,
+  "name": "Registry",
+  "args": {
+    "command": {
+      "command": "status"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 """CSL-743: a veto is final for that intent; a retry must be a new intent.
 
-Lucas's decision on csl-research #1161 item 5. Once the operator vetoes an approval,
+The owner's decision on csl-research #1161 item 5. Once the operator vetoes an approval,
 the gate refuses the same effect digest (``approval_vetoed``) at ``request``, at
 ``decide`` approve for a still-pending sibling, and at ``take`` for a sibling approved
 earlier. Expired, used and never-decided approvals do not block a re-request, and the

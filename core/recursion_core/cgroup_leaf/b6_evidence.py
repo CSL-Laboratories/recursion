@@ -1,4 +1,4 @@
-"""B6 (CSL-728, F23) acceptance contract over recorded host evidence (Lucas, 2026-11-08).
+"""B6 (CSL-728, F23) acceptance contract over recorded host evidence (the owner, 2026-11-08).
 
 This module runs no probe. It only judges an evidence record that a founder's host
 run produced (or a structural fixture in tests) and never touches systemd, cgroups

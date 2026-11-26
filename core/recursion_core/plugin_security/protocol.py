@@ -4,7 +4,7 @@ Plugins and consumers (including in-process plugins) reach the approval gate, th
 and the breaker only through ``CoreService.client_for(caller)``, a callable taking
 request bytes and returning response bytes. The ops, their arguments and the order of
 checks are listed in ``protocol.json`` beside this file, so a later Rust core can be
-driven by the same test vectors (Lucas, Nov 7: keep the core's boundaries
+driven by the same test vectors (the owner, Nov 7: keep the core's boundaries
 language-neutral). The core holds no consumer-specific code: which effect kinds need
 which permission, and which permissions need an authority profile, are injected.
 

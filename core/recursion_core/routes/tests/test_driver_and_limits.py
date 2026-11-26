@@ -1,4 +1,4 @@
-"""Claude Code driver per Lucas's correction (Nov 7 ~6:34pm PST), Codex own login, and limit handling.
+"""Claude Code driver per the owner's correction (Nov 7 ~6:34pm PST), Codex own login, and limit handling.
 
 Fakes only: no real ``claude`` or ``codex`` process, no settings or credential file, no provider call.
 """

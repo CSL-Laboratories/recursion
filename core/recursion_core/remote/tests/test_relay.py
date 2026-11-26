@@ -519,10 +519,38 @@ class NoListenerTests(unittest.TestCase):
                     self.assertNotIn(node.attr, self.FORBIDDEN_CALLS, f"{path.name}:{node.lineno}")
 
 
+# A host without POSIX file locks, as a child interpreter: importing fcntl raises ImportError in every module.
+NO_FILE_LOCKS_CHILD = """
+import io, json, sys
+sys.modules["fcntl"] = None
+sys.path.insert(0, sys.argv[1])
+environ, settings = json.loads(sys.argv[2]), json.loads(sys.argv[3])
+from recursion_core.control_transport import unix
+from recursion_core.control_transport.framing import encode_frame
+from recursion_core.remote import relay, relay_store
+out = {"fcntl": [relay_store.fcntl is None, unix.fcntl is None], "starts": []}
+for argv, kwargs in settings:
+    made = None
+    try:
+        relay.Relay(environ=environ, **kwargs)
+    except Exception as exc:
+        code = getattr(exc, "code", None)
+        made = [type(exc).__name__, str(exc), None if code is None else str(code)]
+    stdout, stderr = io.BytesIO(), io.StringIO()
+    hello = io.BytesIO(encode_frame({"op": "relay_hello", "relay_version": 1}))
+    status = relay.main(argv, environ=environ, stdin=hello, stdout=stdout, stderr=stderr)
+    out["starts"].append({"made": made, "exit": status, "stdout": stdout.getvalue().hex(),
+                          "stderr": stderr.getvalue()})
+print(json.dumps(out))
+"""
+
+
 class RelayWithoutFileLocksTests(unittest.TestCase):
-    """A host without POSIX file locks (fcntl), as Windows is: the relay's store still imports, and every
-    path that would keep the relay's state refuses, with a code and words a person can act on, before it
-    makes, opens or reads a file. Nothing is ever kept without its lock."""
+    """A host without POSIX file locks (fcntl), as Windows is: the relay's modules still import. The relay's
+    start is refused there by the control transport's own check, for every setting, before the relay's
+    folder is reached. Behind that check the store keeps a fence of its own: every path that would keep the
+    relay's state refuses, with a code and words a person can act on, before it makes, opens or reads a
+    file. Nothing is ever kept without its lock."""
 
     @staticmethod
     def _store_without_fcntl():
@@ -554,7 +582,11 @@ class RelayWithoutFileLocksTests(unittest.TestCase):
         self.assertEqual(os.listdir(scratch), [])  # no folder made, no file opened for writing
 
     @unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
-    def test_the_relays_start_refuses_without_file_locks_and_leaves_its_folder_empty(self) -> None:
+    def test_the_stores_own_fence_refuses_the_relays_start_when_only_the_store_lacks_file_locks(self) -> None:
+        """A unit test of the store's own fence: fcntl is taken from relay_store alone while the control
+        transport still has it, a state no host has today (on a host without fcntl the transport's check
+        refuses the start first, as the next test shows). The fence is kept so that the store still refuses
+        if that check is ever lifted."""
         from unittest import mock
 
         state, runtime = support.scratch_dir(self), support.scratch_dir(self)
@@ -571,9 +603,39 @@ class RelayWithoutFileLocksTests(unittest.TestCase):
             self.assertIn("recursion relay: refused: RelayStateRefused: relay_state_no_file_locks: this host has no "
                           "POSIX file locks (fcntl)", err.getvalue())
             self.assertIn("run the relay on a Linux or macOS host", err.getvalue())
-            # Nothing to keep (a window per session, no record): no file of the relay's state, so no lock needed.
-            self.assertIsNone(Relay(environ=environ, cap_scope="session", record_max=0).state_folder)
         self.assertEqual(os.listdir(state), [])  # the folder it was given: still empty
+
+    @unittest.skipUnless(POSIX, "a child interpreter of this POSIX host, with fcntl hidden, stands for the host")
+    def test_on_a_host_without_file_locks_the_transports_check_refuses_the_start_for_every_setting(self) -> None:
+        """fcntl hidden as a real host lacks it, in a fresh interpreter and so from every module that imports
+        it: the control transport's check refuses the relay's start, for a relay that keeps state and for one
+        that keeps nothing, before the relay's folder is reached; the store's code is never written."""
+        state, runtime = support.scratch_dir(self), support.scratch_dir(self)
+        environ = {"XDG_STATE_HOME": state, "XDG_RUNTIME_DIR": runtime}
+        settings = [(["relay", "--key-label", "laptop"], {"key_label": "laptop"}),  # keeps the window and record
+                    (["relay", "--key-label", "laptop", "--cap-scope", "session", "--record-max", "0"],
+                     {"key_label": "laptop", "cap_scope": "session", "record_max": 0})]  # keeps nothing
+        child = subprocess.run([sys.executable, "-B", "-c", NO_FILE_LOCKS_CHILD, str(REMOTE_DIR.parents[1]),
+                                json.dumps(environ), json.dumps(settings)],
+                               capture_output=True, text=True, timeout=support.WATCHDOG_S * 3)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        out = json.loads(child.stdout.strip().splitlines()[-1])
+        self.assertEqual(out["fcntl"], [True, True])  # absent from the store and from the transport alike
+        refused = "platform_unsupported: the AF_UNIX control transport needs POSIX"
+        self.assertEqual(len(out["starts"]), len(settings))
+        for (argv, _), start in zip(settings, out["starts"]):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(start["made"], "the relay started on a host without file locks")
+                name, words, code = start["made"]
+                self.assertEqual(name, "PlatformNotSupported")
+                self.assertTrue(words.startswith(refused), words)
+                self.assertNotEqual(code, "relay_state_no_file_locks")
+                self.assertEqual(start["exit"], EXIT_REFUSED)
+                self.assertEqual(start["stdout"], "")
+                self.assertTrue(start["stderr"].startswith(f"recursion relay: refused: PlatformNotSupported: {refused}"),
+                                start["stderr"])
+                self.assertNotIn("relay_state_no_file_locks", start["stderr"])
+        self.assertEqual(os.listdir(state), [])  # no folder of the relay's state, no state file
 
 
 DEVICE_REFUSED = {"config.set": "all", "plugins.install": "all", "daemon.shutdown": "all",

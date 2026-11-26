@@ -42,10 +42,11 @@ What it checks:
   machine (``relay/refusals.jsonl`` under the daemon's state folder), at most ``record_max`` lines kept,
   newest last, and is also told to ``record`` (``main`` writes it on stderr, which sshd hands to the
   client, never on stdout).
-* The key's window and the record are kept under POSIX file locks. On a host without them (Windows) the
-  start refuses before a file of the relay's folder is made, opened or read (``RelayStateRefused``, code
-  ``relay_state_no_file_locks``); a relay that keeps nothing (``cap_scope`` ``session``, ``record_max``
-  ``0``) needs no file and no lock.
+* The key's window and the record are kept under POSIX file locks. On a host without them the start is
+  refused by the control transport's own check (``PlatformNotSupported``, ``platform_unsupported``), for
+  every setting, before the relay's folder is reached. The store refuses there on its own as well
+  (``RelayStateRefused``, code ``relay_state_no_file_locks``): a second fence, which no start reaches
+  while that check stands, so that the store still refuses if the check is ever lifted.
 
 What waits for the core: the relay connects to the socket as the owner's uid, as before. Until the core
 checks rights at its socket (a paired device's identity presented on the connection, and that device's

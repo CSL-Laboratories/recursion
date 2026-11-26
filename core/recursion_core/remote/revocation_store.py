@@ -265,6 +265,17 @@ def _wall(value: object, optional: bool) -> bool:
         return False
 
 
+def _not_a_file(mode: int) -> str:
+    """What stands in the record's place when it is not a regular file, and the step."""
+    if stat.S_ISLNK(mode):
+        return "it is a link: put the real file in its place"
+    if stat.S_ISDIR(mode):
+        return "it is a folder, not a file: put the real file in its place"
+    if stat.S_ISFIFO(mode):
+        return "it is a pipe, not a file: put the real file in its place"
+    return "it is not a regular file (a socket or a device): put the real file in its place"
+
+
 class _Unreadable(ValueError):
     """Why bytes are not a record this store reads: the words of the refusal."""
 
@@ -474,7 +485,13 @@ class FileRevocationStore:
     def _read(self) -> dict:
         """The file's document, checked. A missing file is an empty record only when no revocation was ever
         written here (no mark); with the mark it is refused. A record that holds fewer revocations than the count
-        beside it is refused."""
+        beside it is refused. What stands in its place when it is not a file is named."""
+        try:
+            found = os.lstat(self.path)
+        except OSError:
+            found = None   # missing, or the open below says why
+        if found is not None and not stat.S_ISREG(found.st_mode):
+            raise self._refused(_not_a_file(found.st_mode))
         try:
             fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
         except FileNotFoundError:
@@ -485,7 +502,9 @@ class FileRevocationStore:
             raise self._refused(f"it cannot be opened ({type(exc).__name__})") from None
         try:
             st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != self._uid or stat.S_IMODE(st.st_mode) & 0o077:
+            if not stat.S_ISREG(st.st_mode):
+                raise self._refused(_not_a_file(st.st_mode))
+            if st.st_uid != self._uid or stat.S_IMODE(st.st_mode) & 0o077:
                 raise self._refused("it is not an owner-only file of the daemon's user")
             with os.fdopen(fd, "rb") as handle:
                 fd = None

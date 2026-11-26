@@ -146,6 +146,11 @@ DEVICE_ID_WORDS = ("the record of revocations cannot keep this device id: writte
                    "back, it does not come back the same (two lone surrogates in a row are read back as the one "
                    "character they form, which is another id), so its revocation would be on disk under another id; "
                    "give the device an id the record writes and reads back unchanged (the pairing door makes one)")
+# The detail of device_unknown at revoke, with a store, for such an id: no phone can have it, so nothing was revoked.
+DEVICE_ID_REVOKE_WORDS = ("no phone has this id, and none can be paired with it: written with the record's encoding and "
+                          "read back, it does not come back the same (two lone surrogates in a row are read back as "
+                          "the one character they form, which is another id), so every door of the book refuses it; "
+                          "nothing was revoked. Revoke the phone by the id the pairing door gave it")
 
 
 def unreadable_detail(reason: str) -> str:
@@ -353,7 +358,10 @@ class DeviceBook:
         return Revocations(devices, released), forget
 
     def _draw_boot(self) -> None:
-        """Called with the book's lock held: a boot id no held id begins with, and never the stored one."""
+        """Called with the book's lock held: a boot id that no held connection id begins with (``<boot>.``). What is
+        compared is the held ids' prefixes, not the boot id the store holds from the last start: a fresh draw of
+        16 random bytes equal to it is not a practical case, and the held prefixes alone keep every id the book
+        makes apart from every id it holds."""
         while True:
             boot = secrets.token_hex(_BOOT_BYTES)
             prefix = boot + "."
@@ -587,7 +595,7 @@ class DeviceBook:
                 record = self._devices.get(device_id) if type(device_id) is str else None
                 if record is None:
                     if self.store is not None and type(device_id) is str and not comes_back_identical(device_id):
-                        raise PairingRefused("device_unknown", DEVICE_ID_WORDS)
+                        raise PairingRefused("device_unknown", DEVICE_ID_REVOKE_WORDS)
                     raise PairingRefused("device_unknown")
                 if record.revoked_at is None:
                     self._devices[device_id] = dataclasses.replace(record, revoked_at=self.clock())

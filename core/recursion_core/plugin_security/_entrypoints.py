@@ -23,6 +23,16 @@ then one line with the commands that go on, and returns 0.
 question, as unpin does, and installs the held release only on ``yes``;
 ``quarantine drop <id>`` moves the held release into a kept place and names it.
 
+``install <plugin_id> --registry <address>@<full commit>`` reads the registry's tree at that commit
+(a local bare repository or its ``file://`` address; the commit must be on the registry's default
+branch) and installs from it with the same checks; ``--registry <folder>`` reads a registry folder on disk by the
+same road, with the same checks and status line. A withdrawn release named by its version is refused from a registry
+at a commit unless ``--allow-withdrawn`` names it, and installed from a folder, as before; one that goes on is said to
+be withdrawn, with the registry's reason and the newest release that is not, on stderr before the install goes on.
+The id may be given as
+the one word after ``install`` or with ``--plugin``. With no registry named the install refuses
+``registry_not_named`` and says how to name one.
+
 ``install --yes`` writes one grant for the requested permissions except
 ``order``. ``install --no-grant`` writes none. With neither flag, a terminal
 is asked once and only the answer ``y`` or ``yes`` grants; any other answer,
@@ -38,9 +48,10 @@ import os
 import sys
 from pathlib import Path
 
-from .install import (InstallRefused, NothingChanged, disable_plugin, enable_plugin, install_plugin,
-                      list_plugins, quarantine_accept, quarantine_drop, quarantine_list, remove_plugin,
-                      rollback_generation, unpin_plugin)
+from .install import (InstallRefused, NothingChanged, disable_plugin, enable_plugin, list_plugins,
+                      quarantine_accept, quarantine_drop, quarantine_list, remove_plugin, rollback_generation,
+                      unpin_plugin)
+from .registry_source import install_from_registry, list_not_wired, shown_lines
 
 __all__ = ["main"]
 
@@ -79,9 +90,12 @@ def _parser() -> argparse.ArgumentParser:
 
     install = commands.add_parser("install")
     install.error = _error  # type: ignore[method-assign]
-    install.add_argument("--registry", required=True)
-    install.add_argument("--plugin", required=True)
+    install.add_argument("plugin_id", nargs="?")
+    install.add_argument("--registry", help="<address>@<full commit>, or a registry folder")
+    install.add_argument("--plugin")
     install.add_argument("--version")
+    install.add_argument("--allow-withdrawn", metavar="VERSION",
+                         help="install this one withdrawn release, named again by its version")
     install.add_argument("--git", help="local bare repository")
     install.add_argument("--config")
     install.add_argument("--state")
@@ -122,6 +136,11 @@ def _parser() -> argparse.ArgumentParser:
     unpin.add_argument("plugin_id")
     unpin.add_argument("--config")
     unpin.add_argument("--state")
+
+    registry = commands.add_parser("registry")
+    registry.error = _error  # type: ignore[method-assign]
+    registry.add_argument("action", choices=("list", "add", "remove", "pin"))
+    registry.add_argument("words", nargs="*")
 
     quarantine = commands.add_parser("quarantine")
     quarantine.error = _error  # type: ignore[method-assign]
@@ -177,7 +196,8 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None, stdin=None
     try:
         args = _parser().parse_args(argv)
     except _Usage as exc:
-        err.write(f"usage: recursion plugin install|list|remove|enable|disable|rollback|unpin|quarantine ({exc})\n")
+        err.write(f"usage: recursion plugin install|list|remove|enable|disable|rollback|unpin|quarantine|registry "
+                  f"({exc})\n")
         return 2
     said = []
 
@@ -202,16 +222,33 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None, stdin=None
             if args.yes and args.no_grant:
                 err.write("usage: recursion plugin install (--yes and --no-grant)\n")
                 return 2
+            if args.plugin_id is not None and args.plugin is not None and args.plugin_id != args.plugin:
+                err.write("usage: recursion plugin install <plugin_id> (two different ids given)\n")
+                return 2
+            plugin_id = args.plugin_id if args.plugin_id is not None else args.plugin
+            if plugin_id is None:
+                err.write("usage: recursion plugin install <plugin_id> [--registry <address>@<full commit>]\n")
+                return 2
             if args.no_grant:
                 write_grant, confirm = False, None
             elif args.yes:
                 write_grant, confirm = True, None
             else:
                 write_grant, confirm = None, _confirm_grant(stdin, err)
-            result = install_plugin(_config_dir(args.config), args.registry, args.plugin,
-                                    version=args.version, state=_state_dir(args.state), report_kept=report,
-                                    confirm=ask, git_repository=args.git, write_grant=write_grant,
-                                    confirm_grant=confirm)
+            options = dict(version=args.version, state=_state_dir(args.state), report_kept=report,
+                           confirm=ask, git_repository=args.git, write_grant=write_grant, confirm_grant=confirm)
+            # One road for a registry folder and a registry at a commit: the same checks, refusals and status
+            # line. A folder install prints no label lines yet: the lines it printed before are kept as they were.
+            # The command reads --registry <folder> as a folder read as it is (plain_folder), as it did before.
+            result = install_from_registry(_config_dir(args.config), plugin_id, registry=args.registry,
+                                           allow_withdrawn=args.allow_withdrawn, plain_folder=True, **options)
+            if result.get("result") != "quarantined":
+                folder = (result.get("registry") or {}).get("kind") == "local"
+                for line in shown_lines(result, status_only=folder):
+                    err.write(f"{line}\n")
+        elif args.command == "registry":
+            # The registry list lives in the person's settings file, which this build does not read yet.
+            raise list_not_wired(f"recursion plugin registry {args.action}")
         elif args.command == "list":
             result = list_plugins(_config_dir(args.config), state=_state_dir(args.state))
         elif args.command == "enable":

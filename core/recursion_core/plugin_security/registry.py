@@ -7,6 +7,12 @@ manifest's own developer key when this interpreter can verify one. It does not
 mean the key is on this install's trusted list. ``verified`` stays a label with
 no meaning defined, so a release that claims it is refused.
 
+A release may carry its files beside the entry in the public form: ``files`` names every file of the
+release folder with its ``sha256``, ``size`` and ``executable``, ``release_sha256`` is the SHA-256 of
+that map written as canonical JSON (sorted keys, no spaces, ASCII), and ``source`` is then null. Every
+file of the folder must be named and every named file must be there, with that digest and size; a name
+that is not a plain file name of the folder is refused. Each refusal names the file.
+
 Rule codes match the marketplace checker. This module is not that program and
 does not copy a registry into the tree.
 """
@@ -39,6 +45,9 @@ RELEASE_FIELDS = frozenset({
     "version", "status", "status_reason", "label", "label_basis", "trust_tier",
     "manifest_sha256", "artifact_sha256", "signature", "package", "source", "compatibility",
 })
+# The public form of a release: its files beside the entry, proven by digest (source is then null).
+RELEASE_FILES_FIELDS = frozenset({"files", "release_sha256"})
+RELEASE_FILE_FIELDS = frozenset({"executable", "sha256", "size"})
 SOURCE_FIELDS = frozenset({"repository", "commit", "path"})
 COMPATIBILITY_FIELDS = frozenset({
     "manifest_schema", "interface", "runtime", "recursion_commit", "recursion_versions",
@@ -94,7 +103,8 @@ _RULES = frozenset({
     "manifest_artifact_digest", "manifest_dependency_lock", "malformed_public_key",
     "manifest_unknown_permission", "manifest_permission_order", "manifest_network_destinations",
     "manifest_credential_refs", "manifest_network_mismatch", "manifest_credential_mismatch",
-    "manifest_install_scripts",
+    "manifest_install_scripts", "release_files", "release_file_outside", "release_file_missing",
+    "release_file_extra", "release_file_digest_mismatch", "release_digest_mismatch",
 })
 _NOTES = frozenset({"signature_unchecked", "artifact_unchecked"})
 
@@ -129,6 +139,8 @@ class CheckedRelease:
     source_repository: str | None = None
     manifest_sha256: str | None = None
     artifact_sha256: str | None = None
+    # The public form: the digest of the release's files map, when the release carries one.
+    release_sha256: str | None = None
 
 
 @dataclass
@@ -266,6 +278,31 @@ def _source_part(release: dict, name: str) -> str | None:
     return value if type(value) is str else None
 
 
+def files_digest(files: dict) -> str:
+    """The digest of a whole release: SHA-256 of its files map written as canonical JSON."""
+    return _sha256(json.dumps(files, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii"))
+
+
+def _files_problem(files: object) -> tuple[str, str] | None:
+    """``(code, detail)`` for a files map that is not well formed, naming the file; else None."""
+    if type(files) is not dict or not files:
+        return "release_files", "files must be a map of at least one file"
+    for name, spec in sorted(files.items(), key=lambda item: str(item[0])):
+        if (type(name) is not str or not name or "/" in name or "\\" in name or name in (".", "..")
+                or _PATH_SEGMENT.fullmatch(name) is None):
+            return "release_file_outside", f"{name!s} is not a file of the release folder"
+        if type(spec) is not dict or set(spec) != RELEASE_FILE_FIELDS:
+            return "release_files", f"{name}: fields must be exactly executable, sha256, size"
+        if (type(spec["sha256"]) is not str or _HEX64.fullmatch(spec["sha256"]) is None
+                or type(spec["size"]) is not int or spec["size"] < 0 or type(spec["executable"]) is not bool):
+            return "release_files", f"{name}: sha256 must be 64 lowercase hex, size a count, executable true or false"
+    return None
+
+
+def _carries_files(release: dict) -> bool:
+    return type(release.get("files")) is dict and type(release.get("release_sha256")) is str
+
+
 def _hex64_or_none(value: object) -> str | None:
     if type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None:
         return value
@@ -304,9 +341,22 @@ def _check_publisher(report: Report, path: str, publisher: object) -> None:
 
 def _check_release_fields(report: Report, path: str, release: dict, seen_versions: set) -> bool:
     """Return whether ``version`` can name a directory. A duplicate is not checked again."""
-    missing, unknown = RELEASE_FIELDS - set(release), set(release) - RELEASE_FIELDS
+    missing, unknown = RELEASE_FIELDS - set(release), set(release) - RELEASE_FIELDS - RELEASE_FILES_FIELDS
     if missing or unknown:
         report.error(path, "release_fields", _fields_detail(missing, unknown))
+    public = bool(RELEASE_FILES_FIELDS & set(release))
+    if public:
+        if not RELEASE_FILES_FIELDS <= set(release):
+            report.error(path, "release_files", "files and release_sha256 come together")
+        else:
+            problem = _files_problem(release["files"])
+            if problem:
+                report.error(path, problem[0], problem[1])
+            elif type(release["release_sha256"]) is not str or _HEX64.fullmatch(release["release_sha256"]) is None:
+                report.error(path, "release_digest_format", "release_sha256")
+            elif release["release_sha256"] != files_digest(release["files"]):
+                report.error(path, "release_digest_mismatch",
+                             "release_sha256 is not the digest of the files map")
     can_name = False
     if "version" in release:
         version = release["version"]
@@ -347,9 +397,13 @@ def _check_release_fields(report: Report, path: str, release: dict, seen_version
     if "package" in release and release["package"] is not None:
         report.error(path, "release_package_reserved")
     if "source" in release:
-        problem = _check_source(release["source"])
-        if problem:
-            report.error(path, "release_source", problem)
+        if public:
+            if release["source"] is not None:
+                report.error(path, "release_source", "source must be null when the release carries files")
+        else:
+            problem = _check_source(release["source"])
+            if problem:
+                report.error(path, "release_source", problem)
     if "compatibility" in release:
         problem = _check_compatibility(release["compatibility"])
         if problem:
@@ -645,6 +699,9 @@ def _check_release_directory(report: Report, tree: _Tree, release_dir: str, entr
             report.error(artifact_path, "artifact_digest_mismatch")
     else:
         report.note(manifest_path, "artifact_unchecked")
+    if _carries_files(release) and _files_problem(release["files"]) is None:
+        read = {MANIFEST_FILE: raw, SIGNATURE_FILE: signature_bytes, ARTIFACT_FILE: artifact_bytes}
+        _check_release_files(report, release_dir, release["files"], files, read)
     if parsed is not None and type(entry_plugin_id) is str and type(release.get("version")) is str:
         report.checked.append(CheckedRelease(
             entry_plugin_id, release["version"],
@@ -655,7 +712,22 @@ def _check_release_directory(report: Report, tree: _Tree, release_dir: str, entr
             release["status_reason"] if type(release.get("status_reason")) is str else None,
             in_examples, _source_part(release, "commit"), _source_part(release, "path"),
             _source_part(release, "repository"), _hex64_or_none(release.get("manifest_sha256")),
-            _hex64_or_none(release.get("artifact_sha256"))))
+            _hex64_or_none(release.get("artifact_sha256")),
+            _hex64_or_none(release.get("release_sha256")) if _carries_files(release) else None))
+
+
+def _check_release_files(report: Report, release_dir: str, named: dict, present: dict, read: dict) -> None:
+    """Every file of the folder is named, every named file is there, each with its digest and size."""
+    for name in sorted(set(named) - set(present)):
+        report.error(os.path.join(release_dir, name), "release_file_missing",
+                     f"{name} is named in files and is not in the release folder")
+    for name in sorted(set(present) - set(named)):
+        report.error(present[name], "release_file_extra", f"{name} is in the release folder and not named in files")
+    for name in sorted(set(named) & set(present)):
+        data = read.get(name)
+        if data is None or _sha256(data) != named[name]["sha256"] or len(data) != named[name]["size"]:
+            report.error(present[name], "release_file_digest_mismatch",
+                         f"{name} differs from the digest or the size its entry names")
 
 
 def _verify_developer_signature(report: Report, path: str, developer_key: str, signature: str | None,

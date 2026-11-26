@@ -1,9 +1,11 @@
-"""Fetch one plugin file from a local bare git repository.
+"""Fetch one plugin file, or a registry's tree, from a git repository.
 
-This is the first code in recursion that fetches a plugin. It uses the git
-program already on the machine and no other package. The repository argument
-is a directory path. An address with a scheme, or a ``git@`` path, is refused
-before git is started.
+This is the code in recursion that fetches. It uses the git program already
+on the machine and no other package. A plugin source is a local bare
+repository: an address with a scheme, or a ``git@`` path, is refused before
+git is started. A registry (``registry_checkout``) is a local bare repository
+or a ``file://`` address of one; an ``https://`` address is recognised and
+refused (below), and every other scheme is refused before git is started.
 
 What this refuses, before any byte is returned for the profile:
 
@@ -11,16 +13,26 @@ What this refuses, before any byte is returned for the profile:
 - a path that is absolute or contains ``..``
 - a symbolic link whose target leaves the tree, and a symbolic link at the file
 - an install script in the tree, or a manifest that names one
+- for a registry: a symbolic link or a submodule anywhere in the tree
 
 The scratch directory is mode 0700 and is removed on success and on failure.
 Nothing in the fetched tree is executed. The file bytes are the git object,
 read with ``git cat-file``. The work tree is not checked out, so a filter or
 a hook in the tree has nothing to run. The scratch repository's HEAD is the
-named commit, and a mismatch is refused.
+named commit, and a mismatch is refused. A plugin fetch and a registry fetch
+pin the commit by the same steps (``_pin``).
+
+A registry's commit must be one the registry publishes: after the pin, the refs
+``_PUBLISHED_REFS`` names are fetched from the registry by name into the scratch
+repository, and a commit that none of them holds (one served by its id alone)
+refuses ``registry_commit_not_published``. An ``https://`` registry is refused
+``registry_transport_unproven`` until that proof is built and tested for a
+remote transport; a local clone of it is read instead.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 from pathlib import Path
@@ -32,28 +44,46 @@ import signal
 import stat
 import subprocess
 
-__all__ = ["SourceRefused", "fetch_plugin_source"]
+__all__ = ["SourceRefused", "fetch_plugin_source", "registry_address", "registry_checkout"]
 
 _GIT = "/usr/bin/git"
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
 _ABS = re.compile(r"/[A-Za-z0-9._/-]+")
+_HTTPS = re.compile(r"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._-]+)+")
 _INSTALL_SCRIPT_NAMES = frozenset({
     "install", "install.sh", "install.py", "install.bash", "install.cmd",
     "setup.sh", "setup.py", "setup.bash",
 })
+# Each figure below becomes a row of the person's settings file once that file is on this base; until
+# then it stands here, in one place, with its present value as the shipped first value.
 _MAX_BLOB = 8 * 1024 * 1024
 _MAX_LISTING = 2 * 1024 * 1024
 _MAX_STDERR = 64 * 1024
+# Seconds one git step may take before it is ended and the fetch is refused.
+_STEP_SECONDS = 30
+# Seconds to wait for an ended git step to go.
+_END_WAIT_SECONDS = 5
+# A registry tree: the most files, and the most bytes in all, its registry/ and examples/ areas may hold.
+_MAX_REGISTRY_FILES = 10000
+_MAX_REGISTRY_BYTES = 256 * 1024 * 1024
+# The folders of a registry's tree that the registry check reads. Nothing else of the tree is written.
+_REGISTRY_AREAS = ("registry", "examples")
+# The refs of a registry whose history counts as published: the default branch only, the narrowest,
+# which is what a registry's own publishing moves. More (every branch, tags) is a choice to settle; this
+# becomes a row of the person's settings file once that file is on this base.
+_PUBLISHED_REFS = ("HEAD",)
 
 
 class SourceRefused(Exception):
     """The fetch did not return bytes. ``code`` is stable."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, path: str | None = None) -> None:
         super().__init__(code)
         self.code = code
+        # For a registry: the file in the fetched tree the refusal is about, when there is one.
+        self.path = path
 
 
 def fetch_plugin_source(repository: str, commit: str, path: str, *, expected_sha256: str,
@@ -83,6 +113,114 @@ def fetch_plugin_source(repository: str, commit: str, path: str, *, expected_sha
             if fetched:
                 raise SourceRefused("source_unavailable") from None
     return blob
+
+
+def registry_address(address: object) -> tuple[str, str]:
+    """``(kind, value)`` for a registry address: ``local`` with a folder path, or ``https`` with the URL.
+
+    A ``file://`` address is its folder path. Every other scheme, a ``git@`` path, a URL with a user,
+    a query or a fragment, and a relative path refuse ``registry_address_refused``.
+    """
+    if type(address) is not str or not address or "\x00" in address or "\n" in address:
+        raise SourceRefused("registry_address_refused")
+    lowered = address.lower()
+    if lowered.startswith("file://"):
+        return "local", address[len("file://"):]
+    if lowered.startswith("https://"):
+        if address.startswith("https://") and _HTTPS.fullmatch(address) is not None:
+            return "https", address
+        raise SourceRefused("registry_address_refused")
+    # Every other scheme, a git@ form and a relative path: none starts with a slash.
+    if not address.startswith("/"):
+        raise SourceRefused("registry_address_refused")
+    return "local", address
+
+
+@contextlib.contextmanager
+def registry_checkout(address: str, commit: str):
+    """Yield a folder holding the registry's ``registry/`` and ``examples/`` at ``commit``, then remove it.
+
+    The folder is written from the git objects of that one commit: no history, no ref and no file outside
+    those two areas is written. A symbolic link or a submodule anywhere in the commit's tree refuses
+    ``registry_link_refused`` before any file is written; an install script by name in those areas refuses
+    ``source_install_script``; a tree over the file or byte figures refuses ``registry_too_large``.
+    """
+    _require_commit(commit)
+    kind, value = registry_address(address)
+    if kind != "local":
+        raise SourceRefused("registry_transport_unproven")
+    source = str(_require_local(value))
+    scratch = _make_scratch()
+    try:
+        records = _pin(scratch, source, commit, over="registry_too_large", bad_name="source_path_escapes")
+        _require_published(scratch, source, commit)
+        tree = scratch / "tree"
+        _write_registry_tree(scratch, tree, records)
+        yield tree
+    finally:
+        _remove_tree(scratch)
+
+
+def _write_registry_tree(scratch: Path, tree: Path, records: dict) -> None:
+    for name, (mode, _sha) in sorted(records.items()):
+        if mode in ("120000", "160000"):
+            raise SourceRefused("registry_link_refused", name)
+    chosen = {name: record for name, record in records.items()
+              if name.split("/", 1)[0] in _REGISTRY_AREAS and "/" in name}
+    if len(chosen) > _MAX_REGISTRY_FILES:
+        raise SourceRefused("registry_too_large")
+    _refuse_scripts(chosen, ())
+    os.mkdir(tree, 0o700)
+    total = 0
+    for name, (mode, _sha) in sorted(chosen.items()):
+        try:
+            _require_path(name)
+        except SourceRefused:
+            raise SourceRefused("source_path_escapes", name) from None
+        if mode not in ("100644", "100755"):
+            # Defence only: git lists no other mode under these areas once links and submodules are refused.
+            raise SourceRefused("source_not_regular", name)
+        size_text = _git(scratch, "cat-file", "-s", f"HEAD:{name}")
+        if not size_text.strip().isdigit() or int(size_text) > _MAX_BLOB:
+            raise SourceRefused("registry_too_large", name)
+        blob = _git(scratch, "cat-file", "blob", f"HEAD:{name}", limit=_MAX_BLOB)
+        total += len(blob)
+        if total > _MAX_REGISTRY_BYTES:
+            raise SourceRefused("registry_too_large")
+        folder = tree
+        for part in name.split("/")[:-1]:
+            folder = folder / part
+            if not os.path.lexists(folder):
+                os.mkdir(folder, 0o700)
+        fd = os.open(folder / name.rsplit("/", 1)[-1],
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
+        try:
+            view = memoryview(blob)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+
+
+def _require_published(scratch: Path, source: str, commit: str) -> None:
+    """Refuse a commit that no ref of ``_PUBLISHED_REFS`` holds, read by name from the registry itself."""
+    specs = []
+    for position, ref in enumerate(_PUBLISHED_REFS):
+        target = f"refs/published/{position}"
+        specs.append(f"+{ref}:{target}/*" if ref.endswith("/*") else f"+{ref}:{target}")
+    _git(scratch, "fetch", "--upload-pack", _upload(scratch), "--no-tags", "--no-recurse-submodules", "--",
+         source, *specs)
+    holding = _git(scratch, "for-each-ref", "--contains", commit, "--format=%(refname)", "refs/published/")
+    if not holding.strip():
+        raise SourceRefused("registry_commit_not_published")
+
+
+def _upload(scratch: Path) -> str:
+    # git runs --upload-pack through a shell. Every part is quoted, so a hooks
+    # path that contains a semicolon, a space, a quote or a dollar sign stays data.
+    return " ".join(shlex.quote(part) for part in (
+        _GIT, "-c", f"core.hooksPath={scratch / 'hooks'}", "-c", "core.fsmonitor=",
+        "-c", "core.sshCommand=", "upload-pack"))
 
 
 def _require_commit(commit: object) -> None:
@@ -148,9 +286,9 @@ def _make_scratch() -> Path:
     return path
 
 
-def _env(scratch: Path) -> dict:
+def _env(scratch: Path, protocol: str | None = None) -> dict:
     """A git environment with no user config and no prompt. Nothing is inherited."""
-    return {
+    env = {
         "PATH": "/usr/bin:/bin",
         "HOME": str(scratch / "home"),
         "TMPDIR": str(scratch / "tmp"),
@@ -164,21 +302,29 @@ def _env(scratch: Path) -> dict:
         "LC_ALL": "C",
         "LANG": "C",
     }
+    if protocol is not None:
+        # A registry fetch: git may use this one protocol and no other, redirects included.
+        env["GIT_ALLOW_PROTOCOL"] = protocol
+    return env
 
 
-def _run(args: list[str], scratch: Path, *, cwd: Path | None = None, limit: int = _MAX_LISTING) -> bytes:
+def _run(args: list[str], scratch: Path, *, cwd: Path | None = None, limit: int = _MAX_LISTING,
+         protocol: str | None = None, over: str = "source_unavailable") -> bytes:
     try:
         proc = subprocess.Popen(
-            args, cwd=str(cwd or scratch / "repo"), env=_env(scratch), stdin=subprocess.DEVNULL,
+            args, cwd=str(cwd or scratch / "repo"), env=_env(scratch, protocol), stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     except OSError:
         raise SourceRefused("source_unavailable") from None
     try:
-        out, err = proc.communicate(timeout=30)
+        out, err = proc.communicate(timeout=_STEP_SECONDS)
     except (subprocess.TimeoutExpired, OSError):
         _kill(proc)
         raise SourceRefused("source_unavailable") from None
-    if proc.returncode != 0 or len(err) > _MAX_STDERR or len(out) > limit:
+    if proc.returncode == 0 and len(out) > limit:
+        # An output over its figure: ``over`` names it (a registry says it is too large, not unreachable).
+        raise SourceRefused(over)
+    if proc.returncode != 0 or len(err) > _MAX_STDERR:
         raise SourceRefused("source_unavailable")
     return out
 
@@ -189,32 +335,30 @@ def _kill(proc: subprocess.Popen) -> None:
     except OSError:
         pass
     try:
-        proc.communicate(timeout=5)
+        proc.communicate(timeout=_END_WAIT_SECONDS)
     except (subprocess.TimeoutExpired, OSError):
         pass
 
 
-def _git(scratch: Path, *args: str, limit: int = _MAX_LISTING) -> bytes:
+def _git(scratch: Path, *args: str, limit: int = _MAX_LISTING, protocol: str | None = None,
+         over: str = "source_unavailable") -> bytes:
     hooks = str(scratch / "hooks")
     return _run([
         _GIT, "-c", "maintenance.auto=false", "-c", f"core.hooksPath={hooks}",
         "-c", "core.fsmonitor=", "-c", "core.sshCommand=", "-c", "core.autocrlf=false",
         *args,
-    ], scratch, limit=limit)
+    ], scratch, limit=limit, protocol=protocol, over=over)
 
 
-def _fetch(scratch: Path, bare: Path, commit: str, path: str, expected: str, install_scripts: tuple) -> bytes:
-    hooks = str(scratch / "hooks")
+def _pin(scratch: Path, source: str, commit: str, *, over: str = "source_unavailable",
+         bad_name: str = "source_unavailable") -> dict:
+    """Fetch ``commit`` alone from the local bare ``source``, prove HEAD is it, return its listing."""
     _git(scratch, "init", "--quiet", "--template", str(scratch / "template"), "-b", "scratch")
-    bare_text = _git(scratch, "--git-dir", str(bare), "rev-parse", "--is-bare-repository")
+    bare_text = _git(scratch, "--git-dir", source, "rev-parse", "--is-bare-repository")
     if bare_text != b"true\n":
         raise SourceRefused("source_not_local")
-    # git runs --upload-pack through a shell. Every part is quoted, so a hooks
-    # path that contains a semicolon, a space, a quote or a dollar sign stays data.
-    upload = " ".join(shlex.quote(part) for part in (
-        _GIT, "-c", f"core.hooksPath={hooks}", "-c", "core.fsmonitor=",
-        "-c", "core.sshCommand=", "upload-pack"))
-    _git(scratch, "fetch", "--upload-pack", upload, "--no-tags", "--no-recurse-submodules", "--", str(bare), commit)
+    _git(scratch, "fetch", "--upload-pack", _upload(scratch), "--no-tags", "--no-recurse-submodules", "--",
+         source, commit)
     fetched = _git(scratch, "rev-parse", "--verify", "FETCH_HEAD")
     if fetched != (commit + "\n").encode("ascii"):
         raise SourceRefused("source_commit_mismatch")
@@ -226,8 +370,12 @@ def _fetch(scratch: Path, bare: Path, commit: str, path: str, expected: str, ins
     kind = _git(scratch, "cat-file", "-t", "HEAD")
     if kind != b"commit\n":
         raise SourceRefused("source_commit_mismatch")
-    listing = _git(scratch, "ls-tree", "-r", "-z", "HEAD")
-    records = _records(listing)
+    listing = _git(scratch, "ls-tree", "-r", "-z", "HEAD", limit=_MAX_LISTING, over=over)
+    return _records(listing, bad_name)
+
+
+def _fetch(scratch: Path, bare: Path, commit: str, path: str, expected: str, install_scripts: tuple) -> bytes:
+    records = _pin(scratch, str(bare), commit)
     _refuse_scripts(records, install_scripts)
     _refuse_symlinks(scratch, records)
     found = records.get(path)
@@ -251,7 +399,7 @@ def _fetch(scratch: Path, bare: Path, commit: str, path: str, expected: str, ins
     return blob
 
 
-def _records(listing: bytes) -> dict:
+def _records(listing: bytes, bad_name: str = "source_unavailable") -> dict:
     found = {}
     for record in listing.split(b"\0"):
         if not record:
@@ -261,7 +409,9 @@ def _records(listing: bytes) -> dict:
             mode, rest = text.split(" ", 1)
             _kind, rest = rest.split(" ", 1)
             _sha, name = rest.split("\t", 1)
-        except (UnicodeDecodeError, ValueError):
+        except UnicodeDecodeError:
+            raise SourceRefused(bad_name, "a file name that is not text") from None
+        except ValueError:
             raise SourceRefused("source_unavailable") from None
         if name in found:
             raise SourceRefused("source_unavailable")
@@ -274,7 +424,7 @@ def _refuse_scripts(records: dict, install_scripts: tuple) -> None:
     for name in records:
         base = posixpath.basename(name)
         if base in _INSTALL_SCRIPT_NAMES or name in named or posixpath.normpath(name) in named:
-            raise SourceRefused("source_install_script")
+            raise SourceRefused("source_install_script", name)
 
 
 def _refuse_symlinks(scratch: Path, records: dict) -> None:

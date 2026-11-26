@@ -63,6 +63,7 @@ from recursion_core.gui.client import ControlClient
 from recursion_core.plugin_security import Refused
 from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, ConnectionBreaker, RouteService
 from recursion_core.routes import contract as route_contract
+from recursion_core.settings import owner_only_file
 
 from . import RUN_ID, TERMINAL
 from .breaker import DurableRouteBreaker, open_breaker_store, store_probe_lease_s
@@ -452,7 +453,7 @@ def load_routes(path):
         info = os.lstat(path)
     except FileNotFoundError:
         return {}
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+    if not owner_only_file(info):
         raise RoutesUnreadable('routes file must be an operator-owned regular file, not group/other writable')
     try:
         data = json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=_json_object)

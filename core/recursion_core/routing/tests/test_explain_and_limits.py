@@ -1669,6 +1669,48 @@ class NextStepsTests(unittest.TestCase):
             snap = detected(cfg, key_state=keys_answering("ready"), route_refusal=lambda entry, g=given: g)
             self.assertEqual(snap["engines"]["codex"]["reason"], code, given)
 
+    def test_a_refusal_that_answers_no_word_is_skipped_with_a_code_word(self) -> None:
+        cfg = limited_to([CODEX, OPENCODE])
+        d = router.decide(cfg, ALL_ROUTABLE, {})
+        for given in (0, False, 1.5, b"launch_refused", ["launch_refused"], NOT_CONSULTED):
+            out = router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE,
+                                          route_refusal=lambda entry, g=given: g if entry["route"]["engine"] == "codex" else None)
+            self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "opencode"), given)
+            code = out["skipped"][0]["skipped"]
+            self.assertIs(type(code), str, given)
+            self.assertTrue(CODE_WORD.fullmatch(code) and code in router._SKIP_STEPS, given)
+            json.dumps(out)
+
+
+class ADecisionWithoutItsRouteIsNoDecisionTests(unittest.TestCase):
+    """A routed decision whose model, engine or connection is null is not decide's answer: next_after_limit reads it as
+    route_decision reads it, no decision, so the route it names is never counted as tried as no listed route and
+    offered again."""
+
+    def setUp(self) -> None:
+        self.cfg = with_limits({"on_limit": "fallback", "fallback": [CLAUDE, CODEX]})
+        self.decision = router.decide(self.cfg, SENTRY, {})
+
+    def test_the_decided_route_is_not_offered_again_when_the_decision_names_no_model(self) -> None:
+        self.assertEqual((self.decision["engine"], self.decision["model"]), (CLAUDE["engine"], CLAUDE["model"]))
+        out = router.next_after_limit(self.cfg, self.decision, LIMIT, ALL_ROUTABLE, route_refusal=NOT_CONSULTED)
+        self.assertEqual((out["action"], out["place"], out["route"]["engine"]), ("switch", 2, "codex"))
+        self.assertEqual([(row["place"], row["skipped"]) for row in out["skipped"]], [(1, "already_tried")])
+        out = router.next_after_limit(self.cfg, {**self.decision, "model": None}, LIMIT, ALL_ROUTABLE,
+                                      route_refusal=NOT_CONSULTED)
+        self.assertNotEqual((out["action"], (out.get("route") or {}).get("engine")), ("switch", CLAUDE["engine"]))
+        self.assertEqual(out, {"action": "none", "reason": "no_decision"})
+
+    def test_a_decision_without_its_model_engine_or_connection_is_read_as_route_decision_reads_it(self) -> None:
+        self.assertIsNotNone(router.route_decision(self.decision))
+        for member in ("model", "engine", "connection"):
+            decision = {**self.decision, member: None}
+            with self.subTest(member):
+                self.assertIsNone(router.route_decision(decision))
+                out = router.next_after_limit(self.cfg, decision, LIMIT, ALL_ROUTABLE, route_refusal=NOT_CONSULTED)
+                self.assertEqual(out, {"action": "none", "reason": "no_decision"})
+                self.assertEqual(router.next_steps(out), [router._ANSWER_STEPS["no_decision"]])
+
 
 if __name__ == "__main__":
     unittest.main()

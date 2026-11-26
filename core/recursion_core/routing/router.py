@@ -531,7 +531,8 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     ``config``, the Config the decision was made with (for a run in flight, that one, not a reloaded file);
     ``decision``, ``decide``'s own answer (a ``route_decision``, anything else without ``ok``, an ``ok`` that is
     neither True nor False, a routed mapping without decide's ``reason``, ``rule``, ``engine``, ``model`` and
-    ``connection``, one whose words are not decide's own plain ``str`` (a subclass of ``str`` is not), or one
+    ``connection``, one whose words are not decide's own plain ``str`` (a subclass of ``str`` is not), one
+    whose ``model`` is null (``decide`` never routes without a model, and ``route_decision`` refuses it too), or one
     that cannot be read answers ``no_decision``; a refusal answers ``no_route``); ``limit``, the route result that ended the run (its ``code`` and, when the route
     service made one, its ``limit_notice`` with the ``attempts`` already made, a list, as ``routes.limits.notice``
     writes it: a notice that is absent or null means the route service made none, and only the decided route
@@ -603,6 +604,9 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     if ((read["engine"] is not _MISSING and type(read["engine"]) is not str)
             or (read["model"] is not _MISSING and read["model"] is not None and type(read["model"]) is not str)):
         return {"action": "none", "reason": "no_decision"}  # an engine or model decide never gives
+    if read["model"] is None:  # as route_decision reads it: decide never routes without a model, and a null
+        # one would count the decided route as tried as no listed route, so that route could be offered again
+        return {"action": "none", "reason": "no_decision"}
     decision = {**read, "connection": conn}
     # The limit result, read once: its code, the vendor's signal, the route service's notice and retry time.
     try:

@@ -897,6 +897,71 @@ class ConnectionBoundTests(_TmpCase):
         # The order, recorded (the round-2 read of #407 by DeepSeek, F6): the join came before the return.
         self.assertTrue(events.empty())
 
+    def test_shutdown_returns_only_once_the_retiring_worker_has_finished(self) -> None:
+        """The g2 read of #407, R2. The test above records the join when it is entered, so a join that
+        returns at once (``timeout=0``) still queues that record before shutdown returns and stays green.
+        This one writes the record after ``Thread.join`` returns, requires the worker to be finished then,
+        and requires that record before shutdown returns. The worker stays inside its socket release until
+        this test lets it go, so a zero timeout returns while the worker is still alive."""
+        import queue
+        from unittest import mock
+        limit = 30.0   # a watchdog only
+        srv = self.server(max_connections=1, idle_timeout_s=30.0, reserved_connections=1,
+                          priority=lambda request: request.get("op") == "stop", reserved_timeout_s=30.0)
+        holder = UnixControlClient(srv.path)
+        self.addCleanup(holder.close)
+        holder.request({"op": "ping"})
+        retiring, proceed = threading.Event(), threading.Event()
+        held: list[threading.Thread] = []
+        events: queue.Queue = queue.Queue()
+        real_close, real_join = socket.socket.close, threading.Thread.join
+
+        def hold_then_close(sock):
+            if threading.current_thread().name == "control-transport-conn" and not held:
+                held.append(threading.current_thread())
+                retiring.set()
+                if not proceed.wait(limit):
+                    raise AssertionError("watchdog: the held worker was never let go")
+            return real_close(sock)
+
+        def observed_join(thread, timeout=None):
+            mine = bool(held) and thread is held[0] and threading.current_thread().name == "test-shutdown"
+            if mine:
+                events.put("join entered")
+            outcome = real_join(thread, timeout)
+            if mine:
+                # After the join, not at entry: a zero timeout has already returned while the worker lives.
+                events.put(("join returned", thread.is_alive()))
+            return outcome
+
+        def shut_down():
+            srv.close()
+            events.put("the server's shutdown returned")
+
+        closer = threading.Thread(target=shut_down, name="test-shutdown")
+        with mock.patch.object(socket.socket, "close", hold_then_close), \
+                mock.patch.object(threading.Thread, "join", observed_join):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stopper:
+                    stopper.settimeout(limit)
+                    stopper.connect(srv.path)
+                    stopper.sendall(framing.encode_frame({"op": "stop", "run_id": "r1"}))
+                    self.assertTrue(framing.read_frame(stopper)["ok"])
+                    self.assertTrue(retiring.wait(limit))
+                    closer.start()
+                    self.assertEqual(events.get(timeout=limit), "join entered")
+                    self.assertTrue(held[0].is_alive())          # still retiring; the join has to wait
+                    proceed.set()
+                    self.assertEqual(events.get(timeout=limit), ("join returned", False))
+                    self.assertEqual(events.get(timeout=limit), "the server's shutdown returned")
+            finally:
+                proceed.set()
+                for worker in held:
+                    real_join(worker, limit)
+                if closer.ident is not None:
+                    real_join(closer, limit)
+        self.assertTrue(events.empty())
+
     def _recording_workers(self, srv) -> list:
         """Every worker thread the server starts, recorded as it begins serving, so a test can join them all."""
         started: list[threading.Thread] = []
@@ -1049,6 +1114,22 @@ class ConnectionBoundTests(_TmpCase):
             for parameter in ("idle_timeout_s", "reserved_timeout_s"):
                 with self.subTest(parameter=parameter, error=error.__name__):
                     with self.assertRaisesRegex(ValueError, parameter):
+                        UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_connections=1,
+                                          priority=lambda request: True, **{parameter: Broken(1.0)})
+
+    def test_an_interrupt_in_timeout_conversion_reaches_the_caller(self) -> None:
+        """The g2 read of #407, R1. ``_seconds`` turns an ``Exception`` from ``float(value)`` into
+        ``ValueError``. ``KeyboardInterrupt``, ``SystemExit`` and ``GeneratorExit`` are not ``Exception``
+        and must reach the caller of ``UnixControlServer``, for both timeout parameters. A catch widened
+        to ``BaseException`` would answer ``ValueError`` instead."""
+        for interrupt in (KeyboardInterrupt, SystemExit, GeneratorExit):
+            class Broken(float):
+                def __float__(self):
+                    raise interrupt
+
+            for parameter in ("idle_timeout_s", "reserved_timeout_s"):
+                with self.subTest(parameter=parameter, interrupt=interrupt.__name__):
+                    with self.assertRaises(interrupt):
                         UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_connections=1,
                                           priority=lambda request: True, **{parameter: Broken(1.0)})
 

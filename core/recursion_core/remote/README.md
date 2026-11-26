@@ -150,6 +150,16 @@ device and label, the client address, the time), newest last, at most `--record-
 (first value 1000; older lines go first; `none` keeps every line; `0` keeps none). One line is also
 written on stderr, which sshd hands to the client that was refused.
 
+A request whose kind is to end something is never counted: `run.stop`, `session.stop`,
+`session.interrupt`, `queue.cancel`, and `approval.answer` whose `answer` is `deny`
+(`rights.ENDING_METHODS`, `rights.ends_something`). Once the key's rights cover it and it fits a frame, it
+is sent to the daemon at once and answered only by the daemon's own answer: it takes no slot, reads no
+window file and waits on no file, so a key whose own watching used up its frames can still stop what it
+watches, and a window that cannot be read never holds it back. A `rate_limited` answer says the cap, the
+window, the scope and `retry_after_s`, the seconds until the next ordinary frame can go, with a sentence
+(`message`) that says what the person can do. A relay whose folder is refused at the start (a wrong mode,
+another owner) starts for no request, a Stop included, until the folder is put right.
+
 Not yet: the relay still connects to the socket as the owner's uid. Until the daemon checks a paired
 device's rights at its own socket, the relay's table is the only lock between a device's key and the
 daemon.

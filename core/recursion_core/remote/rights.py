@@ -73,6 +73,40 @@ METHOD_RIGHTS: Mapping[str, str] = {
     "methods.list": "read",
 }
 
+# THE ENDING KIND: the requests whose kind is to END something. The relay counts none of them against its
+# window of frames and reads no window file for them (``relay.Relay._forward``), so that a key whose own
+# watching used up its frames can still stop what it watches. By the published table: ``run.stop`` stops a
+# run, ``session.stop`` stops a session, ``session.interrupt`` ends the turn under way, ``queue.cancel``
+# takes an item out of the queue before it starts. These are the table's only methods whose names end
+# ``.stop``, ``.interrupt`` or ``.cancel``, and each is a mutating row (a test pins both against the file).
+# The kind lets nothing through that the key's rights do not cover: ``needs`` is asked first, unchanged.
+ENDING_METHODS = frozenset({"run.stop", "session.stop", "session.interrupt", "queue.cancel"})
+# An approval answered with a refusal ends what waited for it. Its params name the refusal by a plain
+# enumerated field (``answer``, one of ``approve``, ``deny`` or null in schemas/control/v1/approval.v1.json),
+# read here as a plain string and nothing else of the sender's.
+APPROVAL_ANSWER = "approval.answer"
+REFUSING_ANSWER = "deny"
+
+
+def ends_something(frame: Mapping[str, Any]) -> bool:
+    """True when ``frame`` is a ``control`` request of the ending kind: a method of ``ENDING_METHODS``, or
+    ``approval.answer`` whose ``params.answer`` is exactly ``deny``. Plain strings and a plain dict only:
+    a subclass of either is not read, so nothing of the sender's runs here."""
+    if not isinstance(frame, dict):
+        return False
+    op, method = frame.get("op"), frame.get("method")
+    if type(op) is not str or op != CONTROL_OP or type(method) is not str:
+        return False
+    if method in ENDING_METHODS:
+        return True
+    if method != APPROVAL_ANSWER:
+        return False
+    params = frame.get("params")
+    if type(params) is not dict:
+        return False
+    answer = params.get("answer")
+    return type(answer) is str and answer == REFUSING_ANSWER
+
 
 class RightsRefused(ValueError):
     """A list of rights the relay cannot hold. ``word`` is the item refused."""

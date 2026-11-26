@@ -60,6 +60,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shlex
 import sqlite3
 import stat
 import sys
@@ -97,6 +98,26 @@ _SHA256 = re.compile(r'[0-9a-f]{64}')
 _GRANT_KEYS = frozenset({'plugin_id', 'artifact_sha256', 'signer_key_id', 'permissions', 'unsigned_order_acknowledged',
                          'order_after_revoked_key', 'order_after_revocation_generation', 'developer_key_id'})
 _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
+# The registry label a plugin row shows. A refused row whose label could not be read says so and why,
+# never "unlisted", which would claim the installer's map was looked up for these bytes.
+_SHOWN = {'verified': 'verified', 'non_verified': 'non-verified', 'unlisted': 'unlisted'}
+NOT_READ_DIRECTORY = 'not read (the plugin directory was refused, so nothing in it was opened)'
+NOT_READ_MANIFEST = 'not read (manifest.json was refused)'
+NOT_READ_INSTALL = 'not read (install.json or its directory was refused)'
+_NOT_READ = frozenset({NOT_READ_DIRECTORY, NOT_READ_MANIFEST, NOT_READ_INSTALL})
+# A refused directory is remembered for the run, so what a row says it found is what the first look found.
+DIRECTORY_REREAD = ('what was found is what the first look found; a directory repaired after the daemon started '
+                    'is read again only after a restart of the daemon')
+# install.json is not read while its directory is refused, so nothing it may hold can be checked: no plugin loads.
+INSTALL_NOT_READ = ('install.json was not read: the install directory %s %s; so the reserved effects, grants and '
+                    'trusted keys written in it could not be checked, and no plugin is loaded while it is so; %s, then '
+                    'restart the daemon')
+# Said once by the run itself, at the daemon's start and in its status, while install.json is not read for its directory.
+INSTALL_UNREAD_RUN = ('install.json was not read, so no plugin was loaded: the install directory %s %s; %s, then '
+                      'restart the daemon')
+# The modes a repair command can change. Any other finding (a link, another owner, not a directory) gets words only.
+_MODE_ONLY = frozenset({'group-writable', 'other-writable'})
+_UNREAD = object()
 # O7 reads (ADV2-3). Uncalibrated defaults: a plugin call that has not answered by its deadline is
 # answered 504 and the plugin is marked degraded; a read that finds another one running waits this
 # long for its turn, then answers busy. A timed-out call cannot be stopped in-process, so while it
@@ -144,40 +165,109 @@ def _first_imports(before, own=None):
                   if not any(name[:i] in fresh for i, char in enumerate(name) if char == '.'))
 
 
+# What ``lstat`` found where a plugin file or directory was expected, in the words a refused row shows.
+_KINDS = ((stat.S_ISLNK, 'a symbolic link (links are not followed)'), (stat.S_ISFIFO, 'a FIFO (named pipe)'),
+          (stat.S_ISSOCK, 'a socket'), (stat.S_ISCHR, 'a character device'), (stat.S_ISBLK, 'a block device'),
+          (stat.S_ISDIR, 'a directory'), (stat.S_ISREG, 'a regular file'))
+DIRECTORY_REFUSED = 'must be an operator-owned directory, not group/other writable'
+
+
+def _kind(mode):
+    return next((words for test, words in _KINDS if test(mode)), 'not a regular file')
+
+
+def plugin_directory_verdict(path):
+    """Whether any file under the plugin directory ``path`` may be read at all.
+
+    ``None`` when it may: a real directory (not a link), owned by this user, that neither group nor
+    other can write. Otherwise the ``PluginRefused`` (``plugin_directory_untrusted``) whose words say
+    what was found there. It looks with ``lstat`` only and opens nothing. Every reader of a plugin file
+    goes through it: ``_read_owned`` asks it about the file's own directory before it looks at the
+    file, and ``PluginHost`` asks it (through ``_directory_refusal``, which remembers a refusal for the
+    rest of the run) before the loader, a plugin row or the label lookup reads anything there.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return PluginRefused('plugin_directory_untrusted', DIRECTORY_REFUSED + '; found: nothing at that path')
+    except OSError as exc:
+        return PluginRefused('plugin_directory_untrusted', f'{DIRECTORY_REFUSED}; found: {type(exc).__name__}')
+    if not stat.S_ISDIR(info.st_mode):
+        found = [_kind(info.st_mode)]
+    else:
+        found = [words for wrong, words in ((info.st_uid != os.geteuid(), 'owned by another user'),
+                                            (info.st_mode & 0o020, 'group-writable'),
+                                            (info.st_mode & 0o002, 'other-writable')) if wrong]
+    if not found:
+        return None
+    return PluginRefused('plugin_directory_untrusted', '%s; found: %s' % (DIRECTORY_REFUSED, ', '.join(found)))
+
+
+def _check_owned(name, info, limit):
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise PluginRefused('plugin_file_untrusted',
+                            f'{name}: must be an operator-owned regular file, not group/other writable')
+    if info.st_size > limit:
+        raise PluginRefused('plugin_file_too_large', f'{name}: {info.st_size} bytes, over the {limit}-byte limit; '
+                                                     'nothing was read')
+
+
 def _read_owned(path, limit, *, missing_ok=False):
-    """Bytes of an operator-owned regular file nobody else can write, or a typed refusal."""
+    """Bytes of an operator-owned regular file nobody else can write, or a typed refusal. It never waits.
+
+    The one function that opens a plugin file. The file's directory must pass
+    ``plugin_directory_verdict`` first. Then the entry is looked at without following a link
+    (``lstat``): a FIFO, a socket, a device, a directory or a link is refused and never opened, and so
+    is a file another user owns or can write, or one larger than ``limit``. The open adds
+    ``O_NONBLOCK``, so not even an entry swapped in after the look can make it wait, and the file that
+    was opened must be the entry that was looked at (``st_dev`` and ``st_ino``) before a byte is read.
+    """
     # Same shape as subscription_routes.policy._check_home: a typed refusal before any
     # file is opened. Windows has no O_NOFOLLOW; a no-follow open for it is not this round,
     # so install refuses instead of dropping the guard (no default of 0, no open without it).
     if os.name == 'nt' or not hasattr(os, 'O_NOFOLLOW'):
         raise PluginRefused('platform_unsupported', 'O_NOFOLLOW is missing; no plugin file is read')
+    if not hasattr(os, 'O_NONBLOCK'):
+        raise PluginRefused('platform_unsupported', 'O_NONBLOCK is missing; no plugin file is read')
+    path = Path(path)
+    refusal = plugin_directory_verdict(path.parent)
+    if refusal is not None:
+        if missing_ok and not os.path.lexists(path.parent):
+            return None
+        raise refusal
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        seen = os.lstat(path)
     except FileNotFoundError:
         if missing_ok:
             return None
-        raise PluginRefused('plugin_file_missing', Path(path).name) from None
+        raise PluginRefused('plugin_file_missing', path.name) from None
     except OSError as exc:
-        raise PluginRefused('plugin_file_unreadable', f'{Path(path).name}: {type(exc).__name__}') from None
+        raise PluginRefused('plugin_file_unreadable', f'{path.name}: {type(exc).__name__}') from None
+    if stat.S_ISLNK(seen.st_mode):
+        # The code a no-follow open has always given a link; the words now say what was found.
+        raise PluginRefused('plugin_file_unreadable', f'{path.name}: {_kind(seen.st_mode)}; it was not opened')
+    if not stat.S_ISREG(seen.st_mode):
+        raise PluginRefused('plugin_file_untrusted',
+                            f'{path.name}: {_kind(seen.st_mode)}, not a regular file; it was not opened')
+    _check_owned(path.name, seen, limit)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise PluginRefused('plugin_file_missing', path.name) from None
+    except OSError as exc:
+        raise PluginRefused('plugin_file_unreadable', f'{path.name}: {type(exc).__name__}') from None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        if (info.st_dev, info.st_ino) != (seen.st_dev, seen.st_ino):
             raise PluginRefused('plugin_file_untrusted',
-                                f'{Path(path).name}: must be an operator-owned regular file, not group/other writable')
-        if info.st_size > limit:
-            raise PluginRefused('plugin_file_too_large', Path(path).name)
+                                f'{path.name}: changed between the look and the open; nothing was read')
+        _check_owned(path.name, info, limit)
         with os.fdopen(os.dup(fd), 'rb') as handle:
             return handle.read(limit + 1)
     finally:
         os.close(fd)
-
-
-def _owned_directory(path):
-    try:
-        info = os.lstat(path)
-    except OSError:
-        return False
-    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022
 
 
 def _registry_labels(value):
@@ -193,6 +283,31 @@ def _registry_labels(value):
     return labels
 
 
+def _no_install():
+    """What an install with no install.json gives: no trusted key, no grant, no reserved effect, no anchor, no label."""
+    return {'trusted_keys': {}, 'grants': {}, 'reserved': ReservedEffects(), 'authority_anchor': None,
+            'registry_labels': {}}
+
+
+def _repair(path, detail):
+    """What to do about the refused directory ``path`` whose refusal says ``detail``.
+
+    A shell command is given only where it is exact: when the mode alone is wrong, as
+    ``chmod go-w -- <path quoted for a POSIX shell>``, so a space stays inside the one argument and a
+    leading dash is not read as an option. A path with a line break or another control character
+    would not stay one line, so it gets plain words and no command.
+    """
+    words = 'make %s a directory of your own (not a link) that group and other cannot write' % path
+    found = set(detail.rpartition('; found: ')[2].split(', '))
+    if not found <= _MODE_ONLY:
+        return words
+    text = os.fsdecode(path)
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        return words + (' (its path holds a line break or another control character, so no command is printed: '
+                        'take the write permission of group and other off that directory)')
+    return words + ' (only its mode is wrong: chmod go-w -- %s)' % shlex.quote(text)
+
+
 def read_install(directory):
     """Parse ``install.json``. With no file: no trusted key, no grant and no label.
 
@@ -203,8 +318,7 @@ def read_install(directory):
     """
     raw = _read_owned(Path(directory) / INSTALL_FILE, MAX_INSTALL_BYTES, missing_ok=True)
     if raw is None:
-        return {'trusted_keys': {}, 'grants': {}, 'reserved': ReservedEffects(), 'authority_anchor': None,
-                'registry_labels': {}}
+        return _no_install()
     try:
         data = json.loads(raw.decode('utf-8'))
     except (ValueError, RecursionError):
@@ -271,6 +385,17 @@ class PluginHost:
         self.health = CoreHealth()
         self.loader = self.core = self.gate = self.authority = self._trust = None
         self._labels = {}
+        # A plugin directory refused once is never read again in this run: str(path) -> (code, detail).
+        self._refused_dirs = {}
+        self._dirs_lock = threading.Lock()
+        # install.json as read for the rows when the constructor did not read it, keyed by its lstat marker.
+        self._install_refusal = None
+        # The refusal of the install directory when install.json was not read because of it, else None.
+        self._install_unread = None
+        self._install_view, self._install_marker = ({}, False), _UNREAD
+        # The run's own sentence while install.json is not read because its directory is refused, else None.
+        self.install_file = None
+        self._install_lock = threading.Lock()
         self.records, self.registries = [], ()
         self.pending_approvals = collections.deque(maxlen=64)  # (approval id, digest) drawn, newest last
         self._operators = {}
@@ -290,6 +415,23 @@ class PluginHost:
             return
         try:
             install = read_install(self._config)
+        except PluginRefused as exc:
+            self._install_refusal = exc.code
+            detail = exc.detail
+            if exc.code == 'plugin_directory_untrusted':
+                # The one opener refused install.json's own directory, so the file was not opened. The reserved
+                # effects, grants and trusted keys it may hold cannot be checked, so no plugin is loaded, wherever
+                # its own directory lies, and none of its code runs: each row says why and what to do.
+                self._install_unread = exc
+                detail = self._install_words(exc)
+                self._say_install_unread(exc)
+            else:
+                log.error('no plugin can load: %s: %s', exc.code, detail)
+            self._refuse_all(sources, exc.code, detail)
+            return
+        # The label is not a gate: it is on the host before the trust store can refuse below.
+        self._labels = install['registry_labels']
+        try:
             self._trust = TrustStore(install['trusted_keys'], revocation_store=self._revocation_store())
         except (PluginRefused, Refused) as exc:
             log.error('no plugin can load: %s', exc)
@@ -299,7 +441,6 @@ class PluginHost:
             log.error('no plugin can load: revocation_store_invalid: %s', type(exc).__name__)
             self._refuse_all(sources, 'revocation_store_invalid', type(exc).__name__)
             return
-        self._labels = install['registry_labels']
         self.loader = PluginLoader(self._trust, install['grants'], install['reserved'], self.health, self._gil)
         self._compose_core(install, breaker)
         for source in sources:
@@ -309,14 +450,41 @@ class PluginHost:
     # -- discovery ------------------------------------------------------------------------------
     def _sources(self, plugin_dirs):
         found = []
+        refusal = self._directory_refusal(self._config) if os.path.lexists(self._config) else None
+        if refusal is not None:
+            self._say_install_unread(refusal)
         if self._config.is_dir():
-            if not _owned_directory(self._config):
-                log.error('plugin directory %s is not operator-owned or is group/other writable; ignored', self._config)
+            if refusal is not None:
                 self.records.append({'source': str(self._config), 'plugin_id': None, 'state': 'refused',
-                                     'code': 'plugin_directory_untrusted', 'detail': 'install directory', 'findings': []})
+                                     'code': 'plugin_directory_untrusted',
+                                     'detail': 'install directory %s %s; neither its install.json nor any plugin '
+                                     'in it was read, and no plugin is loaded while it is so; %s, then restart the '
+                                     'daemon' % (self._config, refusal.detail, _repair(self._config, refusal.detail)),
+                                     'findings': []})
             else:
                 found += sorted(p for p in self._config.iterdir() if p.is_dir() or p.is_symlink())
         return found + [Path(p) for p in plugin_dirs]
+
+    def _say_install_unread(self, refusal):
+        """The run says it once, at the start and in its status: install.json was not read, so no plugin was
+        loaded, the install directory by its whole path, what was found and the repair."""
+        if self.install_file is None:
+            self.install_file = INSTALL_UNREAD_RUN % (self._config, refusal.detail, _repair(self._config, refusal.detail))
+            log.error('%s', self.install_file)
+
+    def _directory_refusal(self, path):
+        """``plugin_directory_verdict`` for this run. A directory refused once stays refused: no row,
+        status or label lookup of this run reads it again, whatever it looks like later."""
+        key = str(path)
+        with self._dirs_lock:
+            known = self._refused_dirs.get(key)
+        if known is None:
+            refusal = plugin_directory_verdict(path)
+            if refusal is None:
+                return None
+            with self._dirs_lock:
+                known = self._refused_dirs.setdefault(key, (refusal.code, refusal.detail))
+        return PluginRefused(*known)
 
     def _refuse_all(self, sources, code, detail):
         for source in sources:
@@ -356,9 +524,9 @@ class PluginHost:
         # that appear between here and the end of this load were first imported for this plugin.
         before = set(sys.modules)
         try:
-            if not _owned_directory(source):
-                raise PluginRefused('plugin_directory_untrusted',
-                                    'must be an operator-owned directory, not group/other writable')
+            refusal = self._directory_refusal(source)
+            if refusal is not None:
+                raise refusal
             manifest = _read_owned(source / MANIFEST, MAX_MANIFEST_BYTES)
             artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES, missing_ok=True)
             signature = _read_owned(source / SIGNATURE, 4096, missing_ok=True)
@@ -476,13 +644,23 @@ class PluginHost:
                 item['permissions'] = list(self.loader.permissions(item['plugin_id']))  # after a revoke or a poison
                 item.update(self._degraded_fields(item['plugin_id']))
             plugins.append(item)
-        return {'plugins': plugins, 'verification': self.verification, 'core_poisoned': self.health.poisoned,
-                'authority_profile': self.authority_state, 'approvals_drawn': len(self.pending_approvals),
-                'approval_surface': 'none: no surface can approve or veto yet, so no effect is authorized',
-                'containment': 'none: plugins run in the daemon process and uid'}
+        answer = {'plugins': plugins, 'verification': self.verification, 'core_poisoned': self.health.poisoned,
+                  'authority_profile': self.authority_state, 'approvals_drawn': len(self.pending_approvals),
+                  'approval_surface': 'none: no surface can approve or veto yet, so no effect is authorized',
+                  'containment': 'none: plugins run in the daemon process and uid'}
+        if self.install_file is not None:
+            answer['install_file'] = self.install_file  # present only while install.json is not read for its directory
+        return answer
 
     def route_records(self):
-        """The plugin rows of the GUI's inventory: what loaded, what was refused and why."""
+        """The plugin rows of the GUI's inventory: what loaded, what was refused and why.
+
+        Each row names the registry label as text: verified, non-verified or unlisted,
+        and says it is a label, not a gate. The core writes that text. The label is
+        not a permission and does not decide whether the plugin loaded. A refused row
+        whose label could not be read says it was not read and why. Nothing here reads
+        a file in a directory that was refused, and nothing here can wait on a file.
+        """
         rows = []
         for record in self.records:
             name = record['plugin_id'] or Path(record['source']).name
@@ -495,10 +673,86 @@ class PluginHost:
                     note += '; degraded: ' + degraded['degraded']
             else:
                 note = 'refused: %s%s' % (record['code'], ': ' + record['detail'] if record['detail'] else '')
+            stored = record.get('registry_label')
+            if stored not in _SHOWN and stored not in _NOT_READ:
+                stored = self._refused_row_label(record)
+            shown = stored if stored in _NOT_READ else _SHOWN.get(stored, 'unlisted')
+            note += self._not_read_words(record, shown)
+            note += '; registry label: %s; a label, not a gate' % shown
             rows.append({'id': 'plugin:' + _SAFE_ID.sub('_', name)[:80], 'class': 'plugin', 'sign_in': '',
                          'configured': record['state'] == 'loaded', 'maturity': 'beta', 'beta': True, 'bars': {},
                          'blocker': note})
         return rows
+
+    def _not_read_words(self, record, shown):
+        """Why a row's label was not read, where the row does not already say it, and what to do.
+        Nothing is opened: the directory refusals are the remembered ones."""
+        words, detail = '', record.get('detail', '')
+        if shown == NOT_READ_DIRECTORY:
+            refusal = self._directory_refusal(Path(record['source']))
+            if (refusal is not None and (record.get('code'), detail) != (refusal.code, refusal.detail)
+                    and '%s %s' % (record['source'], refusal.detail) not in detail):
+                words = '; the plugin directory %s %s' % (record['source'], refusal.detail)
+            words += '; ' + DIRECTORY_REREAD
+        if record.get('source') == str(self._config):
+            return words  # the install directory's own row already says what was not read and what to do
+        refusal = self._install_unread
+        if refusal is None and shown in (NOT_READ_DIRECTORY, NOT_READ_INSTALL) and os.path.lexists(self._config):
+            refusal = self._directory_refusal(self._config)
+        if refusal is not None and refusal.code == 'plugin_directory_untrusted':
+            install = self._install_words(refusal)
+            if install not in detail:
+                words += '; ' + install
+        return words
+
+    def _install_words(self, refusal):
+        """The words of every plugin row while install.json is not read because its directory is refused."""
+        return INSTALL_NOT_READ % (self._config, refusal.detail, _repair(self._config, refusal.detail))
+
+    def _refused_row_label(self, record):
+        """The label of a row that does not carry the loader's: ``verified``, ``non_verified``, ``None``
+        (unlisted) or a not-read phrase. The words come from the installer's map for these manifest
+        bytes, never from the plugin, and only after the row's directory passed the one verdict."""
+        source = record.get('source')
+        if not isinstance(source, str):
+            return None
+        if self._directory_refusal(Path(source)) is not None:
+            return NOT_READ_DIRECTORY
+        labels, refused = self._row_labels()
+        if refused:
+            return NOT_READ_INSTALL
+        if not labels:
+            return None
+        try:
+            manifest = _read_owned(Path(source) / MANIFEST, MAX_MANIFEST_BYTES)
+        except PluginRefused:
+            return NOT_READ_MANIFEST
+        return labels.get(hashlib.sha256(manifest).hexdigest())
+
+    def _row_labels(self):
+        """``(labels, refused)`` for the rows. Read only when a row needs a label, and at most once
+        per change of install.json (its ``lstat`` marker), never once per request."""
+        if self.verification == 'available' or self._install_refusal is not None:
+            # The constructor read install.json, or tried and was refused.
+            return self._labels, self._install_refusal is not None
+        # Verification is unavailable, so the constructor did not read the file: read it for display only.
+        if not os.path.lexists(self._config):
+            return {}, False
+        if self._directory_refusal(self._config) is not None:
+            return {}, True
+        try:
+            seen = os.lstat(self._config / INSTALL_FILE)
+            marker = (seen.st_dev, seen.st_ino, seen.st_size, seen.st_mtime_ns, seen.st_ctime_ns, seen.st_mode)
+        except OSError:
+            marker = None
+        with self._install_lock:
+            if marker != self._install_marker:
+                try:
+                    view = (read_install(self._config)['registry_labels'], False)
+                except PluginRefused:
+                    view = ({}, True)
+                self._install_view, self._install_marker = view, marker
+            return self._install_view
 
     def _degraded_fields(self, plugin_id):
         with self._turn:

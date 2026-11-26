@@ -182,10 +182,52 @@ jobs:
         shell: bash
         run: 'python -P -m pip install --only-binary=:all: -r "$REQUIREMENTS_CI"'
 
+      # The live tests of process handling run only inside a slice of the
+      # runner user's own systemd user manager; outside one they skip. This
+      # step turns on lingering for the runner user through the runner's sudo,
+      # starts user@<uid>.service, waits until the manager answers and a scope
+      # in gate.slice starts and reports a cgroup under that slice, prints that
+      # cgroup to the log, then hands the runtime folder to later steps
+      # through the job's environment file. Bounds: 30 s on each sudo call,
+      # 5 s on each manager call, at most 30 tries one second apart (under
+      # seven minutes at worst, inside the job's 15). No manager: the job stops
+      # here with an error; the gate never runs outside the manager.
+      - name: Start the user service manager
+        run: |
+          uid="$(id -u)"
+          user="$(id -un)"
+          runtime="/run/user/$uid"
+          tries=30
+          up=
+          cgroup=
+          if sudo -n timeout 30 loginctl enable-linger "$user" &&
+             sudo -n timeout 30 systemctl start "user@$uid.service"; then
+            for try in $(seq "$tries"); do
+              if XDG_RUNTIME_DIR="$runtime" timeout 5 systemctl --user show-environment >/dev/null 2>&1 &&
+                 cgroup="$(XDG_RUNTIME_DIR="$runtime" timeout 5 systemd-run --user --scope --quiet --slice=gate.slice -- cat /proc/self/cgroup 2>/dev/null)" &&
+                 [[ "$cgroup" == *"/user@$uid.service/gate.slice/"* ]]; then
+                up=1
+                break
+              fi
+              if [ "$try" -lt "$tries" ]; then
+                sleep 1
+              fi
+            done
+          fi
+          if [ -z "$up" ]; then
+            echo "::error::The systemd user manager of $user (user@$uid.service) did not start, or did not answer systemctl --user show-environment and start a scope in gate.slice, within $tries tries. Without it the live tests of process handling would skip, so the job stops before the gate. Rerun the job; if this repeats, the runner image no longer starts a user manager for its user."
+            exit 1
+          fi
+          echo "A scope of gate.slice runs in $cgroup; the gate runs in a scope beside it."
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          if [ -S "$runtime/bus" ]; then
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
+          fi
+
       - name: Provider-free gate
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: python -X utf8 -B tools/ci_gate.py --force
+        run: systemd-run --user --scope --quiet --slice=gate.slice -- python -X utf8 -B tools/ci_gate.py --force
 
       # Same job and runner as the gate. Slowdowns warn; a crash, timeout, or
       # missing measurement is advisory. `timeout 55` keeps || runnable;

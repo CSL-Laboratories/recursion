@@ -9,11 +9,17 @@ regular file, with O_NONBLOCK, and only the entry it looked at.
 Planted here: a FIFO, a socket file (it stands in for a device and needs no root; a character
 device only when the tests run as root), a link out of the directory and a sparse file larger than
 the manifest limit. Each call is bounded by PLUGIN_READ_GUARD_SECONDS.
+
+While install.json is not read because its directory is refused (group- or other-writable, a link,
+a link to a link, not a directory), no plugin is loaded and none of its code runs: the reserved
+effects that file may hold could not be checked. Each plugin.py of those cases writes a marker
+when it runs, and the marker must stay absent.
 """
 import ast
 import hashlib
 import os
 from pathlib import Path
+import shlex
 import shutil
 import stat
 import sys
@@ -25,6 +31,7 @@ from unittest import mock
 
 from recursion_core.daemon import plugins
 from recursion_core.daemon.tests import plugin_fixture as fx
+from recursion_core.plugin_security import canonical
 from recursion_core.plugin_security.tests.support import FakeGilProbe
 
 # The bound of every call below; a call that has not answered by then waited on a file. It becomes the
@@ -46,6 +53,17 @@ NOT_READ_MANIFEST = 'not read (manifest.json was refused)'
 NOT_READ_INSTALL = 'not read (install.json or its directory was refused)'
 REREAD = 'a directory repaired after the daemon started is read again only after a restart of the daemon'
 GROUP_WRITABLE = 'must be an operator-owned directory, not group/other writable; found: group-writable'
+NOT_CHECKED = ('so the reserved effects, grants and trusted keys written in it could not be checked, and no plugin '
+               'is loaded while it is so; ')
+NOTHING_IN_IT = 'neither its install.json nor any plugin in it was read, and no plugin is loaded while it is so; '
+# The four plugins of the install directory cases: one names a reserved host, one a reserved credential prefix,
+# one has a grant, one names neither. (name, permissions, network destinations, credential refs, granted)
+FOUR = (('res', ('network',), ('api.reserved.example:443',), (), True),
+        ('cred', ('credential',), (), ('vault/token',), True),
+        ('grant', ('panel',), (), (), True),
+        ('plain', ('panel',), (), (), False))
+LOOSENED = {'gw': 'group-writable', 'ow': 'other-writable', 'link': 'a symbolic link', 'link2': 'a symbolic link',
+            'file': 'a regular file'}
 PLUGINS_PY = Path(plugins.__file__).resolve()
 PACKAGE = PLUGINS_PY.parent.parent
 
@@ -199,7 +217,7 @@ class PluginReadGuardTests(unittest.TestCase):
         self.assertEqual(self.opened_under(directory), [])
 
     # -- an install directory others can write ---------------------------------------------------------
-    def test_a_plugin_named_outside_an_install_directory_others_can_write_loads_without_install_json(self):
+    def test_a_plugin_named_outside_an_install_directory_others_can_write_is_refused_and_says_why(self):
         for available in (True, False):
             with self.subTest(verification_available=available):
                 self.count += 1
@@ -220,29 +238,207 @@ class PluginReadGuardTests(unittest.TestCase):
                 self.addCleanup(host.close)
                 rows = {r['id']: r['blocker'] for r in self.bounded('the plugin rows', host.route_records)}
                 self.assertNotIn(str(installed / 'install.json'), self.opened)
-                mine = rows['plugin:fixture.mine' if available else 'plugin:mine']
-                unread = ('install.json was not read: the install directory %s %s; so no trusted key, grant, '
-                          'reserved effect, authority anchor or registry label came from it; to have them, make %s '
-                          'a directory you own that group and other cannot write (chmod go-w %s when only its mode '
-                          'is wrong), then restart the daemon' % (installed, GROUP_WRITABLE, installed, installed))
-                self.assertIn('; ' + unread + '; registry label: ' + NOT_READ_INSTALL + TAIL, mine)
+                self.assertEqual(self.opened_under(own), [])
+                mine = rows['plugin:mine']
+                repair = ('make %s a directory of your own (not a link) that group and other cannot write (only its '
+                          'mode is wrong: chmod go-w -- %s), then restart the daemon' % (installed, shlex.quote(str(installed))))
+                unread = 'install.json was not read: the install directory %s %s; ' % (installed, GROUP_WRITABLE)
+                self.assertIn(unread + NOT_CHECKED + repair + '; registry label: ' + NOT_READ_INSTALL + TAIL, mine)
                 self.assertTrue(mine.endswith('; registry label: ' + NOT_READ_INSTALL + TAIL), mine)
-                if available:
-                    # it loads as it did before, but nothing of the file others can write is taken: no grant
-                    record = next(r for r in host.records if r['source'] == str(own))
-                    self.assertEqual((record['state'], record['trust'], record['permissions']),
-                                     ('loaded', 'unsigned', []))
-                    self.assertTrue(mine.startswith('loaded unsigned; permissions: none; '), mine)
-                    self.assertEqual(host.status('fixture.mine')['plugin']['registry_label'], NOT_READ_INSTALL)
-                else:
-                    self.assertTrue(mine.startswith('refused: plugin_verification_unavailable: '), mine)
+                # refused before its code runs, with no grant, wherever its own directory lies
+                record = next(r for r in host.records if r['source'] == str(own))
+                code = 'plugin_directory_untrusted' if available else 'plugin_verification_unavailable'
+                self.assertEqual((record['state'], record['code'], record['plugin_id']), ('refused', code, None))
+                self.assertTrue(mine.startswith('refused: %s: ' % code), mine)
+                self.assertIsNone(host.loader)
                 # its own directory is not blamed; the install directory's own row names it and what to do
                 self.assertNotIn('the plugin directory %s' % own, mine)
                 self.assertNotIn(str(own), mine)
                 self.assertIn('refused: plugin_directory_untrusted: install directory %s %s; ' % (installed, GROUP_WRITABLE)
-                              + 'no plugin in it and not its install.json was read; make it a directory you own that '
-                              'group and other cannot write (chmod go-w %s when only its mode is wrong), then '
-                              'restart the daemon' % installed, rows['plugin:plugins'])
+                              + NOTHING_IN_IT + repair, rows['plugin:plugins'])
+
+    def four(self, form, *, inner=False, broken=False):
+        """The four plugins named by --plugin, and an install.json that reserves the host and the credential
+        prefix two of them name, grants three of them and labels one, with its directory in ``form``.
+
+        Forms: sound; nofile (a sound directory, no install.json); absent (no install directory); gw and ow
+        (group- or other-writable); link and link2 (a link to a sound directory, a link to a link); file (a
+        regular file where the directory should be). ``inner``: the plugins lie inside the install directory.
+        ``broken``: one more plugin whose manifest is not JSON, which the loader would refuse for its own reason.
+        Returns (config, plugin directories, marker directory, the directory install.json is in or None)."""
+        self.count += 1
+        root = self.tmp / ('four-%d' % self.count)
+        config, marks = root / 'recursion', root / 'marks'
+        marks.mkdir(parents=True, mode=0o700)
+        config.mkdir(parents=True, mode=0o700)
+        home = config / 'plugins' if inner else root / 'own'
+        dirs, grants, labels = [], [], {}
+        for name, permissions, destinations, credentials, granted in FOUR:
+            source = ('open(%r, "w").close()\n' % str(marks / name)).encode() + SOURCE
+            manifest = canonical({'schema': 'csl-plugin-manifest/vNext', 'plugin_id': 'four.' + name,
+                                  'version': '1.0.0', 'artifact_sha256': _digest(source),
+                                  'dependency_lock_sha256': '0' * 64, 'install_scripts': [],
+                                  'developer_key': fx.FAKE_DEVELOPER_KEY, 'permissions': list(permissions),
+                                  'network_destinations': list(destinations), 'credential_refs': list(credentials)})
+            fx.write_plugin(home / name, source, manifest=manifest)
+            dirs.append(home / name)
+            if granted:
+                grants.append(fx.grant_for(source, plugin_id='four.' + name, permissions=permissions))
+            if name == 'grant':
+                labels[_digest(manifest)] = 'verified'
+        if broken:
+            fx.write_plugin(home / 'broken', SOURCE, manifest=b'not JSON')
+            dirs.append(home / 'broken')
+        content = dict(grants=grants, reserved={'hosts': ['reserved.example'], 'credential_prefixes': ['vault/']},
+                       registry_labels=labels)
+        installed = None
+        if form in ('sound', 'gw', 'ow'):
+            installed = fx.write_install(config, **content)
+            if form != 'sound':
+                os.chmod(installed, 0o770 if form == 'gw' else 0o702)
+        elif form == 'nofile':
+            (config / 'plugins').mkdir(mode=0o700, exist_ok=True)
+            os.chmod(config / 'plugins', 0o700)
+        elif form in ('link', 'link2'):
+            installed = fx.write_install(root / 'elsewhere', **content)
+            if form == 'link':
+                os.symlink(installed, config / 'plugins')
+            else:
+                os.symlink(installed, root / 'middle')
+                os.symlink(root / 'middle', config / 'plugins')
+        elif form == 'file':
+            (config / 'plugins').write_text('{}')
+            os.chmod(config / 'plugins', 0o600)
+        return config, dirs, marks, installed
+
+    def build(self, config, dirs, available=True):
+        def make():
+            with self.assertLogs('recursion_core.daemon.plugins', 'INFO'):
+                return plugins.PluginHost(config, config.parent / 'state', plugin_dirs=dirs, gil_probe=FakeGilProbe(),
+                                          verification_available=lambda: available)
+        host = self.bounded('the daemon start (PluginHost)', make)
+        self.addCleanup(host.close)
+        return host
+
+    def rows_of(self, host):
+        rows = {r['id']: r['blocker'] for r in self.bounded('the plugin rows', host.route_records)}
+        self.bounded('status', lambda: host.status('four.res'))
+        self.bounded('inventory', host.inventory)
+        return rows
+
+    def assert_refused_and_never_run(self, form, config, dirs, marks, host, rows, available):
+        self.assertEqual(sorted(p.name for p in marks.iterdir()), [], 'plugin code ran')
+        self.assertIsNone(host.loader)
+        self.assertEqual([p for p in self.opened if p.endswith(os.sep + 'install.json')], [])  # never opened
+        code = 'plugin_directory_untrusted' if available else 'plugin_verification_unavailable'
+        unread = 'install.json was not read: the install directory %s %s; found: %s' % (
+            config / 'plugins', plugins.DIRECTORY_REFUSED, LOOSENED[form])
+        for own in dirs:
+            with self.subTest(plugin=own.name):
+                self.assertEqual(self.opened_under(own), [])
+                record = next(r for r in host.records if r['source'] == str(own))
+                self.assertEqual((record['state'], record['code'], record['plugin_id']), ('refused', code, None))
+                row = rows['plugin:' + own.name]
+                self.assertTrue(row.startswith('refused: %s: ' % code), row)
+                self.assertIn(unread, row)
+                self.assertIn(NOT_CHECKED, row)
+                self.assertIn(', then restart the daemon; registry label: ', row)
+                self.assertEqual(row.count('install.json was not read'), 1, row)
+                self.assertNotIn('unlisted', row)
+                self.assertTrue(row.endswith('; registry label: ' + NOT_READ_INSTALL + TAIL), row)
+        if form != 'file':  # discovery finds the install directory itself and gives it its own row
+            self.assertIn('refused: plugin_directory_untrusted: install directory %s ' % (config / 'plugins'),
+                          rows['plugin:plugins'])
+            self.assertIn(NOTHING_IN_IT, rows['plugin:plugins'])
+
+    def test_an_install_directory_refused_for_its_mode_or_kind_loads_no_plugin_and_runs_none(self):
+        for form in LOOSENED:
+            for available in (True, False):
+                with self.subTest(form=form, verification_available=available):
+                    config, dirs, marks, _ = self.four(form)
+                    host = self.build(config, dirs, available)
+                    rows = self.rows_of(host)
+                    self.assert_refused_and_never_run(form, config, dirs, marks, host, rows, available)
+
+    def test_a_plugin_inside_the_refused_install_directory_is_refused_like_every_other(self):
+        for form in ('gw', 'ow'):
+            with self.subTest(form=form):
+                config, dirs, marks, installed = self.four(form, inner=True)
+                self.assertTrue(all(own.parent == installed for own in dirs))
+                host = self.build(config, dirs)
+                rows = self.rows_of(host)
+                self.assert_refused_and_never_run(form, config, dirs, marks, host, rows, True)
+
+    def test_a_plugin_refused_for_its_own_reason_under_an_unread_install_json_says_not_read(self):
+        for form in ('gw', 'link'):
+            for available in (True, False):
+                with self.subTest(form=form, verification_available=available):
+                    config, dirs, marks, _ = self.four(form, broken=True)
+                    host = self.build(config, dirs, available)
+                    rows = self.rows_of(host)
+                    self.assert_refused_and_never_run(form, config, dirs, marks, host, rows, available)
+                    self.assertTrue(rows['plugin:broken'].endswith('; registry label: ' + NOT_READ_INSTALL + TAIL))
+
+    def test_with_a_sound_install_directory_or_none_the_four_plugins_load_as_before(self):
+        reserved = {'res': ('refused', 'reserved_destination', None), 'cred': ('refused', 'reserved_credential', None),
+                    'grant': ('loaded', None, ['panel']), 'plain': ('loaded', None, [])}
+        unrestricted = {name: ('loaded', None, []) for name, *_ in FOUR}
+        for form, expected in (('sound', reserved), ('nofile', unrestricted), ('absent', unrestricted)):
+            with self.subTest(form=form):
+                config, dirs, marks, _ = self.four(form)
+                host = self.build(config, dirs)
+                rows = self.rows_of(host)
+                got = {Path(r['source']).name: (r['state'], r['code'], r.get('permissions')) for r in host.records}
+                self.assertEqual(got, expected)
+                ran = sorted(name for name, (state, _, _) in expected.items() if state == 'loaded')
+                self.assertEqual(sorted(p.name for p in marks.iterdir()), ran)
+                self.assertTrue(all('install.json was not read' not in row for row in rows.values()), rows)
+                label = 'verified' if form == 'sound' else 'unlisted'
+                self.assertTrue(rows['plugin:four.grant'].endswith('; registry label: %s%s' % (label, TAIL)))
+
+    def test_the_repair_command_is_one_exact_command_or_none(self):
+        for case in ('space', 'dash', 'newline'):
+            with self.subTest(case=case):
+                self.count += 1
+                own = self.tmp / ('own-%d' % self.count) / 'mine'
+                fx.write_plugin(own, SOURCE, plugin_id='fixture.mine', permissions=('panel',))
+                if case == 'dash':  # a relative configuration directory that begins with a dash, as given
+                    work = self.tmp / ('cwd-%d' % self.count)
+                    work.mkdir(mode=0o700)
+                    previous = os.getcwd()
+                    os.chdir(work)
+                    self.addCleanup(os.chdir, previous)
+                    config = Path('-x') / 'recursion'
+                else:
+                    config = self.tmp / ('sp ace-%d' % self.count if case == 'space' else 'line\nbreak-%d' % self.count) / 'recursion'
+                installed = fx.write_install(config, grants=[])
+                os.chmod(installed, 0o770)
+                host = self.build(config, [own])
+                rows = self.rows_of(host)
+                path = str(config / 'plugins')
+                for row in (rows['plugin:plugins'], rows['plugin:mine']):
+                    if case == 'newline':
+                        self.assertNotIn('chmod', row)
+                        self.assertIn('so no command is printed: take the write permission of group and other off '
+                                      'that directory), then restart the daemon', row)
+                        continue
+                    command = 'chmod go-w -- ' + shlex.quote(path)
+                    self.assertIn('(only its mode is wrong: %s), then restart the daemon' % command, row)
+                    self.assertEqual(row.count('chmod'), 1, row)
+                    # what a POSIX shell makes of it: one command, the options ended, the whole path one argument
+                    self.assertEqual(shlex.split(command), ['chmod', 'go-w', '--', path])
+
+    def test_a_repair_command_is_given_only_when_the_mode_alone_is_wrong(self):
+        path = Path('/run/x')
+        for found, has_command in (('group-writable', True), ('group-writable, other-writable', True),
+                                   ('other-writable', True), ('owned by another user, group-writable', False),
+                                   ('a symbolic link (links are not followed)', False), ('a regular file', False),
+                                   ('nothing at that path', False)):
+            with self.subTest(found=found):
+                words = plugins._repair(path, plugins.DIRECTORY_REFUSED + '; found: ' + found)
+                self.assertTrue(words.startswith('make /run/x a directory of your own (not a link) that group and '
+                                                 'other cannot write'), words)
+                self.assertEqual('chmod go-w -- /run/x' in words, has_command, words)
 
     def test_install_json_in_a_directory_others_can_write_is_refused_never_read_as_no_file(self):
         config = self.tmp / 'gw' / 'recursion'

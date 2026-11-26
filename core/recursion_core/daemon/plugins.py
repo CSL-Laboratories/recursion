@@ -60,6 +60,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shlex
 import sqlite3
 import stat
 import sys
@@ -108,11 +109,12 @@ _NOT_READ = frozenset({NOT_READ_DIRECTORY, NOT_READ_MANIFEST, NOT_READ_INSTALL})
 # A refused directory is remembered for the run, so what a row says it found is what the first look found.
 DIRECTORY_REREAD = ('what was found is what the first look found; a directory repaired after the daemon started '
                     'is read again only after a restart of the daemon')
-# A plugin named outside an install directory others can write loads, but nothing of install.json is taken.
-INSTALL_NOT_READ = ('install.json was not read: the install directory %s %s; so no trusted key, grant, reserved '
-                    'effect, authority anchor or registry label came from it; to have them, make %s a directory '
-                    'you own that group and other cannot write (chmod go-w %s when only its mode is wrong), then '
+# install.json is not read while its directory is refused, so nothing it may hold can be checked: no plugin loads.
+INSTALL_NOT_READ = ('install.json was not read: the install directory %s %s; so the reserved effects, grants and '
+                    'trusted keys written in it could not be checked, and no plugin is loaded while it is so; %s, then '
                     'restart the daemon')
+# The modes a repair command can change. Any other finding (a link, another owner, not a directory) gets words only.
+_MODE_ONLY = frozenset({'group-writable', 'other-writable'})
 _UNREAD = object()
 # O7 reads (ADV2-3). Uncalibrated defaults: a plugin call that has not answered by its deadline is
 # answered 504 and the plugin is marked degraded; a read that finds another one running waits this
@@ -285,6 +287,25 @@ def _no_install():
             'registry_labels': {}}
 
 
+def _repair(path, detail):
+    """What to do about the refused directory ``path`` whose refusal says ``detail``.
+
+    A shell command is given only where it is exact: when the mode alone is wrong, as
+    ``chmod go-w -- <path quoted for a POSIX shell>``, so a space stays inside the one argument and a
+    leading dash is not read as an option. A path with a line break or another control character
+    would not stay one line, so it gets plain words and no command.
+    """
+    words = 'make %s a directory of your own (not a link) that group and other cannot write' % path
+    found = set(detail.rpartition('; found: ')[2].split(', '))
+    if not found <= _MODE_ONLY:
+        return words
+    text = os.fsdecode(path)
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        return words + (' (its path holds a line break or another control character, so no command is printed: '
+                        'take the write permission of group and other off that directory)')
+    return words + ' (only its mode is wrong: chmod go-w -- %s)' % shlex.quote(text)
+
+
 def read_install(directory):
     """Parse ``install.json``. With no file: no trusted key, no grant and no label.
 
@@ -393,16 +414,16 @@ class PluginHost:
             install = read_install(self._config)
         except PluginRefused as exc:
             self._install_refusal = exc.code
-            if exc.code != 'plugin_directory_untrusted':
-                log.error('no plugin can load: %s', exc)
-                self._refuse_all(sources, exc.code, exc.detail)
-                return
-            # The one opener refused install.json's own directory (others can write it), so nothing in that
-            # file is trusted. The plugins named outside it load as with no install.json: no trusted key, no
-            # grant, no reserved effect, no authority anchor and no label, and each row says so.
-            self._install_unread = exc
-            log.error('install.json in %s was not read: %s; plugins load without it', self._config, exc.detail)
-            install = _no_install()
+            detail = exc.detail
+            if exc.code == 'plugin_directory_untrusted':
+                # The one opener refused install.json's own directory, so the file was not opened. The reserved
+                # effects, grants and trusted keys it may hold cannot be checked, so no plugin is loaded, wherever
+                # its own directory lies, and none of its code runs: each row says why and what to do.
+                self._install_unread = exc
+                detail = self._install_words(exc)
+            log.error('no plugin can load: %s: %s', exc.code, detail)
+            self._refuse_all(sources, exc.code, detail)
+            return
         # The label is not a gate: it is on the host before the trust store can refuse below.
         self._labels = install['registry_labels']
         try:
@@ -430,10 +451,10 @@ class PluginHost:
                 log.error('plugin directory %s is not operator-owned or is group/other writable; ignored', self._config)
                 self.records.append({'source': str(self._config), 'plugin_id': None, 'state': 'refused',
                                      'code': 'plugin_directory_untrusted',
-                                     'detail': 'install directory %s %s; no plugin in it and not its install.json '
-                                     'was read; make it a directory you own that group and other cannot write '
-                                     '(chmod go-w %s when only its mode is wrong), then restart the daemon'
-                                     % (self._config, refusal.detail, self._config), 'findings': []})
+                                     'detail': 'install directory %s %s; neither its install.json nor any plugin '
+                                     'in it was read, and no plugin is loaded while it is so; %s, then restart the '
+                                     'daemon' % (self._config, refusal.detail, _repair(self._config, refusal.detail)),
+                                     'findings': []})
             else:
                 found += sorted(p for p in self._config.iterdir() if p.is_dir() or p.is_symlink())
         return found + [Path(p) for p in plugin_dirs]
@@ -511,8 +532,7 @@ class PluginHost:
             log.error('plugin at %s refused: %s; the daemon runs without it', source, exc)
             return record
         record.update(plugin_id=loaded.plugin_id, state='loaded', code=None, trust=loaded.trust,
-                      signer_key_id=loaded.signer_key_id,
-                      registry_label=NOT_READ_INSTALL if self._install_unread is not None else loaded.registry_label,
+                      signer_key_id=loaded.signer_key_id, registry_label=loaded.registry_label,
                       permissions=list(loaded.permissions), artifact_sha256=loaded.artifact_sha256,
                       findings=list(loaded.findings), provides=[], containment='in process, same uid: not contained')
         self._attach(loaded, record)
@@ -651,19 +671,27 @@ class PluginHost:
     def _not_read_words(self, record, shown):
         """Why a row's label was not read, where the row does not already say it, and what to do.
         Nothing is opened: the directory refusals are the remembered ones."""
+        words, detail = '', record.get('detail', '')
         if shown == NOT_READ_DIRECTORY:
             refusal = self._directory_refusal(Path(record['source']))
-            words = ''
-            if refusal is not None and record.get('code') != refusal.code:
+            if (refusal is not None and (record.get('code'), detail) != (refusal.code, refusal.detail)
+                    and '%s %s' % (record['source'], refusal.detail) not in detail):
                 words = '; the plugin directory %s %s' % (record['source'], refusal.detail)
-            return words + '; ' + DIRECTORY_REREAD
-        if shown == NOT_READ_INSTALL:
-            refusal = self._install_unread
-            if refusal is None and os.path.lexists(self._config):
-                refusal = self._directory_refusal(self._config)
-            if refusal is not None and refusal.code == 'plugin_directory_untrusted':
-                return '; ' + INSTALL_NOT_READ % (self._config, refusal.detail, self._config, self._config)
-        return ''
+            words += '; ' + DIRECTORY_REREAD
+        if record.get('source') == str(self._config):
+            return words  # the install directory's own row already says what was not read and what to do
+        refusal = self._install_unread
+        if refusal is None and shown in (NOT_READ_DIRECTORY, NOT_READ_INSTALL) and os.path.lexists(self._config):
+            refusal = self._directory_refusal(self._config)
+        if refusal is not None and refusal.code == 'plugin_directory_untrusted':
+            install = self._install_words(refusal)
+            if install not in detail:
+                words += '; ' + install
+        return words
+
+    def _install_words(self, refusal):
+        """The words of every plugin row while install.json is not read because its directory is refused."""
+        return INSTALL_NOT_READ % (self._config, refusal.detail, _repair(self._config, refusal.detail))
 
     def _refused_row_label(self, record):
         """The label of a row that does not carry the loader's: ``verified``, ``non_verified``, ``None``

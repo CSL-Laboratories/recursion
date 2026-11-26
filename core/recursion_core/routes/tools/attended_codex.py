@@ -1,4 +1,4 @@
-"""Founder-attended Codex tool (lane DRIVER-CX). Run by Lucas, or by a lane for the ``schema`` mode only.
+"""Founder-attended Codex tool (lane DRIVER-CX). Run by the owner, or by a lane for the ``schema`` mode only.
 
 Mode ``schema`` records what the installed Codex says its own app-server protocol is, so that no method or
 field name in ``routes/codex.py`` rests on memory or on a source map. It runs two commands of the installed

@@ -1,4 +1,4 @@
-"""Engine-user invariants for the later cross-uid path (CSL-738 B9, Lucas's Nov 8 call).
+"""Engine-user invariants for the later cross-uid path (CSL-738 B9, the owner's Nov 8 call).
 
 The engine user gets no linger and no systemd user manager; the operator keeps
 linger. Nothing here enables, disables, masks or starts anything: the probe only

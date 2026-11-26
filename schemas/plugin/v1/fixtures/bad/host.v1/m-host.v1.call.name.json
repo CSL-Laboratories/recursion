@@ -1,0 +1,9 @@
+{
+  "type": "call",
+  "id": 1,
+  "args": {
+    "command": {
+      "command": "status"
+    }
+  }
+}

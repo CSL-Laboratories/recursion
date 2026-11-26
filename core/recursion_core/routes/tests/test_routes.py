@@ -75,7 +75,7 @@ class ClaudeCodeTest(unittest.TestCase):
         self.assertTrue(proc.stdin_closed)
 
     def test_subscription_child_env_is_explicit_and_leaves_the_users_sign_in_alone(self) -> None:
-        # Lucas's correction (Nov 7 ~6:34pm PST): "Leave the user's own CLAUDE_CODE_OAUTH_TOKEN and /login
+        # The owner's correction (Nov 7 ~6:34pm PST): "Leave the user's own CLAUDE_CODE_OAUTH_TOKEN and /login
         # alone." The name passes through as the user set it; the API key the parent holds does not.
         h = Harness([claude_ok()])
         h.handle(request())
@@ -88,7 +88,7 @@ class ClaudeCodeTest(unittest.TestCase):
         env = h.launcher.calls[0]["env"]
         self.assertEqual(env["ANTHROPIC_API_KEY"], "route-anthropic")
         self.assertNotEqual(env["ANTHROPIC_API_KEY"], PARENT_ENV["ANTHROPIC_API_KEY"])
-        # Lucas's correction: nothing removes a sign-in method from every run; the key outranks it here.
+        # The owner's correction: nothing removes a sign-in method from every run; the key outranks it here.
         self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "parent-oauth")
 
     def test_typed_rate_limit_event_is_plan_limit_with_reset(self) -> None:

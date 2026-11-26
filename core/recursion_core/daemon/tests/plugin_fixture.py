@@ -83,5 +83,9 @@ def write_install(config_dir, *, trusted=None, grants=(), **extra):
 
 
 def grant_for(source, *, key=None, plugin_id='fixture.operator', permissions=('read', 'panel'), **extra):
+    # A manual grant names the developer key write_plugin puts in an unsigned manifest.
+    # An unbound manual grant is refused before a permission-requesting plugin runs.
+    bound = {} if key is not None else {'developer_key_id': key_id(FAKE_DEVELOPER_KEY)}
     return {'plugin_id': plugin_id, 'artifact_sha256': hashlib.sha256(source).hexdigest(),
-            'signer_key_id': key_id(key.public) if key is not None else None, 'permissions': list(permissions), **extra}
+            'signer_key_id': key_id(key.public) if key is not None else None, 'permissions': list(permissions),
+            **bound, **extra}

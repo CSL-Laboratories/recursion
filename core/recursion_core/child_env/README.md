@@ -65,7 +65,7 @@ POSIX only. On Windows every call refuses with `platform_unsupported`.
 
 ## Auth mode and the route
 
-Decided by Lucas and implemented here (CSLR-D-011; PRODUCT.md 055cc7a5 section 3.3, "Every
+Decided by the owner and implemented here (CSLR-D-011; PRODUCT.md 055cc7a5 section 3.3, "Every
 route starts with an explicit auth mode").
 
 `auth_mode` is required and is exactly one of `subscription`, `api_key`, `cloud_provider`
@@ -209,7 +209,7 @@ Foundry switches are dropped. The child gets one only from the route:
 
 ### Subscription base URL
 
-Decided by Lucas (CSLR-D-011; PRODUCT.md `055cc7a5c793b7135e5d0565dc4198cf96230531`, SHA-256
+Decided by the owner (CSLR-D-011; PRODUCT.md `055cc7a5c793b7135e5d0565dc4198cf96230531`, SHA-256
 `e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`, section 3.3 and the
 full-access passages Q20, O44 and H-06): refuse a subscription base URL by default, allow
 official Anthropic without a prompt, trust a named endpoint once and remember it, and let the

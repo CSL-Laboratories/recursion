@@ -34,7 +34,7 @@ def parse(text: str) -> tuple:
     files: dict = {}
     current = None
     for line in text.splitlines(keepends=True):
-        match = _MARKER.match(line.rstrip("\n"))
+        match = _MARKER.match(line.removesuffix("\r\n").removesuffix("\n"))
         if match:
             current = check_name(match.group(1))
             if current in files:

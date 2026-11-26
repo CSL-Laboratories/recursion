@@ -457,6 +457,61 @@ class AdapterLogTest(unittest.TestCase):
                 self.assertEqual(status['run']['result'][field], 'a\ufffdb')
                 self.assertEqual(result[field], 'a\udc80b')
 
+    def test_a_gui_stop_that_comes_first_stops_a_running_run_with_a_lone_surrogate(self):
+        """The GUI Stop is the first Stop of a running run; the socket Stop after it is a repeat."""
+        from recursion_core.control.api import ControlAPI
+        from recursion_core.control.client import SocketAPI
+        from recursion_core.control.registry import EMPTY, InMemoryRunRegistry
+        from recursion_core.control_transport import UnixControlServer
+
+        for field in ('text', 'detail'):
+            with self.subTest(field=field):
+                result = contract.result('run-one', None, text='done', detail='x')
+                result[field] = 'a\udc80b'
+                registry = InMemoryRunRegistry()
+                cgroup = '/slice/recursion-run-run-one.service'
+                registry.put({'run_id': 'run-one', 'tenant': 't', 'engine': 'claude_code',
+                              'state': 'running', 'cgroup': cgroup,
+                              'started_at': 1.0, 'stop': None, 'start_key': None})
+                requested = []
+                kill = SimpleNamespace(request_stop=requested.append, confirm=lambda group, timeout: EMPTY)
+                api = ControlAPI(registry, kill, mock.Mock(), time.time)
+                unit_registry = mock.Mock()
+                unit_registry.get.side_effect = KeyError('no unit row')
+                control = adapter.DaemonControl(
+                    api, mock.Mock(), SimpleNamespace(registry=unit_registry),
+                    SimpleNamespace(results={'run-one': result}, failures={}), self.root)
+                folder = self.root / ('gui-first-' + field)
+                folder.mkdir()
+                server = UnixControlServer(folder / 'socket', control.handle)
+                server.start()
+                self.addCleanup(server.close)
+                client = SocketAPI(str(server.path), timeout_s=3)
+                status = client.call('run.status', {'run_id': 'run-one'})
+                self.assertEqual(status['code'], 'ok', status)
+                self.assertEqual(status['run']['result'][field], 'a�b')
+                self.assertEqual(registry.get('run-one')['state'], 'running')
+                self.assertEqual(requested, [])
+                with self.assertNoLogs(adapter.log, 'ERROR'):
+                    code, body = control.gui_transport('POST', '/v1/runs/stop', b'{"run_id": "run-one"}')
+                self.assertEqual(code, 200)
+                answer = json.loads(body)
+                self.assertEqual(answer['code'], 'stopped', answer)
+                self.assertEqual(answer['run_id'], 'run-one')
+                self.assertIs(answer['repeat'], False)
+                self.assertEqual(requested, [cgroup])
+                self.assertEqual(registry.get('run-one')['state'], 'stopped')
+                stopped = client.call('run.stop', {'run_id': 'run-one'})
+                self.assertEqual(stopped['code'], 'stopped', stopped)
+                self.assertIs(stopped['repeat'], True)
+                self.assertEqual(requested, [cgroup])
+                self.assertEqual(registry.get('run-one')['state'], 'stopped')
+                status = client.call('run.status', {'run_id': 'run-one'})
+                self.assertEqual(status['code'], 'ok', status)
+                self.assertEqual(status['run']['state'], 'stopped')
+                self.assertEqual(status['run']['result'][field], 'a�b')
+                self.assertEqual(result[field], 'a\udc80b')
+
 
 if __name__ == '__main__':
     unittest.main()

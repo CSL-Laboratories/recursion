@@ -493,7 +493,8 @@ WORDS = {
                     "with it (given in its place, or changed where it lies): it also lets through {calls}. What the "
                     "test shows does not hold for the sandbox as shipped. What you can do: give the sandbox the list "
                     "shipped beside it, unchanged, or take those rows out of yours.",
-    "proven_with_widened_list": "Every other test held: the sandbox is shown to hold with {calls} let through as well, "
+    "proven_with_widened_list": "Every other test held: by the plugin host's own test the sandbox holds with {calls} let "
+                                "through as well, "
                                 "and not as shipped; the plugin host loads nothing beside a list wider than the one "
                                 "shipped.",
     "not_loaded": "The plugin was not loaded. Before any plugin code runs, the plugin host shuts itself in and "
@@ -591,7 +592,11 @@ WORDS = {
     "held_signal_owner": "a pipe set before to signal a process on every change",
     "held_shared_map": "a file mapped shared and writable",
     "held_namespace": "a namespace entered before",
-    "limits_intro": "The plugin host is shut in as the test shows: a plugin cannot write your files, reach the "
+    "reported_by_host": "This is the plugin host's own test of its sandbox, made inside the host before any plugin "
+                        "ran. Recursion has not checked the sandbox from outside: a host whose code was changed could "
+                        "make the same report while shut in less. You can rely on it as far as you trust the plugin "
+                        "host program itself: it came with Recursion and is not the plugin.",
+    "limits_intro": "The host's test shows that a plugin cannot write your files, reach the "
                     "network or make the kernel calls the sandbox refuses. The sandbox does NOT stop a plugin from "
                     "signalling a cooperating process on the same machine in the ways below, and the word proven is "
                     "said only of what the record lists as tested:",
@@ -625,6 +630,8 @@ WORDS = {
                   "any container or security tool that changes what a process may do with files, and start it "
                   "again. If it is still refused, keep this message: it says what got through.",
 }
+# The first words a person reads beside proven say whose test it is: they open the first sentence there.
+WORDS["limits_intro"] = WORDS["reported_by_host"] + " " + WORDS["limits_intro"]
 
 # How far apply_wall has gone in THIS process (a forked child inherits it): the steps that changed the
 # process, the step that failed, and the Landlock scopes in force. A process with a failed step, or with any

@@ -4,6 +4,13 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `wall.v1.json` stays `1.0-draft.12`: words only (Nov 25, 2026)
+
+The description of the record and that of `proven` each gain one sentence: the record is made and decided by the
+host itself, the daemon does not check it, and nothing outside the host can tell a weaker filter from the shipped
+one by the record. No field, value, const or rule changes, so the draft number stays. What it breaks: nothing; a
+record that validated at draft 12 validates as before.
+
 ## `wall.v1.json` is `1.0-draft.12` (Nov 25, 2026)
 
 `limits_of_proven` gains `process_times` (a process started before the wall reads the host's times and state in

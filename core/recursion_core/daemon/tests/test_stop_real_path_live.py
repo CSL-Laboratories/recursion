@@ -72,6 +72,7 @@ What may stay behind after the test process is ended from outside:
   the folder. Remove it with ``rm -r -- '<path>'``, the path the case prints. After an end at any
   other point, the run folder goes after the run unit, as above.
 """
+import json
 import os
 from pathlib import Path
 import re
@@ -80,6 +81,7 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -101,6 +103,7 @@ DECOY_CASE_TIMEOUT_S = 300   # the decoy case, with its two runs of a stop case 
 PLANTED_LIFE_S = 330         # every decoy unit ends by itself after this
 PLANTED_TASKS_MAX = 2        # TasksMax of each decoy unit
 KILLED_END_S = UNIT_RUNTIME_MAX_S + 15.0  # after a unit-gone run is ended from outside, how long its units have
+CHILD_RUN_TIMEOUT_S = 60     # each process of the child-name case (a load of this file or a child run)
 
 # The names of this case's helper units and folders: <prefix><random hex> for the holder, and for a run
 # <prefix><random hex>-run (the run helper) and <prefix><random hex>-files (the run folder).
@@ -366,6 +369,29 @@ def child_python():
     if getattr(sys, '_is_gil_enabled', None) is not None and not sys._is_gil_enabled():
         flags += ['-X', 'gil=0']
     return [sys.executable, *flags]
+
+
+def importable_name(path):
+    """The folder ``path`` imports from and its dotted module name: the folders above it that hold an
+    ``__init__.py`` are its packages."""
+    path = Path(path).resolve()
+    parts, folder = [path.stem], path.parent
+    while (folder / '__init__.py').is_file():
+        parts.insert(0, folder.name)
+        folder = folder.parent
+    return folder, '.'.join(parts)
+
+
+# This file's dotted name and the folder it imports from, read from where the file lies, so that a child
+# process imports it however this process loaded it: as a script (where its name is __main__), through the
+# gate (which runs a file with a __main__ guard by its path), by its dotted name or by discovery.
+IMPORT_ROOT, MODULE_NAME = importable_name(__file__)
+# A test run in a child process by the dotted name of its case. argv: <import folder> <test name>. The
+# folder goes first on the path, so the child imports this file even where neither PYTHONPATH nor the
+# folder the child runs in leads to it.
+CHILD_RUN = ('import sys, unittest\n'
+             'sys.path.insert(0, sys.argv[1])\n'
+             "unittest.main(module=None, argv=['python -m unittest', sys.argv[2]])\n")
 
 
 class _CaseTimeout(Exception):
@@ -657,7 +683,8 @@ class LikeNamedDecoyTests(_TimerOffInCleanup, unittest.TestCase):
     run has started (the unit-gone case: systemd stops its run unit when its run helper ends, and its
     run folder after that). After each, every decoy must still be active with its files as they were;
     after the kill, the child's own units and both its folders must be gone by themselves within
-    ``KILLED_END_S``.
+    ``KILLED_END_S``. The child imports this file by its dotted name (``child_case``), whatever way this
+    process loaded it.
     """
 
     def setUp(self):
@@ -701,9 +728,7 @@ class LikeNamedDecoyTests(_TimerOffInCleanup, unittest.TestCase):
                                  f'{when}: the file {name} of the decoy {unit} changed')
 
     def child_case(self, test):
-        module = getattr(sys.modules[__name__], '__spec__', None)
-        module = module.name if module is not None else __name__
-        return [*child_python(), '-m', 'unittest', f'{module}.StopOnTheRealPathTests.{test}']
+        return [*child_python(), '-c', CHILD_RUN, str(IMPORT_ROOT), f'{MODULE_NAME}.StopOnTheRealPathTests.{test}']
 
     def test_like_named_units_and_folders_are_left_alone_by_a_run_and_by_a_killed_run(self):
         dead = dead_pid()
@@ -788,6 +813,115 @@ class LikeNamedDecoyTests(_TimerOffInCleanup, unittest.TestCase):
         self.assertEqual([str(f) for f in folders if f.exists()], [],
                          'the killed run\'s folders are still there')
         self.assert_untouched('after a run that was ended from outside')
+
+
+# The decoy case's child command, built in a process that loaded this file one way. argv: <way> <args>.
+# It prints CHILD <json> (the command, the folder it runs in, its environment) and exits. For the way
+# 'gate' it prints GATE <json>: the command, folder and environment the gate's run_test_file would run
+# this file with; it runs nothing.
+CHILD_PROBE = r'''
+import importlib, json, os, runpy, subprocess, sys, unittest
+DECOY = 'test_like_named_units_and_folders_are_left_alone_by_a_run_and_by_a_killed_run'
+TEST = 'test_stop_answers_stopped_only_once_a_detached_grandchild_is_gone'
+def say(cls):
+    command = cls(DECOY).child_case(TEST)
+    print('CHILD ' + json.dumps({'cmd': command, 'cwd': os.getcwd(), 'env': dict(os.environ)}), flush=True)
+    raise SystemExit(0)
+def walk(suite):
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            yield from walk(test)
+        else:
+            yield test
+way, args = sys.argv[1], sys.argv[2:]
+if way == 'gate':
+    sys.path.insert(0, args[0])
+    import ci_gate
+    def capture(command, cwd=None, env=None, **_):
+        print('GATE ' + json.dumps({'cmd': [str(c) for c in command], 'cwd': str(cwd), 'env': env}), flush=True)
+        return subprocess.CompletedProcess(command, 0)
+    ci_gate.subprocess.run = capture
+    ci_gate.run_test_file(args[1])
+    raise SystemExit(0)
+if way == 'script':
+    unittest.main = lambda *a, **k: say(sys._getframe(1).f_globals['LikeNamedDecoyTests'])
+    runpy.run_path(args[0], run_name='__main__')
+elif way == 'runner':
+    unittest.TestLoader.loadTestsFromModule = lambda self, module, *a, **k: say(module.LikeNamedDecoyTests)
+    sys.argv = ['-c', args[1]]
+    exec(args[0], {'__name__': '__main__'})
+elif way == 'module':
+    say(importlib.import_module(args[0]).LikeNamedDecoyTests)
+elif way == 'discover':
+    for test in walk(unittest.defaultTestLoader.discover(args[0], pattern=args[1], top_level_dir=args[2] or None)):
+        if type(test).__name__ == 'LikeNamedDecoyTests':
+            say(type(test))
+raise SystemExit('the decoy case was not reached this way')
+'''
+
+
+class DecoyChildNameTests(unittest.TestCase):
+    """The decoy case's child names a case it can import, however this file is run.
+
+    This file runs as a script, through the gate's ``run_test_file`` (which runs a file with a
+    ``__main__`` guard by its path), by its dotted name, and by discovery with a top-level folder or
+    from its own folder. For each way a process loads this file that way and builds the decoy case's
+    child command; the child then runs with ``LIVE_CELLS_ENV`` unset and must run its one case and skip
+    it. Nothing here starts a unit or asks the user manager anything, so this case runs on every host.
+    """
+
+    def probe(self, python, env, cwd, args, line='CHILD '):
+        done = subprocess.run([*python, '-c', CHILD_PROBE, *args], capture_output=True, text=True, env=env,
+                              cwd=cwd, timeout=CHILD_RUN_TIMEOUT_S, check=False)
+        for text in done.stdout.splitlines():
+            if text.startswith(line):
+                return json.loads(text[len(line):])
+        self.fail(f'loading this file ({args[0]}) gave no {line.strip()} line (exit {done.returncode}): '
+                  f'{done.stderr[-1500:]}')
+
+    def assert_child_skips(self, way, said):
+        env = {k: v for k, v in said['env'].items() if k != LIVE_CELLS_ENV}
+        done = subprocess.run(said['cmd'], capture_output=True, text=True, env=env, cwd=said['cwd'],
+                              timeout=CHILD_RUN_TIMEOUT_S, check=False)
+        why = (f'run {way}, the decoy case\'s child asks for {said["cmd"][-1]!r}; it must import that case '
+               f'and skip it (exit {done.returncode}): {done.stderr[-1500:]}')
+        self.assertEqual(done.returncode, 0, why)
+        self.assertRegex(done.stderr, r'(?m)^Ran 1 test in ', why)
+        self.assertRegex(done.stderr, r'(?m)^OK \(skipped=1\)$', why)
+
+    def test_the_decoy_cases_child_skips_its_case_however_this_file_is_run(self):
+        import recursion_core
+
+        core = Path(recursion_core.__file__).resolve().parent.parent
+        this = Path(__file__).resolve()
+        dotted = '.'.join(this.relative_to(core).with_suffix('').parts)
+        bare = {k: v for k, v in os.environ.items() if k not in (LIVE_CELLS_ENV, 'PYTHONPATH')}
+        with_path = {**bare, 'PYTHONPATH': str(core)}
+        with tempfile.TemporaryDirectory(prefix='rc-stop-child-name-') as tmp:
+            ways = (
+                ('as a script', with_path, ['script', str(this)]),
+                ('by its dotted name', with_path, ['module', dotted]),
+                ('by discovery with a top-level folder', bare, ['discover', str(this.parent), this.name, str(core)]),
+                ('by discovery from its own folder', with_path, ['discover', str(this.parent), this.name, '']),
+            )
+            for way, env, args in ways:
+                with self.subTest(way=way):
+                    self.assert_child_skips(way, self.probe(child_python(), env, tmp, args))
+            with self.subTest(way='through the gate'):
+                gate = core.parent / 'tools' / 'ci_gate.py'
+                if not gate.is_file():
+                    self.skipTest(f'the gate is not at {gate}')
+                rel = this.relative_to(core.parent).as_posix()
+                run = self.probe(child_python(), with_path, tmp, ['gate', str(gate.parent), rel], line='GATE ')
+                command = run['cmd']
+                env = {k: v for k, v in (run['env'] or with_path).items() if k != LIVE_CELLS_ENV}
+                if command[-1:] == [rel] and command[-3:-2] == ['-c']:
+                    python, args = command[:-3], ['runner', command[-2], rel]
+                elif command[-1:] == [rel]:
+                    python, args = command[:-1], ['script', rel]
+                else:
+                    self.fail(f'the gate runs this file in a way this case does not know: {command}')
+                self.assert_child_skips('through the gate', self.probe(python, env, run['cwd'], args))
 
 
 if __name__ == '__main__':

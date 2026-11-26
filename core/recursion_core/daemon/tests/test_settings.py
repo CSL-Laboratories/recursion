@@ -11,6 +11,7 @@ import collections
 import contextlib
 import copy
 import functools
+import hashlib
 import inspect
 import io
 import json
@@ -18,7 +19,9 @@ import logging
 import os
 from pathlib import Path
 import pickle
+import random
 import re
+import string
 import subprocess
 import sys
 import tempfile
@@ -117,7 +120,8 @@ class TheFileAndItsDefaults(_Folder):
                           "status.hidden_names = ['key', 'keys', 'token', 'tokens', 'secret', 'secrets', 'password'], "
                           "and 4 more (default ['key', 'keys', 'token', 'tokens', 'secret', 'secrets', 'password'], "
                           "and 4 more; source: default)",
-                          "status.shown_names = [] (default []; source: default)"],
+                          "status.shown_names = [] (default []; source: default)",
+                          "status.digest_chars = 8 (default 8; source: default; advised: at most 64)"],
                          settings.lines(loaded))
 
     def test_a_dotted_key_is_the_same_setting(self) -> None:
@@ -1110,7 +1114,8 @@ class WhatAPluginIsHanded(_Folder):
 class PublishedShape(_Folder):
     def test_the_schema_declares_exactly_the_table(self) -> None:
         schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
-        self.assertEqual({"const": settings.FILE_VERSION}, schema["properties"]["version"])
+        version = schema["properties"]["version"]  # its description says what the schema cannot decide
+        self.assertEqual({"const": settings.FILE_VERSION, "description": version.get("description")}, version)
         kinds = {bool: "boolean", int: "integer", float: "number", str: "string", list: "array"}
         found = {}
 
@@ -1155,13 +1160,15 @@ class PublishedShape(_Folder):
     def test_the_good_fixture_is_read_whole_and_the_bad_one_keeps_the_default(self) -> None:
         good = sorted((SCHEMA_DIR / "fixtures" / "good").glob("*.toml"))
         bad = sorted((SCHEMA_DIR / "fixtures" / "bad").glob("*.toml"))
-        self.assertEqual((1, 1), (len(good), len(bad)))
+        self.assertEqual((1, 2), (len(good), len(bad)))
         self.put(good[0].read_text(encoding="utf-8"))
         loaded = settings.load(self.environ)
         self.assertEqual([], self.codes(loaded))
         self.assertEqual({settings.SOURCE_FILE}, {v.source for v in loaded.values.values()})
         self.put(bad[0].read_text(encoding="utf-8"))
         self.assert_default(settings.load(self.environ), settings.OUT_OF_RANGE)
+        self.put(bad[1].read_text(encoding="utf-8"))  # version = 1.0: the schema accepts it, the reader refuses it
+        self.assert_default(settings.load(self.environ), settings.UNREADABLE)
 
 
 CAP_KEY = "status.value_max_chars"
@@ -1357,7 +1364,11 @@ SIGNED_IN = (
     ("https://u:" + "pa/ss" + "@host/x", "pa/ss", "'https://<sign-in hidden>@host/x'"),
     ("ftp://ada%3A" + "S3cr3t" + "@files", "S3cr3t", "'ftp://<sign-in hidden>@files'"),
 )
-NO_SIGN_IN = ("https://example.com:8443/path", "https://example.com/u@mail", "ada@example.com", "a:b c@d")
+NO_SIGN_IN = ("https://example.com:8443/path",)
+# Everything before the last @ of a run is hidden: of a mail address only the part after the @ is shown.
+BEFORE_THE_AT_SIGN = (("ada@example.com", "'<sign-in hidden>@example.com'"), ("a:b c@d", "'a:b <sign-in hidden>@d'"))
+# A path that holds an @ after a host: from the scheme mark to the last @ is hidden, the host with it (the safe side).
+PAST_THE_HOST = (("https://example.com/u@mail", "'https://<sign-in hidden>@mail'"),)
 class NoSecretAndOneLineInEveryShownValue(_Folder):
     """A start line never shows a secret and never becomes two lines."""
 
@@ -1378,6 +1389,9 @@ class NoSecretAndOneLineInEveryShownValue(_Folder):
         for text in NO_SIGN_IN:
             with self.subTest(text=text):
                 self.assertEqual(repr(text), settings._shown(text, settings.NO_LIMIT))
+        for text, whole in PAST_THE_HOST + BEFORE_THE_AT_SIGN:
+            with self.subTest(text=text):
+                self.assertEqual(whole, settings._shown(text, settings.NO_LIMIT))
 
     @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
     def test_an_address_in_the_file_is_shown_without_its_sign_in_in_every_line(self) -> None:
@@ -1603,7 +1617,7 @@ class NoSecretAndOneLineInEveryShownValue(_Folder):
             with self.subTest(name=name[-4:]):
                 self.put(f"version = 1\n{name} = 1\n")
                 details.append(settings.load(self.environ).notes[0].detail)
-                self.assertRegex(details[-1], r"^'(x\.)?k+\.\.\. \(\d+ more, digest [0-9a-f]{6}\) is ")
+                self.assertRegex(details[-1], r"^'(x\.)?k+\.\.\. \(\d+ more, digest [0-9a-f]{8}\) is ")
         self.assertEqual(4, len(set(details)))
         big = "k" * 60000
         self.put(f"version = 1\n{big} = 1\n")
@@ -1611,7 +1625,8 @@ class NoSecretAndOneLineInEveryShownValue(_Folder):
         self.assertEqual(settings.EXIT_WARNED, settings.main([], self.environ, out, io.StringIO()))
         notes = [line for line in out.getvalue().splitlines() if "not a setting" in line]
         self.assertEqual(1, len(notes))
-        self.assertLess(len(notes[0]), 200, notes[0])
+        words = " is not a setting this version knows; it is skipped; remove it or check its spelling"
+        self.assertLessEqual(len(notes[0]), len("warning: note settings_unknown_key: ") + 80 + len(words), notes[0])
         self.assertLessEqual(len(settings._shown(big * 5, 40, key=True)), 40)
         self.put("version = 1\nkkk = 1\n")
         detail = settings.load(self.environ).notes[0].detail
@@ -1706,7 +1721,875 @@ class ATableAndAKeyReadUnderTheFullDottedName(_Folder):
                 loaded = self.read(text)
                 self.assert_default(loaded, settings.UNKNOWN_KEY)
                 self.assertNotIn(FULL_NAME, loaded.values)
-                self.assertEqual("'engines' is not a setting this version knows; it is skipped", loaded.notes[0].detail)
+                self.assertEqual("'engines' is not a setting this version knows; it is skipped; remove it or check "
+                                 "its spelling", loaded.notes[0].detail)
+
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class TheStartLinesWhateverLoggingHeldBefore(_Folder):
+    """A root logger an embedding caller or a test host set up first: the daemon's start lines still carry the
+    time and the process id and are written at INFO, and the caller's own handler keeps receiving them."""
+
+    def start(self, err: io.StringIO) -> None:
+        from recursion_core.daemon import __main__ as daemon_main
+        with mock.patch.dict(os.environ, self.environ), \
+                mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(daemon_main, "require_posix"), \
+                mock.patch.object(daemon_main, "require_free_threaded"), \
+                mock.patch.object(daemon_main, "refuse_engine_user"), \
+                mock.patch.object(daemon_main, "check_operator_linger"), \
+                mock.patch.object(daemon_main.signal, "signal"), \
+                mock.patch.object(daemon_main, "UserLock"), \
+                mock.patch.object(daemon_main, "Registry", side_effect=_ReachedTheLock), \
+                self.assertRaises(_ReachedTheLock):
+            daemon_main.main()
+
+    def test_a_root_handler_set_up_first_at_info_or_warning_leaves_both_lines_with_time_and_process_id(self) -> None:
+        self.put(OFF)
+        root, own = logging.getLogger(), logging.getLogger("recursion_core.daemon")
+        kept = (root.handlers[:], root.level, own.handlers[:], own.level)
+
+        def restore() -> None:
+            root.handlers[:], own.handlers[:] = kept[0], kept[2]
+            root.setLevel(kept[1])
+            own.setLevel(kept[3])
+        self.addCleanup(restore)
+        form = r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} \[" + str(os.getpid()) + r"\] INFO recursion_core\.daemon: "
+        starts = (f"settings file: {self.file}",
+                  "settings: plugin_host.gil_check = false (default true; source: settings file)")
+        for level in (logging.INFO, logging.WARNING):
+            caller = io.StringIO()
+            bare = logging.StreamHandler(caller)
+            bare.setFormatter(logging.Formatter("%(message)s"))
+            root.handlers[:] = [bare]
+            root.setLevel(level)
+            for attempt in ("a first start", "a second start in the same process"):
+                with self.subTest(root=logging.getLevelName(level), attempt=attempt):
+                    err = io.StringIO()
+                    self.start(err)
+                    shown = err.getvalue().splitlines()
+                    for start in starts:
+                        found = [line for line in shown if line.endswith(start)]
+                        self.assertEqual(1, len(found), shown)
+                        self.assertRegex(found[0], form)
+            self.assertIn(starts[0], caller.getvalue().splitlines())  # the caller's own handler is kept
+
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class AKeyIsShownWhole(_Folder):
+    """A key is capped in a note like every shown value, and a cut key carries a short digest of its whole text,
+    so two long keys that differ late read apart; under "none" a key is named whole."""
+
+    def test_two_unknown_keys_of_100_characters_that_differ_after_character_90_give_two_notes(self) -> None:
+        first, second = "a" * 100, "a" * 90 + "b" * 10
+        self.put(f"version = 1\n[plugin_host]\n{first} = false\n{second} = false\n")
+        details = [note.detail for note in settings.load(self.environ).notes]
+        self.assertEqual(2, len(set(details)), details)
+        for detail in details:  # cut at the cap, a digest of the whole key, and the words that say what to do
+            self.assertRegex(detail, r"^'plugin_host\.a+\.\.\. \(\d+ more, digest [0-9a-f]+\) is not a setting this "
+                                     r"version knows; it is skipped; remove it or check its spelling$")
+        self.put(f'version = 1\n[plugin_host]\n{first} = false\n{second} = false\n[status]\nvalue_max_chars = "none"\n')
+        details = [note.detail for note in settings.load(self.environ).notes]
+        for key, detail in zip((first, second), details):  # under "none" the whole key
+            self.assertTrue(detail.startswith(f"'plugin_host.{key}' is not a setting this version knows; it is "
+                                              "skipped; remove it or check its spelling"), detail)
+
+    def test_two_long_quoted_keys_that_differ_late_give_two_notes_with_the_whole_key(self) -> None:
+        first, second = "a" * 90 + ".b", "a" * 90 + ".c"
+        self.put(f'version = 1\n"{first}" = 1\n"{second}" = 1\n')
+        details = [note.detail for note in settings.load(self.environ).notes]
+        self.assertEqual(2, len(set(details)), details)
+        for detail in details:  # cut at the cap, with a digest of the whole key
+            self.assertRegex(detail, r"^'a+\.\.\. \(\d+ more, digest [0-9a-f]+\) is a quoted key that holds a dot")
+        self.put(f'version = 1\n"{first}" = 1\n"{second}" = 1\n[status]\nvalue_max_chars = "none"\n')
+        details = [note.detail for note in settings.load(self.environ).notes]
+        for key, detail in zip((first, second), details):  # under "none" the whole key
+            self.assertTrue(detail.startswith(f"'{key}' is a quoted key that holds a dot"), detail)
+
+    def test_the_note_for_an_unknown_key_says_what_to_do_and_keeps_the_nearest_known_key(self) -> None:
+        self.put("version = 1\n[plugin_host]\ngil_chek = false\n")
+        self.assertEqual("'plugin_host.gil_chek' is not a setting this version knows; it is skipped; remove it or "
+                         "check its spelling; did you mean plugin_host.gil_check?",
+                         settings.load(self.environ).notes[0].detail)
+
+    def test_a_value_is_still_cut_in_its_note(self) -> None:
+        self.put('version = 1\n[plugin_host]\ngil_check = "' + "x" * 200 + '"\n')
+        detail = settings.load(self.environ).notes[0].detail
+        self.assertNotIn("x" * 200, detail)
+        self.assertIn("...", detail)
+
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class TheVersionTheSchemaCannotTell(_Folder):
+    """JSON Schema compares numbers by value, so the schema cannot refuse version 1.0; it says so, and the reader
+    (which takes only the whole number 1) is what refuses it, with its own words, in a published bad vector."""
+
+    SAYS = "JSON Schema cannot tell 1.0 from 1, so this schema accepts version 1.0; the reader takes only the whole number 1"
+
+    def test_the_schema_accepts_1_0_on_purpose_and_its_version_says_the_reader_takes_only_1(self) -> None:
+        schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
+        version = schema["properties"]["version"]
+        self.assertEqual(version["const"], json.loads("1.0"))  # a parsed 1.0 meets const 1: accepted on purpose
+        self.assertIn(self.SAYS, version.get("description", ""))
+        readme = " ".join((SCHEMA_DIR / "README.md").read_text(encoding="utf-8").split())
+        self.assertIn(self.SAYS, readme)
+
+    def test_the_bad_vector_version_1_0_is_refused_by_the_reader_with_its_words(self) -> None:
+        vector = SCHEMA_DIR / "fixtures" / "bad" / "b02-version-written-as-a-float.toml"
+        self.assertTrue(vector.is_file(), vector)
+        self.put(vector.read_text(encoding="utf-8"))
+        loaded = settings.load(self.environ)
+        self.assert_default(loaded, settings.UNREADABLE)
+        self.assertIn("version must be 1, found 1.0; write `version = 1`", loaded.notes[0].detail)
+
+
+def _sha(text: str, chars: int = 8) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:chars]
+
+
+START_FORM = r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} \[" + str(os.getpid()) + r"\] (INFO|WARNING) recursion_core\.daemon: "
+UNKNOWN_WORDS = " is not a setting this version knows; it is skipped; remove it or check its spelling"
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class AKeyIsCappedAndACutKeyCarriesItsDigest(_Folder):
+    """The two rounds joined: a key is capped like every shown value and a cut key carries the first characters
+    of the SHA-256 of its whole text (the row status.digest_chars); a key that looks like a key carries its
+    ordinal only; each start line keeps its time and process id, once per start, on the stderr of the moment."""
+
+    def start(self, err: io.StringIO) -> None:
+        TheStartLinesWhateverLoggingHeldBefore.start(self, err)
+
+    def bare_logging(self, handlers=()) -> None:
+        root, own = logging.getLogger(), logging.getLogger("recursion_core.daemon")
+        kept = (root.handlers[:], root.level, own.handlers[:], own.level)
+
+        def restore() -> None:
+            root.handlers[:], own.handlers[:] = kept[0], kept[2]
+            root.setLevel(kept[1])
+            own.setLevel(kept[3])
+        self.addCleanup(restore)
+        root.handlers[:] = list(handlers)
+        own.handlers[:] = []
+
+    def test_the_join_two_long_keys_read_apart_a_hidden_value_shows_nothing_and_each_start_line_keeps_time_and_pid(self) -> None:
+        # One test that is red when either half is cut: the start lines' time and process id, or the cap's
+        # digest of a cut key and its hidden value.
+        first, second = "a" * 100, "a" * 90 + "b" * 10
+        secret = "plainsecret14c"
+        row = settings.Setting("test.api_key", str, "plain default", "A key.")
+        rows = settings.SETTINGS + (row,)
+        self.put(f'version = 1\n{first} = 1\n{second} = 1\n[test]\napi_key = "{secret}"\n')
+        self.bare_logging()
+        err = io.StringIO()
+        with mock.patch.multiple(settings, SETTINGS=rows, DECLARED=MappingProxyType({r.name: r for r in rows})):
+            self.start(err)
+        shown = err.getvalue().splitlines()
+        mine = [line for line in shown if "settings file: " in line or "settings: " in line]
+        self.assertTrue(mine, shown)
+        for line in mine:
+            self.assertRegex(line, START_FORM)
+        notes = [line for line in mine if UNKNOWN_WORDS in line]
+        self.assertEqual(2, len(notes), mine)
+        self.assertEqual(2, len(set(notes)))
+        for key, line in zip((first, second), notes):
+            self.assertIn(f"digest {_sha(key)})", line)
+            self.assertNotIn(key, line)
+        valued = [line for line in mine if "test.api_key = " in line]
+        self.assertEqual(1, len(valued), mine)
+        self.assertIn(f"test.api_key = {SHOWN_NAME} (default {SHOWN_NAME}; source: settings file)", valued[0])
+        self.assertNotIn(secret, err.getvalue())
+        self.assertNotIn(str(len(secret)), valued[0].split("recursion_core.daemon: ", 1)[1])
+
+    def test_two_long_keys_that_differ_past_the_cap_read_apart_under_every_cap_and_whole_under_none(self) -> None:
+        first, second = "a" * 100, "a" * 90 + "b" * 10
+        for cap in [*range(40, 131), '"none"']:
+            with self.subTest(cap=cap):
+                self.put(f"version = 1\n{first} = 1\n{second} = 1\n[status]\nvalue_max_chars = {cap}\n")
+                details = [note.detail for note in settings.load(self.environ).notes]
+                self.assertEqual(2, len(set(details)), details)
+                for key, detail in zip((first, second), details):
+                    head = detail[:-len(UNKNOWN_WORDS)]
+                    self.assertTrue(detail.endswith(UNKNOWN_WORDS), detail)
+                    if cap == '"none"' or len(repr(key)) <= cap:
+                        self.assertEqual(repr(key), head)
+                    else:
+                        self.assertLessEqual(len(head), cap)
+                        self.assertTrue(head.endswith(f" more, digest {_sha(key)})"), head)
+        big = "k" * 60000
+        self.put(f"version = 1\n{big} = 1\n")
+        detail = settings.load(self.environ).notes[0].detail
+        self.assertTrue(detail.endswith(UNKNOWN_WORDS), detail)
+        self.assertLessEqual(len(detail) - len(UNKNOWN_WORDS), 80)  # the cap plus the note's own words
+        self.assertIn(f"digest {_sha(big)})", detail)
+
+    def test_the_digest_length_is_the_row_status_digest_chars(self) -> None:
+        key = "k" * 199 + "a"  # long enough to be cut under a cap of 160, which leaves room for 64 hex characters
+        self.put(f"version = 1\n{key} = 1\n")
+        loaded = settings.load(self.environ)
+        self.assertIn("status.digest_chars = 8 (default 8; source: default; advised: at most 64)",
+                      settings.lines(loaded))
+        self.assertIn(f"digest {_sha(key)})", loaded.notes[0].detail)
+        for chars, shown in ((6, 6), (12, 12), (64, 64), (65, 64), (1000, 64)):
+            with self.subTest(chars=chars):
+                self.put(f"version = 1\n{key} = 1\n[status]\ndigest_chars = {chars}\nvalue_max_chars = 160\n")
+                loaded = settings.load(self.environ)
+                self.assertEqual(chars, loaded["status.digest_chars"])
+                self.assertRegex(loaded.notes[0].detail, r"digest " + _sha(key, shown) + r"\)")
+                outside = "; outside the advice" if chars > 64 else ""
+                self.assertIn(f"status.digest_chars = {chars} (default 8; source: settings file; advised: at most 64"
+                              f"{outside})", settings.lines(loaded))
+        for found, why in (("5", "found 5; a value below 6 has no meaning; "), ('"none"', "found 'none'; ")):
+            with self.subTest(found=found):
+                self.put(f"version = 1\n{key} = 1\n[status]\ndigest_chars = {found}\n")
+                loaded = settings.load(self.environ)
+                self.assertEqual(8, loaded["status.digest_chars"])
+                self.assertIn(f"status.digest_chars: {why}allowed: a whole number of 6 or more; the default 8 "
+                              "stays in force", [note.detail for note in loaded.notes])
+                self.assertIn(f"digest {_sha(key)})", loaded.notes[0].detail)
+
+    def test_a_key_that_looks_like_a_key_carries_its_ordinal_only_equal_between_two_starts(self) -> None:
+        short, long_ = "ghp_" + "A1b2" * 10, "ghp_" + "C3d4" * 30
+        text = f"version = 1\n{short} = 1\nplain = 1\n{long_} = 1\n"
+        self.put(text)
+        once = [note.detail for note in settings.load(self.environ).notes]
+        twice = [note.detail for note in settings.load(self.environ).notes]
+        self.assertEqual(once, twice)  # two starts of the same file show the same lines
+        hidden = [d for d in once if d.startswith("<hidden key-like name")]
+        self.assertEqual(2, len(hidden), once)
+        self.assertNotEqual(hidden[0], hidden[1])  # two hidden names read apart
+        self.assertEqual(hidden[0].replace(" 1 of this file", " N of this file"),
+                         hidden[1].replace(" 2 of this file", " N of this file"))  # only the ordinal differs
+        self.assertTrue(hidden[0].startswith("<hidden key-like name 1 of this file> is not a setting"), hidden[0])
+        for detail in hidden:
+            for piece in (short, long_, "ghp_", "A1b2", "C3d4", str(len(short)), str(len(long_)), "digest"):
+                self.assertNotIn(piece, detail)
+
+    def test_the_digest_of_a_cut_key_is_made_without_the_sign_in_of_an_address(self) -> None:
+        # Two keys that differ only in the password of an address show the same line, and the digest is that of
+        # the text with the sign-in taken out (the same removal the shown form uses): no trace of the password.
+        for head, tail in (("https://admin:", "@dbhost/" + "p" * 100), ("p" * 100 + " admin:", "@dbhost")):
+            with self.subTest(scheme=head.startswith("https")):
+                keys = [head + word + tail for word in ("S3cretpass", "Hunter2pass")]
+                details = []
+                for key in keys:
+                    self.put(f'version = 1\n"{key}" = 1\n')
+                    details.append(settings.load(self.environ).notes[0].detail)
+                self.assertEqual(details[0], details[1])
+                free = keys[0].replace("admin:S3cretpass", "<sign-in hidden>")
+                self.assertIn(f" more, digest {_sha(free)})", details[0])
+                for key, word in zip(keys, ("S3cretpass", "Hunter2pass")):
+                    self.assertNotIn(_sha(key), details[0])
+                    self.assertNotIn(word, details[0])
+
+    def test_a_key_like_password_inside_the_sign_in_never_enters_the_digest(self) -> None:
+        # The raw text holds a run that looks like a key, but only inside the sign-in: the name is shown cut,
+        # and its digest is made of the text without that sign-in.
+        word = "A1b2" * 6
+        key = "https://admin:" + word + "@dbhost/" + "p" * 100
+        self.put(f'version = 1\n"{key}" = 1\n')
+        detail = settings.load(self.environ).notes[0].detail
+        self.assertIn(f" more, digest {_sha(key.replace('admin:' + word, '<sign-in hidden>'))})", detail)
+        self.assertNotIn(_sha(key), detail)
+        self.assertNotIn("A1b2", detail)
+
+    def test_a_long_name_whose_tail_looks_like_a_key_is_hidden_whole_with_no_digest(self) -> None:
+        # What the look-alike rule hides is never hashed: the whole name is hidden and carries its ordinal only,
+        # also where the part that looks like a key stands past the cap.
+        for tail in ("A1b2" * 6, " password hunter2pass"):
+            with self.subTest(tail=tail[:5]):
+                key = "a" * 100 + tail
+                self.put(f'version = 1\n"{key}" = 1\n')
+                detail = settings.load(self.environ).notes[0].detail
+                self.assertTrue(detail.startswith("<hidden key-like name 1 of this file> "), detail)
+                for piece in ("digest", "aaaa", tail.strip()[:4], str(len(key))):
+                    self.assertNotIn(piece, detail)
+
+    def test_a_value_under_any_name_never_enters_the_digest_of_its_key(self) -> None:
+        # The words of status.hidden_names hide values, never names: an unknown key that holds such a word is
+        # shown cut with the digest of the key alone, and its value is neither shown nor hashed.
+        key, secret = "a" * 100 + "_password", "s3cretvalue1"
+        self.put(f'version = 1\n{key} = "{secret}"\n')
+        detail = settings.load(self.environ).notes[0].detail
+        self.assertIn(f" more, digest {_sha(key)})", detail)
+        self.assertNotIn(secret, detail)
+        self.assertNotIn(_sha(f"{key} = {secret}"), detail)
+
+    def test_a_cut_key_holds_the_cap_and_part_of_the_key_for_every_pair_of_cap_and_digest_length(self) -> None:
+        # The case of the read: caps 40 and 80, digest lengths 16, 32 and 64, keys of 100 and 60000.
+        for size in (100, 60000):
+            key = "k" * (size - 1) + "a"
+            for cap in (40, 80):
+                for chars in (16, 32, 64):
+                    with self.subTest(size=size, cap=cap, chars=chars):
+                        self.put(f"version = 1\n{key} = 1\n[status]\nvalue_max_chars = {cap}\n"
+                                 f"digest_chars = {chars}\n")
+                        detail = settings.load(self.environ).notes[0].detail
+                        head = detail[:-len(UNKNOWN_WORDS)]
+                        self.assertTrue(detail.endswith(UNKNOWN_WORDS), detail)
+                        self.assertLessEqual(len(head), cap)
+                        self.assertTrue(head.startswith("'kkkkkkkk"), head)
+        # Every pair the two rows allow, walked: each cap from its least 40 to 200, each digest length from its
+        # least 6 to past the whole digest; keys of either side of the cap, long, and of the file's most bytes.
+        pattern = re.compile(r"^(.*)\.\.\. \((\d+) more, digest ([0-9a-f]+)\)$")
+        for cap in range(40, 201):
+            for chars in (*range(6, 73), 10 ** 18):
+                sizes = (cap - 3, cap - 2, cap - 1, cap + 40, 1000)
+                if chars in (6, 8, 16, 64, 10 ** 18):
+                    sizes += (60000, settings.MAX_BYTES)
+                for size in sizes:
+                    key = "k" * (size - 1) + "a"
+                    shown = settings._shown(key, cap, key=chars)
+                    if len(repr(key)) <= cap:
+                        self.assertEqual(repr(key), shown)
+                        continue
+                    found = pattern.match(shown)
+                    self.assertIsNotNone(found, (cap, chars, size, shown))
+                    kept, more, digest = found.group(1), int(found.group(2)), found.group(3)
+                    self.assertLessEqual(len(shown), cap, (cap, chars, size))
+                    self.assertTrue(kept.startswith("'kkkkkkkk"), (cap, chars, size, shown))
+                    self.assertEqual(len(repr(key)), len(kept) + more, (cap, chars, size))
+                    self.assertGreaterEqual(len(digest), 6)
+                    self.assertEqual(_sha(key, len(digest)), digest)
+                    if len(digest) < min(chars, 64):  # shortened only where the cap leaves no more room
+                        self.assertLessEqual(len(kept), 10, (cap, chars, size, shown))
+
+    def test_a_second_start_in_one_process_with_no_earlier_handler_writes_each_start_line_once(self) -> None:
+        self.put(OFF)
+        self.bare_logging()
+        err = io.StringIO()
+        self.start(err)
+        self.start(err)
+        shown = err.getvalue().splitlines()
+        for start in (f"settings file: {self.file}",
+                      "settings: plugin_host.gil_check = false (default true; source: settings file)"):
+            found = [line for line in shown if line.endswith(start)]
+            self.assertEqual(2, len(found), shown)  # one line on each of the two starts
+            for line in found:
+                self.assertRegex(line, START_FORM)
+
+    def test_the_daemons_handler_writes_to_the_stderr_of_the_moment(self) -> None:
+        self.put(OFF)
+        for earlier in (False, True):
+            with self.subTest(earlier=earlier):
+                caller = logging.StreamHandler(io.StringIO())
+                self.bare_logging([caller] if earlier else [])
+                first = io.StringIO()
+                self.start(first)
+                first.close()  # the host shuts the stderr it had at start
+                later = io.StringIO()
+                with mock.patch.object(sys, "stderr", later):
+                    logging.getLogger("recursion_core.daemon").info("a line after the start")
+                self.assertIn("a line after the start", later.getvalue())
+                self.assertNotIn("Logging error", later.getvalue())
+                self.assertRegex(later.getvalue().splitlines()[0], START_FORM)
+
+
+# Two made-up passwords; a line shown for one must equal the line shown for the other.
+PASSWORDS = ("S3cretpass", "Hunter2pass")
+# Two addresses in one run of text, joined in every way a person may write them: (the form with {} for the
+# secret, the secret's own text around {} where it holds more). Each secret stands in the SECOND address or later.
+JOINED = (
+    ("https://a:x@h1/,https://b:{}@h2/", "{}"),  # a comma
+    ("https://a:x@h1;https://b:{}@h2", "{}"),  # a semicolon, no path
+    ("https://a:x@h1/|ftp://b:{}@h2/", "{}"),  # a pipe
+    ('"https://a:x@h1/","https://b:{}@h2/"', "{}"),  # double quotes
+    ("'https://h1/'+'https://b:{}@h2/'", "{}"),  # single quotes, the first with no sign-in
+    ("[https://a:x@h1/][https://b:{}@h2/]", "{}"),  # brackets
+    ("https://a:x@h1/\nhttps://b:{}@h2/", "{}"),  # a line break
+    ("https://a:x@h1/https://b:{}@h2/", "{}"),  # nothing at all, after a path
+    ("https://a:x@h1https://b:{}@h2", "{}"),  # nothing at all, after the host
+    ("HTTPS://A:X@H1/,POSTGRES://B:{}@H2/DB", "{}"),  # upper-case schemes
+    ("https://a:x@h1/,https://{}@h2/", "{}"),  # a sign-in with no password
+    ("https://a:x@h1/,https://b:{}@q@h2/", "{}@q"),  # an at-sign in the password
+    ("https://a:x@h1/,https://b:{}:q@h2/", "{}:q"),  # a colon in the password
+    ("https://a:x@h1/,https://b:{}%40q%3Ar@h2/", "{}%40q%3Ar"),  # both, percent-escaped
+    ("https://h1/,https://b:{}/q@h2/", "{}/q"),  # a slash in the password
+    ("https://a:x@h1/,https://b:q@{}/r@h2/", "q@{}/r"),  # an at-sign and then a slash in the password
+    ("https://a:x@h1/,https://b:{}%40q%2Fr@h2/x", "{}%40q%2Fr"),  # both, percent-escaped, then a path
+    ("https://h1:8443/,b:{}@h2/", "{}"),  # a sign-in without a scheme after an address
+    ("b:{}@h0,https://a:x@h1/", "{}"),  # a sign-in without a scheme before an address
+    ("a://u:x@h1,b://u:y@h2,c://u:{}@h3", "{}"),  # three addresses, the secret in the third
+)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class EverySignInOfATextIsTakenOut(_Folder):
+    """The sign-in of every address in a text is taken out, however two addresses are joined, as a value and as
+    a key, shown whole or cut; the digest of a cut key does not move when only a password changes."""
+
+    def test_the_second_of_two_addresses_joined_by_a_comma_or_a_semicolon_shows_no_password(self) -> None:
+        # The case of draft 631's sign-in rule: only the first sign-in of a run was taken out.
+        # Everything before the last @ of the run is hidden but a scheme at its very start: the first host sat
+        # before it, and so did the label 'x=', which stands before the scheme.
+        cases = (("https://a:x@h1/,https://b:{}@h2/", "'https://<sign-in hidden>@h2/'"),
+                 ("x=https://a:x@h1/;y=postgres://b:{}@h2/db", "'<sign-in hidden>@h2/db'"))
+        for form, whole in cases:
+            for word in PASSWORDS:
+                text = form.format(word)
+                with self.subTest(form=form, word=word):
+                    for cap in (40, 80, settings.NO_LIMIT):  # as a value
+                        self.assertNotIn(word, settings._shown(text, cap))
+                    self.assertEqual(whole, settings._shown(text, settings.NO_LIMIT))
+                    details = []
+                    for key in (text, text + "p" * 100):  # as a key of the file: shown whole, then cut
+                        self.put(f'version = 1\n"{key}" = 1\n')
+                        details.append(settings.load(self.environ).notes[0].detail)
+                    self.assertTrue(details[0].startswith(whole), details[0])
+                    free = settings._without_sign_in(text + "p" * 100)
+                    self.assertNotIn(word, free)
+                    self.assertIn(f" more, digest {_sha(free)})", details[1])
+                    for detail in details:
+                        self.assertNotIn(word, detail)
+                        self.assertNotIn(_sha(text + "p" * 100), detail)
+            lines = []
+            for word in PASSWORDS:
+                self.put(f'version = 1\n"{form.format(word)}{"p" * 100}" = 1\n')
+                lines.append(settings.load(self.environ).notes[0].detail)
+            self.assertEqual(lines[0], lines[1])  # the digest does not move when only the password changes
+
+    def test_every_sign_in_is_taken_out_however_the_addresses_are_joined(self) -> None:
+        for form, secret in JOINED:
+            with self.subTest(form=form):
+                shown, cut, free = [], [], []
+                for word in PASSWORDS:
+                    text = form.format(word)
+                    for value in (text, ("Ada", text), (("Ada", text),)):
+                        for cap in (40, 80, settings.NO_LIMIT):
+                            line = settings._shown(value, cap)
+                            self.assertNotIn(word, line)
+                            self.assertNotIn(secret.format(word), line)
+                            self.assertNotIn(word[:4], line)
+                    shown.append(settings._shown(text, settings.NO_LIMIT))
+                    key = text + "/" + "q" * 100
+                    cut.append(settings._shown(key, 80, key=8))
+                    self.assertNotIn(_sha(key), cut[-1])
+                    self.assertNotIn(word, cut[-1])
+                    free.append(settings._without_sign_in(key))
+                    self.assertNotIn(word, free[-1])
+                self.assertIn("<sign-in hidden>", shown[0])
+                self.assertEqual(shown[0], shown[1])  # only the password changed: the same line
+                self.assertEqual(cut[0], cut[1])  # and the same digest
+                self.assertEqual(free[0], free[1])
+
+    def test_an_address_with_no_sign_in_keeps_every_character(self) -> None:
+        # A run with no @ stays whole: hosts and their ports.
+        for text in ("https://h1/,https://h2:8443/x",):
+            with self.subTest(text=text):
+                self.assertEqual(repr(text), settings._shown(text, settings.NO_LIMIT))
+
+    def test_a_host_or_a_path_before_the_last_at_sign_is_hidden_with_it(self) -> None:
+        # The safe side: everything before the last @ of the run is hidden but a scheme at its very start.
+        for text, whole in (("https://h1/u@mail,ada@example.com", "'https://<sign-in hidden>@example.com'"),
+                            ("a@b,https://h2/", "'<sign-in hidden>@b,https://h2/'"),
+                            ("https://h1/?to=ada@example.com#u@x", "'https://<sign-in hidden>@x'"),
+                            ("https://[2001:db8::1]:5432/x,https://h2/@x", "'https://<sign-in hidden>@x'"),
+                            ("https://h:8080/u@mail", "'https://<sign-in hidden>@mail'")):
+            with self.subTest(text=text):
+                self.assertEqual(whole, settings._shown(text, settings.NO_LIMIT))
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class ACutKeyNeverCarriesFewerThanTheLeastDigest(_Folder):
+    """A digest is shortened to fit the cap, but never below the least of status.digest_chars."""
+
+    def test_a_key_whose_count_has_six_digits_keeps_the_least_digest_within_the_least_cap(self) -> None:
+        # Each U+200E is shown as its escape of 6 characters, so the count of what is not shown has 6 digits and
+        # the room the cap of 40 leaves beside the key's first characters is 5: the least, 6, stands.
+        key = "\u200e" * 21832
+        least = settings.DECLARED[settings.DIGEST_CHARS].floor
+        pattern = re.compile(r"^(.*)\.\.\. \((\d{6}) more, digest ([0-9a-f]+)\)$")
+        for chars in (6, 8, 64):
+            with self.subTest(chars=chars):
+                shown = settings._shown(key, 40, key=chars)
+                self.assertLessEqual(len(shown), 40, shown)
+                found = pattern.match(shown)
+                self.assertIsNotNone(found, shown)
+                self.assertEqual(least, len(found.group(3)), shown)
+                self.assertEqual(_sha(key, least), found.group(3))
+                self.assertGreater(len(found.group(1)), 1, shown)  # the quote and part of the key
+
+# The forms of a password that a reading of a host and its port, or a cut at each scheme mark, let through: (the
+# form with {} for the made-up password, the secret's own text around {}, the line shown whole as a value).
+PAST_A_PORT_OR_A_SCHEME_MARK = (
+    ("https://UsrQ:1234/{}@dbhost/x", "1234/{}", "'https://<sign-in hidden>@dbhost/x'"),  # digits, then a slash
+    ("https://UsrQ:1234#{}@dbhost/x", "1234#{}", "'https://<sign-in hidden>@dbhost/x'"),  # digits, then a hash
+    ("https://UsrQ:1234?{}@dbhost/x", "1234?{}", "'https://<sign-in hidden>@dbhost/x'"),  # digits, then a ?
+    ("https://UsrQ:QZJa://{}@dbhost/x", "QZJa://{}", "'https://<sign-in hidden>@dbhost/x'"),  # a scheme mark
+    ("https://UsrQ:QZJahttps://{}@dbhost/x", "QZJahttps://{}", "'https://<sign-in hidden>@dbhost/x'"),  # a scheme
+    ("UsrQ:QZJa://{}@dbhost/x", "QZJa://{}", "'<sign-in hidden>@dbhost/x'"),  # a scheme mark, no scheme before
+    ("https://a:x@h1/,https://UsrQ:1234/{}@h2/", "1234/{}", "'https://<sign-in hidden>@h2/'"),  # the second of two
+)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class FromTheFirstSchemeMarkToTheLastAtSignIsHidden(_Folder):
+    """A password that holds digits and then a slash, a hash or a question mark, or that holds a scheme mark, is
+    hidden as a value and as a key, shown whole or cut; the digest of a cut key does not move with it."""
+
+    def assert_hidden(self, line: str, form: str, secret: str, word: str) -> None:
+        self.assertNotIn(word, line)
+        self.assertNotIn(secret.format(word), line)
+        self.assertNotIn("UsrQ", line)
+        self.assertNotIn("QZJa", line)
+
+    def test_as_a_value(self) -> None:
+        for form, secret, whole in PAST_A_PORT_OR_A_SCHEME_MARK:
+            for word in PASSWORDS:
+                text = form.format(word)
+                with self.subTest(form=form, word=word):
+                    for value in (text, ("Ada", text), (("Ada", text),)):
+                        for cap in (40, 80, settings.NO_LIMIT):
+                            self.assert_hidden(settings._shown(value, cap), form, secret, word)
+                    self.assertEqual(whole, settings._shown(text, settings.NO_LIMIT))
+
+    def test_as_a_key_shown_whole(self) -> None:
+        for form, secret, whole in PAST_A_PORT_OR_A_SCHEME_MARK:
+            details = []
+            for word in PASSWORDS:
+                with self.subTest(form=form, word=word):
+                    self.put(f'version = 1\n"{form.format(word)}" = 1\n')
+                    details.append(settings.load(self.environ).notes[0].detail)
+                    self.assertTrue(details[-1].startswith(whole), details[-1])
+                    self.assert_hidden(details[-1], form, secret, word)
+            with self.subTest(form=form):
+                self.assertEqual(details[0], details[1])  # only the password changed: the same line
+
+    def test_as_a_key_cut_the_digest_holds_still_while_only_the_password_changes(self) -> None:
+        for form, secret, whole in PAST_A_PORT_OR_A_SCHEME_MARK:
+            details = []
+            for word in PASSWORDS:
+                key = form.format(word) + "p" * 100
+                with self.subTest(form=form, word=word):
+                    self.put(f'version = 1\n"{key}" = 1\n')
+                    details.append(settings.load(self.environ).notes[0].detail)
+                    self.assert_hidden(details[-1], form, secret, word)
+                    self.assertIn(f" more, digest {_sha(settings._without_sign_in(key))})", details[-1])
+                    self.assertNotIn(_sha(key), details[-1])
+            with self.subTest(form=form):
+                self.assertEqual(details[0], details[1])  # the digest does not move when only the password changes
+
+
+# The generated test: made-up passwords from this alphabet (letters, digits and the marks a password may hold, the
+# scheme mark drawn as one), a set count of draws from one seed, in one address and in two joined addresses.
+GENERATED_ALPHABET = tuple(string.ascii_letters + string.digits) + ("/", ":", "#", "?", "@", "%", ",", ";", "://")
+GENERATED_DRAWS = 5000
+GENERATED_SEED = 729
+GENERATED_LONGEST = 24
+GENERATED_FORMS = (
+    "https://u:{}@dbhost/x",  # one address
+    "https://a:x@h1/,https://u:{}@h2/x",  # the second of two joined by a comma
+    "https://u:{}@h1/;postgres://b:x@h2/db",  # the first of two joined by a semicolon
+    "https://u:{}@h1https://b:x@h2",  # the first of two joined by nothing
+)
+
+
+# The second generator: a password label of the look-alike rule (each spelling, in lower, upper and mixed case,
+# then each mark or none) or a known key prefix, then a made-up password from GENERATED_ALPHABET that holds an @:
+# the last @ at any place and the tail after it of every length from 0 to GENERATED_LONGEST, for each form in turn.
+# The reproduced cases come first, set by hand.
+LABELLED_SEED = 2311
+LABELLED_DRAWS = 50  # for each label, case and mark, and for each key prefix: two of each tail length
+LABELLED_WORDS = ("password", "passwd", "secret", "apikey", "api_key", "api-key", "bearer", "token")
+LABELLED_MARKS = ("=", ":", ": ", " = ", "")
+LABELLED_BY_HAND = (("password=", "hunter2@x7Gq9zLm"), ("token:", "abc@defghijk"), ("password=", "hunter2@x7Gq"))
+
+
+def _labelled_forms() -> list[tuple[str, bool]]:
+    """(the label and its mark, or a key prefix; whether it is a label with no mark)."""
+    forms = []
+    for word in LABELLED_WORDS:
+        mixed = "".join(c.upper() if i % 2 else c for i, c in enumerate(word))
+        for spelled in (word, word.upper(), mixed):
+            forms.extend((spelled + mark, not mark) for mark in LABELLED_MARKS)
+    return forms + [(prefix, False) for prefix in settings._KEY_PREFIXES]
+
+
+def _labelled_draws():
+    """(the form, the password) of each draw: the reproduced cases, then LABELLED_DRAWS for each form."""
+    yield from LABELLED_BY_HAND
+    draw = random.Random(LABELLED_SEED)
+    no_at = tuple(c for c in GENERATED_ALPHABET if c != "@")
+    marks = tuple(c for c in GENERATED_ALPHABET if not c[0].isalnum())
+    for form, bare in _labelled_forms():
+        for i in range(LABELLED_DRAWS):
+            tail = "".join(draw.choice(no_at) for _ in range(i % (GENERATED_LONGEST + 1)))
+            before = "".join(draw.choice(GENERATED_ALPHABET) for _ in range(draw.randint(0, GENERATED_LONGEST)))
+            while len(before) + 1 + len(tail) < settings._KEY_TAIL:  # the label rule reads a password this long
+                before += draw.choice(GENERATED_ALPHABET)
+            password = before + "@" + tail
+            if bare and (password[0].isalnum() or password[0] == "_"):
+                # a label and a password with no mark between them that read as one longer word ('tokenab@c')
+                # are no label to the look-alike rule; a mark begins the password instead
+                password = draw.choice(marks) + password
+            yield form, password
+
+
+class AGeneratedPasswordNeverReachesALine(unittest.TestCase):
+    """In every draw no run of 3 characters of the password (so no longer run either) stands in a line shown for
+    it, as a value whole and cut and as a key cut, and every such line, the cut key's digest with it, is the line
+    shown for a stand-in password that shares no character with the alphabet."""
+
+    @staticmethod
+    def lines(text: str) -> tuple[str, str, str]:
+        return (settings._shown(text, settings.NO_LIMIT), settings._shown(text, 40),
+                settings._shown(text + "/" + "q" * 100, 80, key=8))
+
+    def test_no_run_of_a_generated_password_reaches_a_line_and_no_digest_moves(self) -> None:
+        draw = random.Random(GENERATED_SEED)
+        drawn = 0
+        for form in GENERATED_FORMS:
+            reference = self.lines(form.format("~"))
+            key = form.format("~") + "/" + "q" * 100
+            self.assertIn(f"digest {_sha(settings._without_sign_in(key))})", reference[2])
+            for _ in range(GENERATED_DRAWS):
+                password = "".join(draw.choice(GENERATED_ALPHABET)
+                                   for _ in range(draw.randint(1, GENERATED_LONGEST)))
+                drawn += 1
+                runs = {password[i:i + 3] for i in range(len(password) - 2)}
+                for line, before in zip(self.lines(form.format(password)), reference):
+                    # a run the stand-in's line holds too (a scheme mark, a word of the note) is no trace
+                    leaked = sorted(run for run in runs if run in line and run not in before)
+                    if leaked or line != before:
+                        self.fail(f"form {form!r}, password {password!r}: {leaked} in {line!r}")
+        self.assertEqual(len(GENERATED_FORMS) * GENERATED_DRAWS, drawn)
+
+    def test_a_labelled_password_that_holds_an_at_sign_is_hidden_whole(self) -> None:
+        # The label or prefix and the password as one value: whole, cut and as a key cut, the line is the
+        # hidden-key words and no run of 3 characters of the password stands in it.
+        drawn, failed = 0, []
+        for form, password in _labelled_draws():
+            drawn += 1
+            runs = {password[i:i + 3] for i in range(len(password) - 2)}
+            lines = self.lines(form + password)
+            leaked = sorted(run for run in runs if any(run in line for line in lines) and run not in settings._HIDDEN_KEY)
+            if leaked or set(lines) != {settings._HIDDEN_KEY}:
+                failed.append(f"{form + password!r}: {leaked} in {lines!r}")
+        self.assertEqual(len(LABELLED_BY_HAND) + len(_labelled_forms()) * LABELLED_DRAWS, drawn)
+        self.assertEqual([], failed[:4], f"{len(failed)} of {drawn} generated values show a part of the password")
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class ALabelledPasswordIsHiddenWhole(_Folder):
+    """A value or a key whose own text carries a password label or a known key prefix is never shown, not in
+    part, wherever the @ stands in it: in status (python -m recursion_core.settings) and in the start log, under
+    names that hold no hidden word."""
+
+    def shown(self, text: str) -> str:
+        self.put(text)
+        env = dict(self.environ, PATH=os.environ.get("PATH", ""), PYTHONPATH=str(CORE), TMPDIR=str(self.tmp))
+        proc = subprocess.run([sys.executable, "-B", "-m", "recursion_core.settings"], capture_output=True,
+                              text=True, env=env, cwd=str(self.tmp), timeout=60, check=False)
+        _, messages, _ = TheDaemonsStart.start_log(self)
+        logged = [message for message in messages if message.startswith("settings: ")]
+        self.assertTrue(logged)
+        return proc.stdout + proc.stderr + "\n".join(logged)
+
+    def assert_hidden_whole(self, file) -> None:
+        real = [form + password for form, password in LABELLED_BY_HAND]
+        stand_in = [form + "~" * len(password) for form, password in LABELLED_BY_HAND]
+        out = self.shown(file(real))
+        self.assertIn("<hidden", out)
+        for form, password in LABELLED_BY_HAND:
+            self.assertNotIn(password[3:], out)
+            self.assertNotIn(password[password.rfind("@"):], out)  # the tail after the last @
+        self.assertEqual(self.shown(file(stand_in)), out)  # only the password changed: every line the same
+
+    def test_as_values_under_names_that_hold_no_hidden_word(self) -> None:
+        def file(texts: list[str]) -> str:
+            return (f'version = 1\n[plugin_host]\ngil_check = "{texts[0]}"\n[status]\nvalue_max_chars = "none"\n'
+                    f'shown_names = [{", ".join(chr(34) + text + chr(34) for text in texts)}]\n')
+        self.assert_hidden_whole(file)
+
+    def test_as_keys_of_the_file(self) -> None:
+        self.assert_hidden_whole(lambda texts: "version = 1\n" + "".join(f'"{text}" = 1\n' for text in texts))
+
+    def test_every_labelled_draw_as_a_key_of_a_file_is_hidden_whole(self) -> None:
+        self.put('version = 1\n"zzzz" = 1\n"zz.zz" = 1\n')  # the words of the two notes a key can meet
+        tails = {note.detail[len(repr(key)):] for key, note in zip(("zzzz", "zz.zz"), settings.load(self.environ).notes)}
+        batches = collections.defaultdict(dict)
+        for form, password in _labelled_draws():
+            batches[form].setdefault(form + password, password)
+        drawn, failed = 0, []
+        for keys in batches.values():
+            self.put("version = 1\n" + "".join(f'"{key}" = 1\n' for key in keys))
+            notes = settings.load(self.environ).notes
+            self.assertEqual(len(keys), len(notes))
+            for number, (key, note) in enumerate(zip(keys, notes), 1):
+                drawn += 1
+                name = settings._HIDDEN_KEY_NAME.format(number)
+                rest = re.sub(r"; did you mean [a-z_.]+\?$", "", note.detail[len(name):])
+                if not note.detail.startswith(name) or rest not in tails:
+                    failed.append(f"{key!r}: {note.detail!r}")
+        self.assertEqual(sum(len(keys) for keys in batches.values()), drawn)
+        self.assertEqual([], failed[:4], f"{len(failed)} of {drawn} generated keys show a part of the password")
+
+
+# Sign-ins with no scheme at the very start of their run: (the form with {} for the made-up secret, the parts of
+# the form that must never be shown, the line shown whole as a value). Everything before the last @ is hidden.
+BEFORE_THE_LAST_AT_SIGN = (
+    ("Us!rQ:{}@h/x", ("Us!", "rQ"), "'<sign-in hidden>@h/x'"),  # a mark in the user name, then a password
+    ("Us{}!rQ:QZJa@h/x", ("Us", "rQ", "QZJa"), "'<sign-in hidden>@h/x'"),  # the secret in the user name
+    ("ab/CD+{}=:QZJa@h/x", ("ab/CD", "QZJa"), "'<sign-in hidden>@h/x'"),  # a slash, a plus, an equals sign
+    ("x=Us${}:QZJa@h/x", ("x=Us", "QZJa"), "'<sign-in hidden>@h/x'"),  # a label, then a dollar sign
+    ("{}@github.com/org/repo", (), "'<sign-in hidden>@github.com/org/repo'"),  # a token as the user, no colon
+    ("{}@dbhost:5432", (), "'<sign-in hidden>@dbhost:5432'"),  # the colon only after the last @, a port
+    ("{}@github.com:org/repo.git", (), "'<sign-in hidden>@github.com:org/repo.git'"),  # the scp form
+    ("{}@h1,https://UsrQ:QZJa@h2/", ("UsrQ", "QZJa", "h1,"), "'<sign-in hidden>@h2/'"),  # a token before a scheme
+    ("x;{}@h0.example.com", ("x;",), "'<sign-in hidden>@h0.example.com'"),  # a label and a token
+    ("h0.example.com/db?x=1*{}@h1.example.com", ("h0.", "db?x"), "'<sign-in hidden>@h1.example.com'"),  # a host
+    ("url=https://UsrQ:{}@h/x", ("url=", "UsrQ"), "'<sign-in hidden>@h/x'"),  # a label before a scheme
+)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class EverythingBeforeTheLastAtSignIsHidden(_Folder):
+    """With no scheme at the very start of a run, nothing before its last @ is shown: not a user name or a part
+    of it, not a token used as the user name, not a label or an earlier host; as a value and as a key, shown
+    whole or cut, and the digest of a cut key does not move with what is hidden."""
+
+    def assert_hidden(self, line: str, form: str, parts: tuple[str, ...], word: str) -> None:
+        self.assertNotIn(word, line)
+        self.assertNotIn(word[:3], line)
+        for part in parts:
+            self.assertNotIn(part, line)
+
+    def test_as_a_value(self) -> None:
+        for form, parts, whole in BEFORE_THE_LAST_AT_SIGN:
+            for word in PASSWORDS:
+                text = form.format(word)
+                with self.subTest(form=form, word=word):
+                    for value in (text, ("Ada", text), (("Ada", text),)):
+                        for cap in (40, 80, settings.NO_LIMIT):
+                            self.assert_hidden(settings._shown(value, cap), form, parts, word)
+                    self.assertEqual(whole, settings._shown(text, settings.NO_LIMIT))
+
+    def test_as_a_key_shown_whole(self) -> None:
+        for form, parts, whole in BEFORE_THE_LAST_AT_SIGN:
+            details = []
+            for word in PASSWORDS:
+                with self.subTest(form=form, word=word):
+                    self.put(f'version = 1\n"{form.format(word)}" = 1\n')
+                    details.append(settings.load(self.environ).notes[0].detail)
+                    self.assertTrue(details[-1].startswith(whole), details[-1])
+                    self.assert_hidden(details[-1], form, parts, word)
+            with self.subTest(form=form):
+                self.assertEqual(details[0], details[1])  # only the secret changed: the same line
+
+    def test_as_a_key_cut_the_digest_holds_still_while_only_the_hidden_part_changes(self) -> None:
+        for form, parts, whole in BEFORE_THE_LAST_AT_SIGN:
+            details = []
+            for word in PASSWORDS:
+                key = form.format(word) + "/" + "p" * 100  # a slash: '5432' and the p's are no key-like run
+                with self.subTest(form=form, word=word):
+                    self.put(f'version = 1\n"{key}" = 1\n')
+                    details.append(settings.load(self.environ).notes[0].detail)
+                    self.assert_hidden(details[-1], form, parts, word)
+                    self.assertIn(f" more, digest {_sha(settings._without_sign_in(key))})", details[-1])
+                    self.assertNotIn(_sha(key), details[-1])
+            with self.subTest(form=form):
+                self.assertEqual(details[0], details[1])  # the digest does not move when only the secret changes
+
+
+class WhatEndsARun(unittest.TestCase):
+    """A run ends at every white-space character as Python counts them, and at nothing else: a zero-width
+    character inside a sign-in does not end its run, so the sign-in stays hidden whole."""
+
+    def test_every_white_space_character_ends_a_run_and_nothing_else_does(self) -> None:
+        for code in range(0x110000):
+            char = chr(code)
+            if bool(settings._SPACE.fullmatch(char)) != char.isspace():
+                self.fail(f"U+{code:04X}: ends a run {bool(settings._SPACE.fullmatch(char))}, white space "
+                          f"{char.isspace()}")
+
+    def test_a_zero_width_character_does_not_end_a_run(self) -> None:
+        for mark in tuple(chr(code) for code in (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF)):
+            with self.subTest(mark=f"U+{ord(mark):04X}"):
+                self.assertEqual("'https://<sign-in hidden>@h/x'",
+                                 settings._shown(f"https://UsrQ:QZ{mark}Ja@h/x", settings.NO_LIMIT))
+                self.assertEqual("'<sign-in hidden>@h/x'", settings._shown(f"Us{mark}rQ@h/x", settings.NO_LIMIT))
+
+    def test_white_space_ends_a_run_and_the_run_after_it_is_read_alone(self) -> None:
+        for mark in tuple(chr(code) for code in (0x20, 0x09, 0x0A, 0xA0, 0x2028, 0x1F)):
+            with self.subTest(mark=f"U+{ord(mark):04X}"):
+                line = settings._shown(f"Us{mark}rQ@h/x", settings.NO_LIMIT)
+                self.assertTrue(line.endswith("<sign-in hidden>@h/x'"), line)
+                self.assertNotIn("rQ", line)
+
+
+# The generated test of the one rule: made-up secrets from every ASCII letter, digit and mark (the scheme mark drawn
+# as one), as user names with and without a colon and as passwords, after a scheme, a label or nothing, in 1, 2 or 5
+# addresses joined by any ASCII mark or by nothing; a set count of draws from one seed.
+GENERATED_RUN_ALPHABET = tuple(string.ascii_letters + string.digits + string.punctuation) + ("://",)
+GENERATED_RUN_DRAWS = 50000
+GENERATED_RUN_SEED = 7295
+GENERATED_RUN_LONGEST = 40
+GENERATED_RUN_SCHEMES = ("", "", "https", "postgres", "postgresql+psycopg", "jdbc:postgresql", "redis", "git+ssh",
+                         "mongodb+srv", "amqps")
+GENERATED_RUN_LABELS = ("", "", "url=", "dsn:", "x;")
+GENERATED_RUN_FORMS = ("UsrQ:{p}@", "{s}:{p}@", "{s}@", ":{p}@", "")  # the last: no sign-in
+GENERATED_RUN_PATHS = ("", "/db", ":5432/x", "/x?y=1")
+# The scheme and its mark a run may begin with, as the module's words say it, written here again.
+A_SCHEME_AT_THE_START = re.compile(r"[A-Za-z0-9+.-]+://")
+
+
+class NothingBeforeTheLastAtSignReachesALine(unittest.TestCase):
+    """In every generated draw no run of 3 characters of what stood before the last @ (the scheme at the very start
+    aside) stands in a line shown for it (a value whole and at the cap of 40, a key cut at 80 and at 40) that the
+    line of a stand-in lacks, where the stand-in is the same text with all of that part written as one '~'; and
+    every such line, a cut key's digest with it, is the stand-in's line."""
+
+    @staticmethod
+    def lines(text: str) -> tuple[str, ...]:
+        key = text + "/" + "q" * 100
+        return (settings._shown(text, settings.NO_LIMIT), settings._shown(text, 40),
+                settings._shown(key, 80, key=8), settings._shown(key, 40, key=6))
+
+    def test_no_run_of_what_stood_before_the_last_at_sign_reaches_a_line_and_no_digest_moves(self) -> None:
+        draw = random.Random(GENERATED_RUN_SEED)
+
+        def secret() -> str:
+            return "".join(draw.choice(GENERATED_RUN_ALPHABET) for _ in range(draw.randint(1, GENERATED_RUN_LONGEST)))
+
+        seen = collections.Counter()
+        for _ in range(GENERATED_RUN_DRAWS):
+            parts = [draw.choice(GENERATED_RUN_LABELS)]
+            for i in range(draw.choice((1, 2, 5))):
+                if i:
+                    parts.append(draw.choice(("",) + tuple(string.punctuation)))
+                scheme, form = draw.choice(GENERATED_RUN_SCHEMES), draw.choice(GENERATED_RUN_FORMS)
+                seen[f"form {form!r}"] += 1
+                parts.append((scheme + "://" if scheme else "") + form.format(s=secret(), p=secret())
+                             + f"h{i}.example.com" + draw.choice(GENERATED_RUN_PATHS))
+            text = "".join(parts)
+            last = text.rfind("@")
+            start = A_SCHEME_AT_THE_START.match(text)
+            begin = start.end() if start else 0
+            if last <= begin:
+                seen["nothing before an @"] += 1
+                continue
+            seen["a scheme at the start" if start else "no scheme at the start"] += 1
+            hidden = text[begin:last]
+            runs = {hidden[i:i + 3] for i in range(len(hidden) - 2)}
+            stand_in = self.lines(text[:begin] + "~" + text[last:])
+            if settings._key_shape_as_written(text) and not settings._key_shape_as_written(text[:begin] + "~"
+                                                                                         + text[last:]):
+                # The one exception: the hidden part carries a password label or a known key prefix, as the
+                # module's own predicate reads it, so every line is the words for a hidden key or password.
+                seen["the hidden part carries a key shape"] += 1
+                stand_in = (settings._HIDDEN_KEY,) * len(stand_in)
+            for line, before in zip(self.lines(text), stand_in):
+                leaked = sorted(run for run in runs if run in line and run not in before)
+                if leaked or line != before:
+                    self.fail(f"text {text!r}: {leaked} in {line!r}, the stand-in's line {before!r}")
+        self.assertEqual(GENERATED_RUN_DRAWS, seen["nothing before an @"] + seen["a scheme at the start"]
+                         + seen["no scheme at the start"])
+        kinds = ["a scheme at the start", "no scheme at the start"] + [f"form {f!r}" for f in GENERATED_RUN_FORMS]
+        for drawn in kinds:
+            self.assertGreater(seen[drawn], 0, drawn)
 
 
 if __name__ == "__main__":

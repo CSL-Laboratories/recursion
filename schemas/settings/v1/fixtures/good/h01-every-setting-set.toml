@@ -12,3 +12,5 @@ value_max_chars = 120
 hidden_names = ["pin"]
 # Show no setting under a hidden name anyway.
 shown_names = []
+# Show ten characters of the digest of a long key.
+digest_chars = 10

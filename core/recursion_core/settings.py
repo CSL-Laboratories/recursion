@@ -36,14 +36,30 @@ The rules this module keeps:
 * ONE CAP ON A SHOWN VALUE. Every value status, the start log or a note shows passes ``_shown``, whose one
   return goes through the cap of the row ``status.value_max_chars`` (80 characters as shipped, 40 at least;
   ``"none"`` shows every value whole): a text past it is cut and the characters not shown are counted, and
-  a list keeps the names that fit whole and counts the rest.
+  a list keeps the names that fit whole and counts the rest. A key of the file is capped the same way; a key
+  that is cut carries the first characters of the SHA-256 of its text after the sign-in rule's hiding
+  (below), said to be a digest (the row ``status.digest_chars``, 8 as shipped, as many as fit the cap beside the
+  key's first 8 characters, 6 at least), so two keys never read the same; a key that fits is shown whole.
 * NEVER SHOWN, under any cap and under ``"none"``, not in part and not by its length: the value of a
   setting whose name holds a word of the row ``status.hidden_names`` (the first net: by name, whatever the
-  value looks like); the sign-in of a web address, what stands between the scheme and the host, also
-  without a scheme and inside a longer text (``postgres://<sign-in hidden>@db/x``); and a text that looks
-  like a key or a password. That look-alike rule is only a second net: it misses a short key, a key of one
-  case or of digits only, a UUID, base64 cut by ``+`` or ``/``, and a key split over a list's items, so
-  such a value under a name not on the list is shown. Every line is one line: a line break, a control
+  value looks like); a text that looks like a key or a password; and a sign-in, by one rule on each run of
+  text (the sign-in rule). A run is what stands between two white-space characters as Python counts them
+  (``str.isspace``: a space, a tab, a line break, a no-break space, U+2028, U+001C to U+001F and the
+  others); a zero-width character such as U+200B does not end a run. In a run that holds an @, everything
+  before its LAST @ is hidden, except a scheme and its mark at the very start of the run (ASCII letters,
+  digits, ``+``, ``.`` and ``-``, then ``://``), which stay: ``postgres://<sign-in hidden>@db/x``,
+  ``<sign-in hidden>@db/x``. Nothing else before that @ is shown: not a user name or a part of it, not a
+  label, not the host or the path of an earlier address (two joined addresses show as
+  ``a://<sign-in hidden>@h2/``, ``https://h/u@mail`` as ``https://<sign-in hidden>@mail`` and
+  ``url=a://u:p@h`` as ``<sign-in hidden>@h``); what follows the last @ is shown. Everything before the last
+  at-sign of a run is hidden; of an email address only the part after the at-sign is shown. The sign-in
+  rule misses a sign-in that holds white space (the run ends there, and what stands before it is shown), an
+  address written wholly percent-escaped, and a secret written as the scheme at the very start of a run.
+  The look-alike rule is only a second net: it misses a short key, a key of
+  one case or of digits only, a UUID, base64 cut by ``+`` or ``/``, and a key split over a list's items, so
+  such a value under a name not on the list is shown. A value or a key whose own text, as the person wrote
+  it, carries a password label or a known key prefix is never shown, not in part, wherever an @ stands in
+  it: ``password=ab@cdefgh`` is hidden whole. Every line is one line: a line break, a control
   character or a direction or format character is shown escaped (``\\n``, ``\\u202e``).
 * A FILE ADDS AND NEVER TAKES AWAY. The words of ``status.hidden_names`` a file lists are added to the
   shipped words, which no file can take away; an empty or missing list keeps the shipped words alone. A
@@ -99,10 +115,17 @@ _NO_LIMIT_TEXT = "none"
 VALUE_MAX_CHARS = "status.value_max_chars"  # the row of the one cap on a shown value
 HIDDEN_NAMES = "status.hidden_names"  # the row of the words of a name whose value is never shown
 SHOWN_NAMES = "status.shown_names"  # the row of the settings shown although their name holds such a word
+DIGEST_CHARS = "status.digest_chars"  # the row of how many hex characters of a cut key's digest are shown
 # The words put in place of what is never shown; each fits the least cap, so no cap cuts them.
 _HIDDEN_KEY = "<hidden: looks like a key or password>"
 _HIDDEN_NAME = f"<hidden: name in {HIDDEN_NAMES}>"
 _HIDDEN_SIGN_IN = "<sign-in hidden>"
+# A key of the file that looks like a key or a password: its ordinal among such keys by the file's order, equal
+# between two starts of the same file; no digest, no length and no character of its text.
+_HIDDEN_KEY_NAME = "<hidden key-like name {} of this file>"
+# A cut key keeps this many characters of its shown text (the opening quote and 8 of the key) before its digest;
+# the digest takes what is left of the cap, never less than the least of status.digest_chars. To become a row.
+_KEY_KEPT = 9
 # A text is never shown when it holds a run of this many letters and digits of two kinds or more, a known
 # key prefix or a password label followed by this many more characters, or a PEM block. Each figure is to
 # become a row of the settings file.
@@ -113,10 +136,10 @@ _KEY_PREFIXES = ("sk-", "sk_", "pk_", "rk_", "ghp_", "gho_", "ghu_", "ghs_", "gh
                  "hf_", "npm_", "pypi-")
 _KEY_RUN_TEXT = re.compile("[A-Za-z0-9]{%d,}" % _KEY_RUN)
 _KEY_LABEL = re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|bearer|token)\b\s*[:=]?\s*\S{%d,}" % _KEY_TAIL)
-_KEY_PREFIX = re.compile(r"(?<![A-Za-z0-9])(?:%s)[A-Za-z0-9_.+/=-]{%d,}"
+_KEY_PREFIX = re.compile(r"(?<![A-Za-z0-9])(?:%s)\S{%d,}"
                          % ("|".join(re.escape(prefix) for prefix in _KEY_PREFIXES), _KEY_TAIL))
 _SPACE = re.compile(r"(\s+)")
-_KEY_DIGEST_BYTES = 3  # a key that is cut carries this many bytes of a digest of its whole text, in hex; to become a row
+_SCHEME_AT_START = re.compile(r"[A-Za-z0-9+.-]+://")  # the scheme and its mark a run may begin with
 _Advice = tuple[int | float | None, int | float | None]  # (at least, at most)
 
 
@@ -163,12 +186,21 @@ _SHOWN_NAMES_ROW = Setting(
     "whole as status shows it (such as db.api_token); empty as shipped. Each start and each status that uses "
     "this list says so in a note that names those settings. A text that looks like a key or password and the "
     "sign-in of an address stay hidden in such a value.")
+_DIGEST_CHARS_ROW = Setting(
+    DIGEST_CHARS, int, 8,
+    "How many hex characters of the SHA-256 digest of a key's text, with what the sign-in rule hides taken "
+    "out, a key cut at the cap carries in a note, so two long keys that differ only past the cap read "
+    "apart; a key that fits the cap carries none. The least is 6, since below it two keys read the same too "
+    "often; past 64, the whole digest, nothing more is shown, so 64 is the advised most. A cut key carries "
+    "only as many as fit the cap beside its first 8 characters, and never fewer than 6.",
+    floor=6, advice=(None, 64))
 SETTINGS: tuple[Setting, ...] = (
     Setting("plugin_host.gil_check", bool, True,
             "Whether each plugin host makes its GIL check; on by default, and a person may turn it off."),
     _VALUE_MAX_CHARS_ROW,
     _HIDDEN_NAMES_ROW,
     _SHOWN_NAMES_ROW,
+    _DIGEST_CHARS_ROW,
 )
 DECLARED = MappingProxyType({row.name: row for row in SETTINGS})
 
@@ -232,8 +264,30 @@ def _looks_like_a_key(text: str) -> bool:
                for run in _KEY_RUN_TEXT.findall(text))
 
 
+def _key_shape_as_written(text: str) -> bool:
+    """Whether ``text``, as the person wrote it and before the sign-in rule, carries a password label or a known
+    key prefix (``_KEY_LABEL``, ``_KEY_PREFIX``). Where it does, the whole text is never shown, even where the
+    label or prefix stands in a part the sign-in rule would hide: then one fact about that part is shown, that
+    it looks like a key or a password, and never a character of it."""
+
+    return bool(_KEY_LABEL.search(text) or _KEY_PREFIX.search(text))
+
+
+def _never_shown(text: str) -> bool:
+    """Whether a text of the person's file, a value or a key, is never shown, not in part: the one predicate
+    the value path (``_piece``) and the key path (``load``) both ask. A password label or a known key prefix
+    is read on the text as the person wrote it, so the sign-in rule cannot take a label away and leave the end
+    of its password in view: ``password=ab@cdefgh`` is hidden whole, wherever the @ stands. The whole
+    look-alike rule is read on the text after the sign-in rule as well. The long-run test is not read on the
+    text as written: a long run inside a sign-in the rule hides would hide the whole address."""
+
+    return _key_shape_as_written(text) or _looks_like_a_key(_without_sign_in(text))
+
+
 def _without_sign_in(text: str) -> str:
-    """``text`` with the sign-in of every web address in it replaced by words that say so; the rest stays."""
+    """``text`` with what the sign-in rule hides in each run (``_run_without_sign_in``) replaced by words that
+    say so; the rest stays. A run ends at every white-space character as Python counts them (``str.isspace``);
+    a zero-width character does not end a run."""
 
     if "@" not in text:
         return text
@@ -241,33 +295,20 @@ def _without_sign_in(text: str) -> str:
 
 
 def _run_without_sign_in(run: str) -> str:
-    """One run of text without a space. With a scheme, the sign-in is what stands between ``://`` and the
-    host: up to the last @ before the path, or, where what stands there is no host and port (a password that
-    holds a /), up to the last @ of the run. Without a scheme it is a name, a colon and what follows, up to
-    the last @ of the run. What cannot be told from a host is hidden too. Each step is one pass over the run."""
+    """One run of text with no white space in it, by one rule that errs on the side of hiding: everything
+    before the run's LAST @ is hidden, except a scheme and its mark at the very start of the run
+    (``_SCHEME_AT_START``: ASCII letters, digits, ``+``, ``.`` and ``-``, then ``://``), which stay. Nothing
+    else before that @ is shown: not a user name or a part of it, not a label, not a host or a path of an
+    earlier address. What follows the last @ is shown. So of a mail address only the part after the @ is
+    shown; a run with no @, or with nothing before its last @ but such a scheme, stays whole."""
 
     last = run.rfind("@")
     if last < 0:
         return run
-    mark = run.find("://", 0, last)
-    if mark >= 0:
-        begin = mark + 3
-        ends = [i for i in (run.find(c, begin) for c in "/?#") if i >= 0]
-        authority = run[begin:min(ends, default=len(run))]
-        if "@" in authority:
-            end = begin + authority.rfind("@")
-        else:
-            host = authority.split("]", 1)[1] if authority.startswith("[") and "]" in authority else authority
-            if ":" not in host or host.rsplit(":", 1)[1].isdigit() or host.endswith(":"):
-                return run  # a host, or a host and its port: no sign-in, and an @ after it is in the path
-            end = last
-        return run[:begin] + _HIDDEN_SIGN_IN + run[end:]
-    colon = run.find(":", 0, last)
-    if colon < 0:
+    scheme = _SCHEME_AT_START.match(run)  # it holds no @, so it ends at or before the last @
+    begin = scheme.end() if scheme else 0
+    if begin == last:
         return run
-    begin = colon
-    while begin > 0 and (run[begin - 1].isalnum() or run[begin - 1] in ".%+~_-"):
-        begin -= 1
     return run[:begin] + _HIDDEN_SIGN_IN + run[last:]
 
 
@@ -308,10 +349,10 @@ def _piece(value: object) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
-        text = _without_sign_in(str.__str__(value))  # its own text: never a subclass's __str__ or __repr__
-        if _looks_like_a_key(text):  # never shown, not in part and not by its length, whatever the cap
+        text = str.__str__(value)  # its own text: never a subclass's __str__ or __repr__
+        if _never_shown(text):  # never shown, not in part and not by its length, whatever the cap
             return _HIDDEN_KEY
-        return repr(text)
+        return repr(_without_sign_in(text))
     if isinstance(value, (int, float)):
         try:
             return (float.__repr__ if isinstance(value, float) else int.__repr__)(value)
@@ -320,10 +361,12 @@ def _piece(value: object) -> str:
     return _one_line(f"a {type(value).__name__}")
 
 
-def _digest(text: str) -> str:
-    """A short digest of the whole ``text``, so that two keys cut at the same place never read the same."""
+def _digest(text: str, chars: int) -> str:
+    """The first ``chars`` hex characters of the SHA-256 of ``text`` (UTF-8), so that two keys cut at the same
+    place never read the same. ``_shown`` gives it the key's text after the sign-in rule's hiding
+    (``_without_sign_in``), so nothing that rule hides enters the hash."""
 
-    return hashlib.blake2s(text.encode("utf-8", "surrogatepass"), digest_size=_KEY_DIGEST_BYTES).hexdigest()
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:chars]
 
 
 def _cut(text: str, cap: object, rest: int, names: bool, digest: str = "") -> str:
@@ -337,11 +380,14 @@ def _cut(text: str, cap: object, rest: int, names: bool, digest: str = "") -> st
             return f"... ({more} more, digest {digest})"
         return f"... ({more} more character{'' if more == 1 else 's'} not shown)"
 
+    if digest:  # as many digest characters as fit beside the key's first characters, never fewer than the least
+        room = cap - len(f"... ({len(text)} more, digest )") - _KEY_KEPT
+        digest = digest[:max(_DIGEST_CHARS_ROW.floor, room)]  # at the least cap every key of MAX_BYTES keeps 8
     keep = max(0, cap - len(said(len(text))))  # the count fits inside the cap
     return f"{text[:keep]}{said(len(text) - keep)}"
 
 
-def _shown(value: object, cap: object = None, hidden: bool = False, key: bool = False) -> str:
+def _shown(value: object, cap: object = None, hidden: bool = False, key: bool | int = False) -> str:
     """The one way a value becomes text for a person in this module: status, the start log and every note.
 
     Each branch computes text; the one return passes it through the cap, ``cap`` characters (the row
@@ -350,8 +396,11 @@ def _shown(value: object, cap: object = None, hidden: bool = False, key: bool = 
     whole, never cut inside a name, and counts the rest. With ``hidden`` (the setting's name holds a word of
     ``status.hidden_names``) the value is never shown; the sign-in of an address and a text that looks like a
     key or a password are never shown either (``_piece``): the look-alike rule is only a second net. With
-    ``key`` (the value is a key of the file) a cut text carries a short digest of the whole key, so that two
-    keys cut at the same place never read the same; a key that fits the cap is shown whole."""
+    ``key`` (the value is a key of the file) a cut text carries a short digest of the key's text after the
+    sign-in rule's hiding, so that two keys cut at the same place never read the same and nothing that rule
+    hides enters the hash; a key that fits the cap is shown whole. The digest has as many hex characters
+    as ``key`` says (the row ``status.digest_chars``), its shipped value when True, or as fit the cap beside the
+    key's first characters, never fewer than the row's least."""
 
     cap = _VALUE_MAX_CHARS_ROW.default if cap is None else cap
     text, names, rest = (_HIDDEN_NAME if hidden else _piece(value)), [], 0
@@ -366,7 +415,9 @@ def _shown(value: object, cap: object = None, hidden: bool = False, key: bool = 
             names.append(piece)
         rest = len(value) - len(names)
         text = "[" + ", ".join(names) + "]"
-    return _cut(text, cap, rest, bool(names), _digest(str.__str__(value)) if key and isinstance(value, str) else "")
+    chars = _DIGEST_CHARS_ROW.default if key is True else key
+    digest = _digest(_without_sign_in(str.__str__(value)), chars) if key and isinstance(value, str) else ""
+    return _cut(text, cap, rest, bool(names), digest)
 
 
 def _allows_no_limit(row: Setting) -> bool:
@@ -516,17 +567,26 @@ def load(environ) -> Loaded:
     cap = _before_notes(flat, _VALUE_MAX_CHARS_ROW)
     names = _before_notes(flat, _HIDDEN_NAMES_ROW)
     shown = _before_notes(flat, _SHOWN_NAMES_ROW)
+    chars = _before_notes(flat, _DIGEST_CHARS_ROW)
+    hidden_keys = 0
+
+    def key_text(name: str) -> str:  # a key shown is capped with its digest; a key hidden carries its ordinal only
+        nonlocal hidden_keys
+        if _never_shown(name):
+            hidden_keys += 1
+            return _HIDDEN_KEY_NAME.format(hidden_keys)
+        return _shown(name, cap, key=chars)
     for name, found in flat:
         row = DECLARED.get(name)
         if found is _QUOTED:
-            notes.append(Note(UNKNOWN_KEY, f"{_shown(name, cap, key=True)} is a quoted key that holds a dot, not a setting; "
+            notes.append(Note(UNKNOWN_KEY, f"{key_text(name)} is a quoted key that holds a dot, not a setting; "
                                            "it is skipped; write it without the quotes", warns=True))
         elif row is None:
             known = sorted({*DECLARED, *(n.rsplit(".", 1)[0] for n in DECLARED)})  # its keys and its tables
             close = difflib.get_close_matches(name, known, n=1, cutoff=0.8)  # text only; never applied
             hint = f"; did you mean {close[0]}?" if close else ""
-            notes.append(Note(UNKNOWN_KEY, f"{_shown(name, cap, key=True)} is not a setting this version knows; it is "
-                                           f"skipped{hint}", warns=True))
+            notes.append(Note(UNKNOWN_KEY, f"{key_text(name)} is not a setting this version knows; it is "
+                                           f"skipped; remove it or check its spelling{hint}", warns=True))
         else:
             value, reason = _taken(row, found)
             if reason is None:

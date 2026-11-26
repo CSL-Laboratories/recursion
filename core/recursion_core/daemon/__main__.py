@@ -16,6 +16,7 @@ import logging
 import os
 from pathlib import Path
 import signal
+import sys
 import threading
 
 from recursion_core import settings
@@ -27,6 +28,44 @@ from .gui import LoopbackGUI
 from .launcher import EngineUnitManager
 
 log = logging.getLogger('recursion_core.daemon')
+_LOG_FORMAT = '%(asctime)s [%(process)d] %(levelname)s %(name)s: %(message)s'
+_OWN_HANDLER = 'recursion_daemon_own_handler'  # marks each handler the daemon adds (its own logger, or a bare root)
+
+
+class _StderrOfTheMoment(logging.StreamHandler):
+    """Writes to the ``sys.stderr`` of the moment it writes, as ``logging.lastResort`` does, so a host that later
+    puts another stderr in place and shuts the one it had at start gets no logging error, and the line reaches
+    the new one."""
+
+    def __init__(self) -> None:
+        logging.Handler.__init__(self)
+
+    @property
+    def stream(self):
+        return sys.stderr
+
+
+def _log_with_time_and_process_id():
+    """The daemon's lines carry the time and the process id and are written at INFO, whatever logging held.
+
+    A root with no handler gets one of the daemon's own in that form, at INFO (what ``basicConfig`` would do).
+    Where an embedding caller or a test host set up the root first, the daemon's own logger gets one handler of
+    its own in the same form, at INFO; the caller's handlers stay and still receive the lines. ``force=True``
+    would take the caller's handlers away. Every handler the daemon adds carries its mark, so a later main() in
+    the same process takes a root that holds only the daemon's own handler as not set up by anyone else and
+    writes each line once; each such handler writes to the stderr of the moment it writes."""
+    root = logging.getLogger()
+    earlier = any(not getattr(h, _OWN_HANDLER, False) for h in root.handlers)
+    for handler in [h for h in log.handlers if getattr(h, _OWN_HANDLER, False)]:
+        log.removeHandler(handler)  # a later main() in the same process: still one handler
+    handler = _StderrOfTheMoment()
+    setattr(handler, _OWN_HANDLER, True)
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    if earlier:
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+    elif not root.handlers:
+        logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT, handlers=[handler])
 
 
 def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep_seconds=5):
@@ -34,7 +73,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
     are installed plugin directories, which only the composed daemon loads, through the loader."""
     require_posix()  # Windows: typed PlatformUnsupported before any lock, state, socket or GUI
     require_free_threaded()
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(process)d] %(levelname)s %(name)s: %(message)s')
+    _log_with_time_and_process_id()
     refuse_engine_user(os.environ)
     check_operator_linger(getpass.getuser())
     runtime = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')

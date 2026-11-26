@@ -1487,6 +1487,87 @@ class RulesTest(unittest.TestCase):
                     seen = {keyword for keyword, location, _ in client.leaf_errors(validator, changed) if location == at}
                     self.assertLessEqual(keywords, seen)
 
+    # ---- sweep S1 of the merged drafts (Nov 15, 2026), the findings that reproduce on master
+    def test_page_positions_written_as_integral_floats_are_whole_numbers_and_exact(self):
+        """Event positions are integers of the schema, whatever their spelling: 42.0 and 43.0 continue a cursor at
+        41 as 42 and 43 do. And the arithmetic is exact: a page that repeats the requested position
+        9007199254740992 is out of order even where a float would round position + 1 back to it."""
+        rules = self.rules
+        g01 = self.vector("event.page/g01-*.json")
+        page = copy.deepcopy(g01["page"])
+        for event in page["events"]:
+            event["seq"] = float(event["seq"])
+        self.assertEqual(rules.page_problems(g01["params"], g01["page"]), [])
+        self.assertEqual(rules.page_problems(g01["params"], page), [])
+        big = copy.deepcopy(g01)
+        big["params"]["cursor"]["seq"] = big["page"]["cursor"]["seq"] = 9007199254740992.0
+        big["page"]["events"] = big["page"]["events"][:1]
+        big["page"]["events"][0]["seq"] = 9007199254740992.0
+        self.assertIn("order", rules.page_problems(big["params"], big["page"]))
+
+    def test_revisions_written_as_integral_floats_are_whole_numbers(self):
+        """An approval's expected_revision of 1.0 is the revision 1, an opening recorded at revision 1.0 is a
+        sound opening, and an edit of an item or a change of an approval advances an integral-float revision by
+        exactly one, in Python's int."""
+        rules = self.rules
+        seed = client.read_json(next((self.folder / "fixtures" / "good" / "approval.v1").glob("h01-*.json")))
+        at = "2026-11-13T07:34:32.000Z"
+        answers = []
+        for revision in (1, 1.0):
+            model = rules.ApprovalModel(seed)
+            opened = model.call(self.OWNER, "approval.open", {"command_id": "s1.open.0001", "approval_id": seed["approval_id"],
+                                                              "surface": "tui"}, at)
+            self.assertEqual(opened["code"], "ok")
+            answers.append(model.call(self.OWNER, "approval.answer", {
+                "command_id": "s1.answer.0001", "approval_id": seed["approval_id"], "surface": "tui", "digest": seed["digest"],
+                "answer": "approve", "expected_revision": revision}, at)["code"])
+        self.assertEqual(answers, ["ok", "ok"])
+        approved = client.read_json(next((self.folder / "fixtures" / "good" / "approval.v1").glob("h02-*.json")))
+        self.assertEqual(rules.approval_problems(approved), [])
+        for opening in approved["opened_by"]:
+            opening["revision"] = float(opening["revision"])
+        self.assertEqual(rules.approval_problems(approved), [])
+        found = self.vector("queue.delivery/d12-*.json")
+        for revision, wanted in ((3.0, 4), (9007199254740992.0, 9007199254740993)):
+            with self.subTest(revision=revision):
+                item = dict(copy.deepcopy(found["item"]), revision=revision)
+                model = rules.DeliveryModel(item)
+                model.step("edit", {"text": "another text"})
+                self.assertEqual((type(model.item["revision"]), model.item["revision"]), (int, wanted))
+
+    def test_a_prompt_with_no_utf8_bytes_is_refused_by_the_start_identity_rules(self):
+        """A prompt that holds an escaped lone surrogate fits the start request's schema and has no UTF-8 bytes to
+        hash: the start identity rules refuse it ('prompt'), as the control API answers request_invalid / prompt,
+        and never raise UnicodeEncodeError."""
+        rules = self.rules
+        request = {"tenant": "t1", "engine": "codex", "prompt": "\ud800", "client_key": "probe-start"}
+        for call, args in ((rules.start_intent_text, (request, [])), (rules.start_key_of, (request, None)),
+                           (rules.start_key_of, (request, []))):
+            with self.subTest(call=call.__name__, declared=args[1]):
+                self.refused("prompt", call, *args)
+        stored = rules.start_key_of(dict(request, prompt="a prompt"), None)
+        self.refused("prompt", rules.start_retry, stored, request, None)
+
+    def test_a_stopped_run_is_cancelled_only_with_a_proof_of_this_record(self):
+        """A stopped run's Task is cancelled only on a proof of THIS record, as the registry restores one
+        (control/registry.py, StopUnattested): its proof says empty, names the record's cgroup and marker, and is
+        of the record's generation or an earlier one. Anything else is refused stop_unattested."""
+        rules = self.rules
+        found = self.vector("task.derivation/r15-*.json")
+        view, events, pending = found["view"], found["events"], found["pending_approval_ids"]
+        self.assertEqual(rules.task_of_run(view, events, pending)["status"], "cancelled")
+        for member, value in (("cgroup", "/synthetic-other-cgroup"), ("cgroup_marker", "cg-other"),
+                              ("generation", view["generation"] + 1), ("proof", "populated")):
+            with self.subTest(member=member):
+                changed = copy.deepcopy(view)
+                changed["stop_attestation"][member] = value
+                self.refused("stop_unattested", rules.task_of_run, changed, events, pending)
+        for generation in (view["generation"], view["generation"] - 1):
+            with self.subTest(generation=generation):
+                same = copy.deepcopy(view)
+                same["stop_attestation"]["generation"] = generation
+                self.assertEqual(rules.task_of_run(same, events, pending)["status"], "cancelled")
+
     # ---- the delivery of a queue item
     def test_a_refused_delivery_step_changes_nothing_and_raises_nothing_but_a_refusal(self):
         rules = self.rules

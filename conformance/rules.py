@@ -521,7 +521,7 @@ def approval_problems(record: dict) -> list:
     seen = []
     for opening in record.get("opened_by") or ():
         who = (opening.get("principal"), opening.get("surface"), opening.get("revision"))
-        if who in seen or not isinstance(opening.get("revision"), int) or opening["revision"] > record.get("revision", 0):
+        if who in seen or _whole(opening.get("revision")) is None or opening["revision"] > record.get("revision", 0):
             problems.append("opened_by")
             break
         seen.append(who)
@@ -715,6 +715,18 @@ def _supported(schemas: dict) -> dict:
             _READ_LOCATIONS.update(_locations(_READ))
         return _READ_LOCATIONS
     return _locations(schemas)
+
+
+def _whole(value):
+    """An integer of these records as Python's int, however JSON spelled it (1.0 is 1), or None for anything that is
+    not one (a boolean, a fraction, text). The dialect's integer, in exact arithmetic."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
 
 
 def _kind(value) -> str:
@@ -1082,7 +1094,7 @@ class DeliveryModel:
                 if (not changes or not isinstance(changes.get("text", "text"), str) or not changes.get("text", "text")
                         or not isinstance(changes.get("delivery", "steer"), str) or changes.get("delivery", "steer") not in HOW_OF):
                     raise Refused("edit")
-                item.update(changes, revision=item["revision"] + 1)
+                item.update(changes, revision=_whole(item["revision"]) + 1)
         else:
             raise Refused("happening")
 
@@ -1126,6 +1138,19 @@ def _log_times(events: list, entity: str, entity_id: str, of_turn: str | None = 
     return None, (changed[-1] if changed else None)
 
 
+def _stop_attested(record: dict) -> bool:
+    """Whether a stopped record carries a proof of ITS Stop, as the registry requires before it restores one
+    (control/registry.py, StopUnattested): the proof says empty, names the record's own cgroup and marker, and is of
+    the record's generation or an earlier one (a proof older than the record is sound)."""
+    proof = record.get("stop_attestation")
+    if not isinstance(proof, dict) or proof.get("proof") != "empty" or proof.get("cgroup") != record.get("cgroup"):
+        return False
+    if proof.get("cgroup_marker") is not None and proof["cgroup_marker"] != record.get("cgroup_marker"):
+        return False
+    proof_generation, record_generation = _whole(proof.get("generation")), _whole(record.get("generation"))
+    return proof_generation is not None and record_generation is not None and proof_generation <= record_generation
+
+
 def task_of_run(view: dict, events: list = (), pending_approval_ids: list = ()) -> dict:
     """What the Task of a run started without a session must say, from the run's view and its log.
 
@@ -1133,7 +1158,9 @@ def task_of_run(view: dict, events: list = (), pending_approval_ids: list = ()) 
     Starting, running, a Stop pending and an unobservable unit are ``working`` (``input_required``
     while an approval is pending), and a Stop that was asked and is not confirmed sets
     ``cancel_requested`` (the view says ``stop_pending``, or carries a stop record, or both). ``working``
-    for an unobservable unit means that no terminal outcome is known, not that progress was observed. ``stopped`` is ``cancelled``: only a confirmed Stop is. A run that ended with
+    for an unobservable unit means that no terminal outcome is known, not that progress was observed. ``stopped`` is ``cancelled``: only a confirmed Stop is, and a stopped view whose proof is not a proof of this
+    record (another cgroup or marker, a later generation, a proof that does not say empty) is refused
+    ``stop_unattested``. A run that ended with
     a result is ``completed`` when the result carries no code and says ok, and ``failed`` with the
     result's code when it carries one. (The route contract writes ok exactly when there is no code. A
     result that breaks that is never ``completed``: one that says ok and carries a code is ``failed``
@@ -1156,6 +1183,8 @@ def task_of_run(view: dict, events: list = (), pending_approval_ids: list = ()) 
         # Either sign of a Stop that was asked and is not confirmed: the state, or the stop record.
         task["cancel_requested"] = state == "stop_pending" or view.get("stop") is not None
     elif state == "stopped":
+        if not _stop_attested(view):
+            raise Refused("stop_unattested")
         task["status"] = "cancelled"
     elif state == "ended" and result is not None:
         ok = result["code"] is None and result["status"] == "ok"
@@ -1348,7 +1377,7 @@ class ApprovalModel:
         # answer is 'approve' or 'deny' and nothing else: no other word is ever read as either.
         for field in self._NEEDS[method]:
             value = params.get(field) if isinstance(params, dict) else None
-            whole = (type(value) is int and value >= 1) if field == "expected_revision" else (isinstance(value, str) and bool(value))
+            whole = (_whole(value) is not None and _whole(value) >= 1) if field == "expected_revision" else (isinstance(value, str) and bool(value))
             if not whole or (field == "answer" and value not in ("approve", "deny")):
                 return {"code": "request_invalid", "detail": field}
         receipt_key = (method, params.get("command_id"))
@@ -1427,7 +1456,7 @@ class ApprovalModel:
         if expires_at is not None:
             milliseconds(expires_at)                            # 'timestamp' for a deadline that is not a moment
             candidate["expires_at"] = expires_at
-        candidate["revision"] = record["revision"] + 1
+        candidate["revision"] = _whole(record["revision"]) + 1
         if not fits("approval.v1.json", candidate):         # the whole candidate, before it replaces anything
             raise Refused("record_invalid")
         problems = approval_problems(candidate)
@@ -1466,6 +1495,15 @@ class ApprovalModel:
 INTENT_VERSION = 1
 
 
+def _prompt_sha256(request: dict) -> str:
+    """The SHA-256 of the prompt's UTF-8 bytes. A prompt that has none (an escaped lone surrogate fits the schema's
+    string) is refused 'prompt', as the control API answers request_invalid / prompt."""
+    try:
+        return hashlib.sha256(request["prompt"].encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        raise Refused("prompt") from None
+
+
 def start_intent_text(request: dict, declared) -> str:
     """The exact preimage of a start intent, version 1: the text, as RFC 8785 writes it, of ONE object:
     ``engine`` as the request supplied it, or null when it names none; ``prompt_sha256``, the SHA-256 of
@@ -1474,7 +1512,7 @@ def start_intent_text(request: dict, declared) -> str:
     one that is null are all left out. It is taken from what the client sent, before any registrant
     normalises or routes the request, and never from a registrant's output."""
     intent = {"engine": request.get("engine"),
-              "prompt_sha256": hashlib.sha256(request["prompt"].encode("utf-8")).hexdigest()}
+              "prompt_sha256": _prompt_sha256(request)}
     for field in declared:
         if request.get(field) is not None:
             intent[field] = request[field]
@@ -1495,7 +1533,7 @@ def start_key_of(request: dict, declared) -> dict | None:
     if not isinstance(key, str):
         return None
     start_key = {"client_key": key, "engine": request.get("engine"),
-                 "prompt_sha256": hashlib.sha256(request["prompt"].encode("utf-8")).hexdigest()}
+                 "prompt_sha256": _prompt_sha256(request)}
     if declared is not None:
         start_key["intent_version"] = INTENT_VERSION
         start_key["intent_sha256"] = hashlib.sha256(start_intent_text(request, declared).encode("utf-8")).hexdigest()
@@ -1587,24 +1625,25 @@ def page_problems(params: dict, page: dict) -> list:
     problems = []
     raw = page["projection"] == "raw"
     items = page["events"] if raw else page["lines"]
-    position = cursor["seq"]
+    position = _whole(cursor["seq"])           # positions in exact arithmetic, whatever their spelling (42.0 is 42)
     for item in items:
         gap = (item["type"] if raw else item["event_type"]) == "replay.gap"
+        seq = _whole(item["seq"])
         if raw and item["session_id"] != cursor["session_id"] and "log" not in problems:
             problems.append("log")
         if raw and gap:
             if gap_problem(item) and "gap" not in problems:
                 problems.append("gap")
-            ok = item["payload"]["from"] == position + 1 and item["seq"] >= position + 1
+            ok = _whole(item["payload"]["from"]) == position + 1 and seq is not None and seq >= position + 1
         elif gap:
-            ok = item["seq"] >= position + 1        # a line carries the span's last position, not its first
+            ok = seq is not None and seq >= position + 1     # a line carries the span's last position, not its first
         else:
-            ok = item["seq"] == position + 1
+            ok = seq == position + 1
         if not ok and "order" not in problems:
             problems.append("order")
-        position = max(position, item["seq"]) if isinstance(item["seq"], int) else position
+        position = max(position, seq) if seq is not None else position
     answered = page["cursor"]
-    if answered["session_id"] != cursor["session_id"] or answered["seq"] != position:
+    if answered["session_id"] != cursor["session_id"] or _whole(answered["seq"]) != position:
         problems.append("cursor")
     if answered["epoch"] < cursor["epoch"] or page["epoch_advanced"] != (answered["epoch"] > cursor["epoch"]):
         problems.append("epoch")

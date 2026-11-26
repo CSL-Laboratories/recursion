@@ -27,6 +27,17 @@ Nothing is frozen yet.
 | `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
 | `session.token.v1.json` | 1.0-draft.1 |
 
+## The reference rules after sweep S1 (Nov 15, 2026)
+
+No schema changes, and no draft number. Four findings of the desk's sweep S1 of the merged drafts reproduce on
+master and are answered in `conformance/` (rules, the client, tests, one vector):
+
+| What changed | What it breaks |
+|---|---|
+| A position or a revision is an integer of the schema whatever its spelling: `42.0` continues a cursor at 41, `expected_revision: 1.0` is revision 1, an opening at `1.0` is sound, and an edit or a change advances an integral-float revision by one; page positions are compared in exact arithmetic, so a page that repeats the requested position `9007199254740992` is out of order | A reference that judged such numbers by Python's type |
+| A prompt with no UTF-8 bytes (an escaped lone surrogate) is refused `prompt` by the start identity rules, as the control API answers; it no longer raises `UnicodeEncodeError` | Nothing that fits |
+| A stopped run's Task is `cancelled` only on a proof of that record (cgroup, marker, generation not later, proof empty), as the registry restores one; otherwise the rule refuses `stop_unattested`. A `task.derivation` vector may now expect `refused:<code>` | A producer that projects a cancelled Task from a stop proof of another record |
+
 ## After two reads of the fifth read's answer (Nov 14, 2026)
 
 `approval` draft 9; every other schema keeps its draft. Both reads of `5aface43` found the four fifth-read

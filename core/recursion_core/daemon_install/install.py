@@ -84,6 +84,14 @@ _STORE_GROUND = ("Recursion does not create its stores in {folder}: it is on {ki
 _UNDECIDED = ("Recursion cannot tell which disk {folder} is on, so it creates no store there: {why}. Make "
               "every folder on the way to it a folder you can open, with no loop of links, or run recursiond "
               "install with XDG_STATE_HOME set to an absolute folder on a local disk, then run it again.")
+# The reason in ``_UNDECIDED`` when the walk cannot search a folder above the store folder ({how}: the command).
+_UNSEARCHABLE = ("{folder} cannot be searched ({code}): the install needs search (x) permission on every folder above "
+                 "the store folder and read permission only on the store folder; give your user search permission on "
+                 "it with: {how}")
+# The reason in ``_UNDECIDED`` when the last folder the walk reaches, which the stores are made in, cannot be read.
+_UNREADABLE = ("{folder} cannot be read ({code}): the stores are made in it or below it, so the install needs read "
+               "and search permission on it, and only search permission on the folders above it; give your user "
+               "that permission with: {how}")
 # The whole details of ``store_ground_changed``: a folder read was moved or replaced before, or while, the
 # stores were made.
 _CHANGED_BEFORE = ("{where} was moved or replaced after its disk was read and before the stores were made, so "
@@ -148,6 +156,14 @@ def plan_commands(action: str) -> tuple[tuple[str, ...], ...]:
 # (``readlink``) and followed by the walk itself, as the kernel follows it.
 _FOLDER_OPEN = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
                 | getattr(os, "O_CLOEXEC", 0))
+# The walk (``_walk``) holds each folder on the way by path only (O_PATH), which needs search (x) permission on the
+# folder before it and never read permission, so a folder above that can be searched but not read (a root-owned
+# /home of mode 0711) does not stop it; only the last folder it reaches is opened for reading (``_for_reading``).
+# With O_DIRECTORY and O_NOFOLLOW a link at the name fails ENOTDIR, as the read-open does, and is never opened as
+# the link itself, so every link is read and followed by the walk as before. A platform with no O_PATH opens
+# each folder for reading, as before.
+_WALK_OPEN = ((os.O_PATH | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+              if hasattr(os, "O_PATH") else _FOLDER_OPEN)
 
 
 @dataclass(frozen=True)
@@ -177,6 +193,39 @@ def _undecided(folder: str, why: str) -> InstallRefused:
     return InstallRefused("store_ground_undecided", _UNDECIDED.format(folder=_shown(folder), why=why))
 
 
+def _how(fd: int, path: str, bits: str) -> str:
+    """The command that gives the person ``bits`` on the folder ``fd`` is (``chmod``): for their own folder their
+    own bits, else everyone's, run by the folder's owner."""
+
+    try:
+        mine = os.fstat(fd).st_uid == os.geteuid()
+    except (OSError, AttributeError):
+        mine = False
+    return f"chmod u+{bits} {_quoted(path)}" if mine else f"chmod a+{bits} {_quoted(path)}, run by its owner"
+
+
+def _cannot_search(fd: int, path: str, folder: str, exc: OSError) -> InstallRefused:
+    """``store_ground_undecided`` for the folder ``fd`` (``path``) the walk holds and cannot search below."""
+
+    code = errno.errorcode.get(exc.errno, exc.errno)
+    return _undecided(folder, _UNSEARCHABLE.format(folder=_shown(path), code=code, how=_how(fd, path, "x")))
+
+
+def _for_reading(fd: int, path: str, folder: str) -> int:
+    """The last folder the walk reached, which the stores are made in (or under), opened for reading through the
+    walk's own descriptor (``.``), never by its name again: the very folder held, now one that can be synced,
+    listed and locked. The descriptor itself where the walk opens folders for reading (no O_PATH). ``fd`` stays
+    the caller's."""
+
+    if _WALK_OPEN == _FOLDER_OPEN:
+        return fd
+    try:
+        return os.open(".", _FOLDER_OPEN, dir_fd=fd)
+    except OSError as exc:
+        code = errno.errorcode.get(exc.errno, exc.errno)
+        raise _undecided(folder, _UNREADABLE.format(folder=_shown(path), code=code, how=_how(fd, path, "rx"))) from None
+
+
 def _walk(folder: str) -> tuple[int, str, tuple[str, ...], str, str]:
     """Open ``folder``'s nearest folder that is there, resolved as the kernel resolves it, from opened folders.
 
@@ -187,14 +236,16 @@ def _walk(folder: str) -> tuple[int, str, tuple[str, ...], str, str]:
     the names from it on are read as the folders ``ensure_dir`` makes read them (below a folder that is not there
     no link can stand), and a ``..`` among them walks on from the folder reached. Returns the opened folder (the
     caller closes it), its path as the walk reached it, the names below it, and the link whose target was not
-    there with that target ("" and "" when none)."""
+    there with that target ("" and "" when none). Each folder on the way is held by path only (``_WALK_OPEN``):
+    search permission on the folder before it is all the walk needs; the folder returned is opened for reading
+    (``_for_reading``). A folder that cannot be searched is named with the permission it lacks."""
 
     if type(folder) is not str or not folder.startswith("/") or "\0" in folder:
         raise InstallRefused("store_ground_undecided", f"a store folder is an absolute path, not {folder!r}")
     names = [(name, "") for name in folder.split("/") if name]
     targets: dict[str, str] = {}
     links = 0
-    fd, path = os.open("/", _FOLDER_OPEN), "/"
+    fd, path = os.open("/", _WALK_OPEN), "/"
     try:
         while names:
             name, via = names.pop(0)
@@ -202,20 +253,28 @@ def _walk(folder: str) -> tuple[int, str, tuple[str, ...], str, str]:
                 continue
             if name == "..":
                 if path != "/":
-                    up = os.open("..", _FOLDER_OPEN, dir_fd=fd)
+                    try:
+                        up = os.open("..", _WALK_OPEN, dir_fd=fd)
+                    except OSError as exc:
+                        raise _cannot_search(fd, path, folder, exc) from None
                     os.close(fd)
                     fd, path = up, os.path.dirname(path)
                 continue
             try:
-                below = os.open(name, _FOLDER_OPEN, dir_fd=fd)
+                below = os.open(name, _WALK_OPEN, dir_fd=fd)
             except FileNotFoundError:
                 rest = [name] + [later for later, _ in names if later != "."]
                 if ".." in rest:
                     names = [(part, via) for part in os.path.normpath("/".join(rest)).split("/")]
                     continue
-                return fd, path, tuple(rest), via, targets.get(via, "")
+                readable = _for_reading(fd, path, folder)
+                if readable != fd:
+                    os.close(fd)
+                return readable, path, tuple(rest), via, targets.get(via, "")
             except OSError as exc:
                 here = os.path.join(path, name)
+                if exc.errno == errno.EACCES and _WALK_OPEN != _FOLDER_OPEN:  # by path only: the search of fd
+                    raise _cannot_search(fd, path, folder, exc) from None
                 if exc.errno not in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
                     raise _undecided(folder, f"{_shown(here)} cannot be opened ({errno.errorcode.get(exc.errno, exc.errno)})") from None
                 try:
@@ -227,14 +286,17 @@ def _walk(folder: str) -> tuple[int, str, tuple[str, ...], str, str]:
                     raise _undecided(folder, f"more than {_MAX_LINKS} links on the way") from None
                 targets[here] = target
                 if target.startswith("/"):
-                    root = os.open("/", _FOLDER_OPEN)
+                    root = os.open("/", _WALK_OPEN)
                     os.close(fd)
                     fd, path = root, "/"
                 names[:0] = [(part, here) for part in target.split("/") if part]
                 continue
             os.close(fd)
             fd, path = below, os.path.join(path, name)
-        return fd, path, (), "", ""
+        readable = _for_reading(fd, path, folder)
+        if readable != fd:
+            os.close(fd)
+        return readable, path, (), "", ""
     except BaseException:
         os.close(fd)
         raise

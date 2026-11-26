@@ -7,6 +7,7 @@ it); the machine's own table is never read, and no real mount is made.
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib
 import os
 import random
@@ -924,6 +925,114 @@ class GroundAsTheKernelResolvesItTests(unittest.TestCase):
                     authority = os.path.join(home + ".judged", ".config", "recursion", "authority")
                     self.assertEqual(os.listdir(authority) if os.path.isdir(authority) else [], [])  # no key, no part
                     self.assertEqual(_tree(nfs), before)  # the refused place's own key and stores untouched
+
+
+@unittest.skipUnless(LINUX, "the installer is Linux-only")
+@unittest.skipIf(LINUX and os.geteuid() == 0, "root searches and reads every folder whatever its mode, so a folder it "
+                 "cannot search or read cannot be made for it: run these as a person who is not root")
+class SearchOnlyFoldersAboveTheStoresTests(unittest.TestCase):
+    """The walk to a store folder needs only search (x) permission on the folders above it, as a root-owned /home of
+    mode 0711 gives; read permission is needed only on the folder the stores are made in."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="store-ground-search-")
+        self.addCleanup(tmp.cleanup)
+        self.case = os.path.realpath(tmp.name)
+        os.chmod(self.case, 0o700)
+        self.table = os.path.join(self.case, "mountinfo")
+        with open(self.table, "w", encoding="utf-8") as out:
+            out.write("20 1 0:20 / / rw,relatime shared:0 - ext4 src0 rw\n")
+        patcher = mock.patch.object(INSTALL, "_MOUNTINFO", self.table, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.parent = os.path.join(self.case, "parent")
+        self.home = os.path.join(self.parent, "home")
+        os.makedirs(self.home, 0o700)
+
+    def mode(self, path, mode):
+        os.chmod(path, mode)
+        self.addCleanup(os.chmod, path, 0o700)  # put back before the temporary folder is removed
+
+    def refused(self, call, *args, **kwargs):
+        with self.assertRaises(InstallRefused) as caught:
+            call(*args, **kwargs)
+        self.assertEqual(caught.exception.kind, "store_ground_undecided", caught.exception.detail)
+        self.assertNotIn("\n", caught.exception.detail)
+        return caught.exception.detail
+
+    def test_a_parent_that_can_be_searched_but_not_read_holds_the_stores(self):
+        self.mode(self.parent, 0o111)  # search only: not readable, even by its owner
+        with self.assertRaises(PermissionError):
+            os.listdir(self.parent)  # the stand-in is what it says
+        ground = INSTALL.store_ground(self.home)
+        self.assertEqual((ground.where, ground.below, ground.kind), (self.home, (), "ext4"))
+        paths = owned_paths(Roots(home=self.home))
+        self.assertEqual(INSTALL.store_ground(paths.store_dir).where, self.home)
+        plan = install(Roots(home=self.home), EXEC)
+        self.assertTrue(plan.changed)
+        self.assertTrue(plan.stores)
+        for kind, path, made in plan.stores:
+            with self.subTest(store=kind):
+                self.assertTrue(made)
+                self.assertTrue(os.path.isfile(path))
+        upgrade(Roots(home=self.home), EXEC)  # and an upgrade through the same folders
+
+    def test_links_in_a_parent_that_can_only_be_searched_are_followed_as_before(self):
+        real = os.path.join(self.parent, "real")
+        os.mkdir(real, 0o700)
+        os.symlink("real", os.path.join(self.parent, "state"))
+        os.symlink("loop-b", os.path.join(self.parent, "loop-a"))
+        os.symlink("loop-a", os.path.join(self.parent, "loop-b"))
+        self.mode(self.parent, 0o111)
+        for written in (os.path.join(self.parent, "state"), os.path.join(self.parent, "state", "..", "real"),
+                        os.path.join(self.parent, "state", "new")):
+            with self.subTest(written=written):
+                ground = INSTALL.store_ground(written)
+                self.assertEqual(ground.where, real)
+        written = os.path.join(self.parent, "loop-a", "x")
+        detail = self.refused(INSTALL.check_store_ground, (written,))
+        self.assertIn("more than 40 links on the way", detail)
+
+    def test_a_folder_above_that_cannot_be_searched_is_named_with_the_permission_and_the_way_out(self):
+        self.mode(self.parent, 0o000)
+        for written, call in ((self.home, INSTALL.store_ground), (self.parent + "/../parent/home", INSTALL.store_ground),
+                              (os.path.join(self.parent, "x", ".."), INSTALL.store_ground)):
+            with self.subTest(written=written):
+                detail = self.refused(call, written)
+                self.assertTrue(detail.startswith(
+                    f"Recursion cannot tell which disk {written} is on, so it creates no store there: {self.parent} "
+                    f"cannot be searched (EACCES): the install needs search (x) permission on every folder above the "
+                    f"store folder and read permission only on the store folder"), detail)
+                self.assertIn(f"give your user search permission on it with: chmod u+x {self.parent}. ", detail)
+                self.assertIn("XDG_STATE_HOME set to an absolute folder on a local disk", detail)
+        detail = self.refused(INSTALL.check_store_ground, (os.path.join(self.home, ".local", "state"),))
+        self.assertIn(f"{self.parent} cannot be searched (EACCES)", detail)
+
+    def test_the_folder_the_stores_are_made_in_that_cannot_be_read_is_refused_naming_it(self):
+        paths = owned_paths(Roots(home=self.home))
+        os.makedirs(paths.store_dir, 0o700)
+        self.mode(paths.store_dir, 0o300)  # search and write, not read
+        detail = self.refused(INSTALL.store_ground, paths.store_dir)
+        self.assertTrue(detail.startswith(
+            f"Recursion cannot tell which disk {paths.store_dir} is on, so it creates no store there: {paths.store_dir} "
+            f"cannot be read (EACCES): the stores are made in it or below it, so the install needs read and search "
+            f"permission on it"), detail)
+        self.assertIn(f"with: chmod u+rx {paths.store_dir}. ", detail)
+        detail = self.refused(install, Roots(home=self.home), EXEC)
+        self.assertIn(f"{paths.store_dir} cannot be read (EACCES)", detail)
+        self.assertEqual(os.listdir(os.path.dirname(paths.store_dir)), [os.path.basename(paths.store_dir)])
+
+    def test_the_walk_holds_the_folders_above_by_path_only_where_the_platform_can(self):
+        if not hasattr(os, "O_PATH"):
+            self.assertEqual(INSTALL._WALK_OPEN, INSTALL._FOLDER_OPEN)
+            return
+        self.assertTrue(INSTALL._WALK_OPEN & os.O_PATH)
+        self.assertTrue(INSTALL._WALK_OPEN & os.O_DIRECTORY)  # a link at the name fails, never opened as the link
+        self.assertTrue(INSTALL._WALK_OPEN & os.O_NOFOLLOW)
+        with contextlib.ExitStack() as held:
+            ground = INSTALL.store_ground(self.home, held)
+            os.fsync(ground.fd)  # the folder the stores are made in is open for reading: it can be synced
+            self.assertEqual(os.listdir(ground.fd), [])
 
 
 @unittest.skipUnless(LINUX, "the installer is Linux-only")

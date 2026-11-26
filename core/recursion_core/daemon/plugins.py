@@ -71,7 +71,8 @@ from recursion_core.gui.panels import panel_registry
 from recursion_core.plugin_security import (ApprovalGate, Authority, CoreHealth, CoreService, GilProbe, Grant,
                                             PluginLoader, Refused, ReservedEffects, TrustStore,
                                             create_revocation_store)
-from recursion_core.plugin_security.manifest import MAX_MANIFEST_BYTES, PERMISSIONS_V1, developer_key_id_ok
+from recursion_core.plugin_security.limits import ARTIFACT, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES
+from recursion_core.plugin_security.manifest import PERMISSIONS_V1, developer_key_id_ok
 from recursion_core.plugin_security.signing import backend_available
 
 from .breaker import STORE_DIR
@@ -82,10 +83,10 @@ log = logging.getLogger(__name__)
 
 PLUGINS_DIR = 'plugins'                 # $XDG_CONFIG_HOME/recursion/plugins
 INSTALL_FILE = 'install.json'
-MANIFEST, SIGNATURE, ARTIFACT = 'manifest.json', 'manifest.sig', 'plugin.py'
+MANIFEST, SIGNATURE = 'manifest.json', 'manifest.sig'   # ARTIFACT: plugin_security/limits.py
 REVOCATION_FILE = 'revoked.sqlite3'     # <state dir>/plugin-security/
 LEDGER_FILE = 'ledger.sqlite3'          # installer-created; never created here
-MAX_ARTIFACT_BYTES, MAX_INSTALL_BYTES = 8 * 1024 * 1024, 1024 * 1024
+MAX_INSTALL_BYTES = 1024 * 1024        # MAX_MANIFEST_BYTES, MAX_ARTIFACT_BYTES: plugin_security/limits.py
 VERIFICATION_UNAVAILABLE = 'plugin_verification_unavailable'
 CRYPTOGRAPHY_MISSING = 'cryptography missing; install recipe in plugin_security/README.md'
 EFFECT_PERMISSIONS = {'order': 'order'}

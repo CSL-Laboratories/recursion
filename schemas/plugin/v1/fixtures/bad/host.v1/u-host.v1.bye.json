@@ -1,0 +1,5 @@
+{
+  "type": "bye",
+  "reason": "daemon stopping",
+  "x_nobody_defined": true
+}

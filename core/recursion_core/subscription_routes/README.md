@@ -54,7 +54,7 @@ API-key routes (`anthropic`, `openai`) launch.
 
 ## Subscription sign-ins (2026-11-08 briefing)
 
-Lucas's 2026-11-08 briefing: allow a subscription sign-in only where the provider names that
+The owner's 2026-11-08 briefing: allow a subscription sign-in only where the provider names that
 harness. A profile asks for one with `auth: "subscription"` and a `method`, and both are
 checked against `SUBSCRIPTION_SIGN_INS`:
 
@@ -91,9 +91,9 @@ checked against `SUBSCRIPTION_SIGN_INS`:
   holds without reading it, which it does not do. So a present own store is flagged in
   `RouteDecision.flags` as `own_login_store_not_inspected:<entry>`: it could hold a login
   `hermes auth` adopted or an OpenCode Claude provider plugin. Reading those stores (provider
-  entry presence only) or refusing them is open for Lucas.
+  entry presence only) or refusing them is open for the owner.
 
-## Own-loop routes: Copilot and Nous (Lucas, 2026-11-08)
+## Own-loop routes: Copilot and Nous (the owner, 2026-11-08)
 
 PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or request, fail closed:
 
@@ -134,7 +134,7 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
 
 ## Antigravity CLI is the Google route; the Gemini CLI route was dropped
 
-Owner call (Lucas, 2026-11-09): the Gemini CLI route is dropped entirely and Antigravity CLI
+Owner call (2026-11-09): the Gemini CLI route is dropped entirely and Antigravity CLI
 (`agy`) replaces it. `gemini_cli.py`, `check_gemini_cli_sign_in` and `GeminiCliRefused` are
 gone: importing `recursion_core.subscription_routes.gemini_cli` raises `ModuleNotFoundError`,
 and `gemini` is not an engine (`check_route("gemini", ...)` refuses `unknown_engine`). There
@@ -159,7 +159,7 @@ landed on recursion #323. It is not repeated here.
 
 ## Wrapper pins (Pi, Hermes, Cursor)
 
-Lucas, 2026-11-09: Pi, Hermes and Cursor run as beta when the launcher script and the
+The owner, 2026-11-09: Pi, Hermes and Cursor run as beta when the launcher script and the
 installed package files match a pin. `measure_package_pin(launcher_path, install_root, *,
 allowed_link_targets=(), full_access_acknowledged=False)` hashes the launcher and every file
 under the install root and returns a `PackagePin`. Pass it in a `WrapperInstall` as
@@ -296,7 +296,7 @@ How the switch is written:
 Secure defaults first. What a user or a plugin configures comes in as explicit inputs to
 the check and guard functions. This package reads no file, environment variable or keyring
 for them and never prompts: the driver owns prompts and saved configuration, and passes
-the saved values in on each run. These are Lucas's 2026-11-09 owner calls on recursion #321,
+the saved values in on each run. These are the 2026-11-09 owner calls on recursion #321,
 under CSLR-D-011 and PRODUCT.md `055cc7a5c793b7135e5d0565dc4198cf96230531` (SHA-256
 `e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`; "the user should be
 able to customize this or add plugins to configure this", grill Q20).

@@ -34,12 +34,12 @@ pinned route ``argv[0]`` must be the pinned path. Launch options that would repl
 widen the launch refuse, ``cwd`` is forwarded, and any other option refuses unless the caller
 lists it in ``RouteRequirements.extra_launch_options``.
 
-Configured requirements (2026-11-09, Lucas; PRODUCT.md 055cc7a5 Q20, O44, H-06) come in as explicit
+Configured requirements (2026-11-09, the owner; PRODUCT.md 055cc7a5 Q20, O44, H-06) come in as explicit
 inputs: a ``RouteRequirements`` value and ``full_access_acknowledged``. Nothing here reads a config
 file, the environment, a keyring or a prompt to find them, and nothing here renders a notice: the
 driver owns prompts, saved configuration and the full-access danger notice.
 
-2026-11-08 briefing (Lucas): allow a subscription sign-in in these harnesses only where the provider names
+2026-11-08 briefing (the owner): allow a subscription sign-in in these harnesses only where the provider names
 that harness. ChatGPT: OpenCode and Pi, through their registered Sign in with ChatGPT method only. Grok:
 OpenCode and Hermes. Claude and Google sign-ins stay refused in all three; anything unconfirmed is refused; an API key
 still works. PRODUCT.md 055cc7a5 section 2 (E9): "the E9 profile sets Hermes's
@@ -53,7 +53,7 @@ own default cannot pick a Claude model. The sign-in stays in the engine's own lo
 Recursion holds, copies or ships no token, and a subscription child env carries no credential at all.
 That store is allowed by presence only and never read, so whether it also holds an adopted Claude or
 Codex login is not known here: the decision says so with an ``own_login_store_not_inspected:<entry>``
-flag. Whether to read or refuse those stores is open for Lucas (PRODUCT.md 055cc7a5 section 2).
+flag. Whether to read or refuse those stores is open for the owner (PRODUCT.md 055cc7a5 section 2).
 
 Candidate code: no engine, provider or network is used, and nothing here claims a running core
 calls it yet. Provider ids marked unverified below were not read from the engines' source.
@@ -487,7 +487,7 @@ def _check_subscription(
     _check_hermes_home(engine, route_home, checked)
     flags = tuple(f"parent_env_has:{name}" for name in CLAUDE_SUBSCRIPTION_ENV if name in (parent_env or {}))
     # The engine's own store was allowed by presence only; whether it holds an adopted Claude or Codex
-    # login, or a Claude provider plugin, was not inspected (open for Lucas). A .hermes that holds only
+    # login, or a Claude provider plugin, was not inspected (open for the owner). A .hermes that holds only
     # Recursion's own adopt switch has nothing uninspected in it and gets no flag.
     flags += tuple(f"own_login_store_not_inspected:{entry}" for entry in own
                    if os.path.lexists(os.path.join(route_home, entry))

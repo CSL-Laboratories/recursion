@@ -32,7 +32,7 @@ from recursion_core.routes import contract as c
 from recursion_core.routes.base import RouteAdapter, scalar
 from recursion_core.routes.launch import child_env
 
-# Lucas, Nov 7 ~6:34pm PST (correction to the Nov 8 briefing; replaces "refuse --bare, clear apiKeyHelper,
+# The owner, Nov 7 ~6:34pm PST (correction to the Nov 8 briefing; replaces "refuse --bare, clear apiKeyHelper,
 # CLAUDE_CODE_OAUTH_TOKEN and CLAUDE_CODE_SIMPLE"): launch the unmodified ``claude`` binary; each run uses
 # the route the user picked and only that run's environment changes; nothing removes a sign-in method
 # from every run. Recursion never edits the user's Claude Code settings or credential files, never sets

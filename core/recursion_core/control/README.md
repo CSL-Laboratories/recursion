@@ -241,7 +241,7 @@ this CLI, and give the GUI a device/pairing door onto it. #324's body says #327 
 PR does not take it on, and no other lane or issue is named for it yet. Until one is, the daemon's GUI
 door answers 401 and `cli.run(..., None)` answers `control_api_unavailable`, so Stop through the GUI or
 the packaged CLI on Nov 11 (PRODUCT.md 2.1, 3.4 S6) has no owner. Which lane and issue own it is
-Lucas's call.
+the owner's call.
 
 ## Tests
 

@@ -27,14 +27,17 @@ and the object the method handlers and the engine drivers call:
 * ``sweep()`` writes ``expired`` and ``approval.answered`` for every pending request whose deadline has come.
   The worker started by ``start`` calls it at each deadline. A failure of the worker withdraws ``ready``
   and the worker tries again; a row that cannot be read is set aside, never retried for ever.
-* ``recover()`` at a start with no deadline worker of this queue alive (the first start, or one after a
-  stop): an engine's request still pending belonged to a driver that died with the daemon,
-  so it ends as expired, never approved; an engine's request approved but not carried out loses its
-  binding, so nothing can carry it out through the dead driver; deadlines that passed while the daemon was
-  down are written. While a worker of this queue is alive its drivers are alive too, so recovery does
-  nothing there: a second start while the queue runs ends no request and retires no binding, and its answer
-  says so (``already_running``). ``start`` answers ``{"code", "says"}``: ``started``, ``already_running``,
-  ``store_absent`` or ``stopped``, each with its sentence in ``START_SAYS``. While a start runs no surface is offered anything: the start offers what no surface
+* ``recover()`` at a start of a queue that is not started (the first start, or one after a stop): an engine's
+  request still pending belonged to a driver that died with the daemon, so it ends as expired, never approved;
+  an engine's request approved but not carried out loses its binding, so nothing can carry it out through the
+  dead driver; deadlines that passed while the daemon was down are written. Whether the queue runs is its own
+  record that it was started and not stopped, not the life of its worker thread: while it runs its drivers
+  count as alive, so recovery does nothing there. A second start while the queue runs ends no request and
+  retires no binding, and its answer says so (``already_running``); one that finds its deadline worker ended
+  without a stop (an interruption raised inside a sweep) starts it again, recovers nothing, and says so in its
+  answer (``worker_restarted``) and in the log. ``start`` answers ``{"code", "says"}``: ``started``,
+  ``already_running``, ``worker_restarted``, ``store_absent`` or ``stopped``, each with its sentence in
+  ``START_SAYS``. While a start runs no surface is offered anything: the start offers what no surface
   took to every surface subscribed then, once its worker runs, and nothing at all if it fails. A start that
   raises before it lets the surfaces through (a failure, or an interruption anywhere from the moment it holds
   the surfaces back) lets them through all the same, so each new request is offered to every surface at once.
@@ -76,10 +79,11 @@ and the object the method handlers and the engine drivers call:
   ``list_page`` serves approval.list (summaries only).
 * ``consume(...)`` carries an approved effect out once, against the private binding; every refusal is a
   typed ``ApprovalRefused``. It consumes through ``store.consume_in``, the one place the plugin gate's ``take``
-  goes through too: an approved record whose deadline has come is written ``expired`` and refused
-  ``approval_expired`` (that expiry is the one thing a refusal changes, and it was already due), and one whose
-  effect was vetoed or denied on the store is refused ``approval_vetoed``, both read inside the transaction that
-  would mark it consumed.
+  goes through too: an approved record whose end has come (its deadline, or the shorter end a plugin gate on the
+  same store declared: ``store.end_of``) is written ``expired`` and refused ``approval_expired``
+  (that expiry is the one thing a refusal changes, and it was already due), and one whose effect was vetoed or
+  denied on the store is refused ``approval_vetoed``, both read inside the transaction that would mark it
+  consumed.
 
 Two answers at once: with EVENTS' store (one transaction at a time) the second waits, reads the resolved
 record and is answered ``conflict``/``already_resolved``. A store that lets two transactions run at once
@@ -132,6 +136,9 @@ START_SAYS = {
     "already_running": "The approval queue was already running, so nothing it holds was ended: no request was "
                        "expired and no approval lost its binding. Its deadline worker was started again. Stop the "
                        "queue first if you meant to recover what a stopped daemon left.",
+    "worker_restarted": "The approval queue was running, but its deadline worker had ended without a stop, so it "
+                        "was started again. Nothing the queue holds was ended: no request was expired and no "
+                        "approval lost its binding. There is nothing you need to do; the log notes when it happened.",
     "store_absent": "The approval queue did not start, because no event store is composed, and it refuses every "
                     "request. Compose an event store, then start it again.",
     "stopped": "The approval queue was stopped while it started, so it is left stopped. Start it again if you "
@@ -232,7 +239,8 @@ class ApprovalQueue:
         return {"code": code, "says": START_SAYS[code]}
 
     def _worker_alive(self) -> bool:
-        """Whether a deadline worker this queue published still runs: then its drivers run too."""
+        """Whether a deadline worker this queue published still runs. It does not say whether the queue runs (its
+        record of started and not stopped does): a worker can end without a stop."""
         with self._lock:
             worker = self._worker
             return self._generation is not None and worker is not None and worker.is_alive()
@@ -248,7 +256,14 @@ class ApprovalQueue:
             self.attach(context.store)
         elif self._store is not context.store:
             raise RuntimeError("the approval queue is attached to another store")
-        running = self._worker_alive()  # a start while the queue runs: recovery ends nothing (see ``recover``)
+        with self._lock:
+            running = self._running  # started and not stopped: a start now recovers nothing (see ``recover``)
+        restarted = running and not self._worker_alive()
+        if restarted:
+            # Its worker ended without a stop (an interruption raised inside a sweep): the queue still counts as
+            # started, so its drivers count as alive and nothing is recovered; the worker is started again below.
+            log.warning("the approval deadline worker had ended without a stop; it is started again, and nothing "
+                        "the queue holds was ended")
         generation = object()
         try:
             with self._lock:
@@ -305,6 +320,8 @@ class ApprovalQueue:
         if self._stops_here() != stops:
             return "stopped"
         self._offer_backlog()
+        if restarted:
+            return "worker_restarted"
         return "already_running" if running else "started"
 
     def stop(self, context=None) -> None:
@@ -632,12 +649,15 @@ class ApprovalQueue:
     def recover(self) -> dict:
         """At start: end engine requests whose driver died, retire the bindings of approved ones not yet
         carried out, write due expiries, offer again the requests never shown (during a start that offering
-        reaches no surface: the start makes it once its worker runs). While a deadline worker of this queue is
-        alive (a second start while it runs, or a call made while it runs) the drivers are alive as well, so it
-        does nothing and reports ``running``: no request is ended and no binding retired."""
+        reaches no surface: the start makes it once its worker runs). While the queue counts as started and not
+        stopped (a second start, or a call made while it runs, even after its deadline worker ended without a
+        stop) its drivers count as alive, so it does nothing and reports ``running``: no request is ended and no
+        binding retired."""
         closed, retired = [], []
         now = self.now()
-        if self._worker_alive():
+        with self._lock:
+            running = self._running
+        if running:
             return {"closed": closed, "retired": retired, "expired": [], "told": [], "at": now, "running": True}
         with self._store.transaction() as tx:
             engine = rows.unresolved_engine(tx)
@@ -718,8 +738,9 @@ class ApprovalQueue:
 
     def consume(self, approval_id: str, revision: int, digest: str, binding) -> dict:
         """Carry an approved effect out once; ``ApprovalRefused`` (a typed code) otherwise, and nothing changed
-        except an expiry that was already due (``store.consume_in``: an approved record at or past its deadline is
-        written ``expired`` and refused ``approval_expired``; one whose effect was vetoed is ``approval_vetoed``).
+        except an expiry that was already due (``store.consume_in``: an approved record at or past its end, its
+        deadline or the shorter end a plugin gate on the store declared, is written ``expired`` and refused
+        ``approval_expired``; one whose effect was vetoed is ``approval_vetoed``).
 
         A store that runs two transactions at once refuses the second one's write; the consumption is then
         tried again from a fresh read (a short, bounded backoff), which finds it consumed and refuses
@@ -733,7 +754,7 @@ class ApprovalQueue:
                         raise ApprovalRefused("approval_unknown")
                     kept = rows.binding_of(tx, approval_id)
                     refusal, record = rows.consume_in(tx, held, kept, revision, digest, binding,
-                                                      milliseconds(self.now()))
+                                                      milliseconds(self.now()), store=self._store)
             except sqlite3.OperationalError:
                 time.sleep(min(0.001 * 2 ** attempt, 0.05))
                 continue

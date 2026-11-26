@@ -33,9 +33,12 @@ the daemon running or not, is written ``expired`` when it is next read and is re
 the same transaction, and a second take, after a restart too, is ``approval_replayed``.
 The take consumes through the approval queue's own ``store.consume_in``, the one place every
 consumer of the store goes through: the deadline and the veto are read there, inside the
-transaction that marks the record consumed, so the queue's ``consume`` refuses what the take
-refuses. An approval covers exactly the effect it was drawn for: another effect presented with it
-is ``approval_digest_mismatch``. An approved one found past its deadline, by a take or
+transaction that marks the record consumed. The deadline read there is the end every reader of
+the store enforces (``store.end_of``): a gate given a store declares its own end there
+(``store.declare_end``) for as long as it lives, so a shorter deadline or stall time of any
+gate on the store ends a record for the queue's ``consume`` exactly as for a gate's ``take``,
+and the two refuse alike, whichever comes first. An approval covers exactly the effect it was drawn for:
+another effect presented with it is ``approval_digest_mismatch``. An approved one found past its deadline, by a take or
 any other read, is written ``expired`` in the same transaction and stays so for good,
 whatever the clock says later; approval.v1 keeps no answer on an expired record, so the
 record drops it, and the ``approval.answered`` event written when it was approved still
@@ -64,9 +67,10 @@ one requested last; two requested in the same second go by the order they were m
 store or without one): ``waiting_approval`` while its newest approval is unanswered, and ``stalled`` once that approval is still
 unanswered at its stall time (by default the deadline). An approval ends at the earlier
 of its deadline and its stall time: from then on it can be neither answered nor taken,
-so a stalled run never proceeds. With a store, both are the gate's own figures when the record is read: a
-gate made with a shorter deadline or stall time ends a record it reads at its request time plus the
-shorter figure, and a longer figure never makes an ended approval live again. Every code the gate
+so a stalled run never proceeds. With a store, the end is the shortest one declared on the store when the
+record is read or consumed (``store.end_of``): a gate made with a shorter deadline or stall time ends a
+record at its request time plus the shorter figure, for every reader and consumer of that store, and a
+longer figure never makes an ended approval live again. Every code the gate
 answers has its sentence in the one table ``SAYS``: what happened, and the one thing to do.
 
 State is bounded (without a store). A terminal approval (used, vetoed or expired) drops its effect bytes
@@ -270,6 +274,8 @@ class ApprovalGate:
             rows = _durable()[0]
             if declare_tables:
                 store.register_tables(rows.LANE, rows.VERSION, rows.DDL)
+            # This gate's end, declared on the store: the one consuming function ends a record there as well.
+            rows.declare_end(store, self, "plugin_effect", self._end)
 
     def _retire(self, approval_id: str, item: _Approval, state: str) -> None:
         """Make an entry terminal: drop its bytes, keep a bounded tombstone. Lock held."""
@@ -475,15 +481,15 @@ class ApprovalGate:
     def _reloaded(self, tx, held: dict, now: int) -> dict:
         """A record as it stands now: a pending one whose deadline has come, or an approved one found past
         it, is written ``expired`` (with ``approval.answered``) before anything reads it, for good. Its end is
-        the earlier of its own deadline and its request time plus this gate's end, so a deadline or stall
-        time made shorter since the request takes effect at once."""
-        rows, model, timestamp_of, milliseconds, _ = _durable()
+        the one every reader of the store enforces (``store.end_of``): the earlier of its own deadline and its
+        request time plus the shortest end declared on the store, this gate's among them, so a deadline or stall
+        time made shorter since the request takes effect at once, for the queue's consume as well."""
+        rows, model, timestamp_of, _, _ = _durable()
         changed = model.expire_if_due(held, timestamp_of(now))
-        ended = now * 1000 >= milliseconds(held["requested_at"]) + self._end * 1000
+        ended = now * 1000 >= rows.end_of(self._store, held)
         if changed is None and held["state"] == "pending" and ended:
-            changed = model.expire_if_due(held, held["expires_at"])  # ended by this gate's shorter figure
-        if changed is None and held["state"] == "approved" and (
-                ended or now * 1000 >= milliseconds(held["expires_at"])):
+            changed = model.expire_if_due(held, held["expires_at"])  # ended by a shorter end declared on the store
+        if changed is None and held["state"] == "approved" and ended:
             # approval.v1 keeps no answer on an expired record; the approval.answered event of the approval
             # still says who approved it.
             changed = dict(held, state="expired", answered_by=None, answer=None, answered_at=None)
@@ -588,7 +594,8 @@ class ApprovalGate:
                 if held["state"] != "approved":
                     return ("approval_not_granted", held["state"])
                 # The deadline and the veto are read where every consumer of the store consumes a record.
-                refusal, _ = rows.consume_in(tx, held, None, held["revision"], held["digest"], None, now * 1000)
+                refusal, _ = rows.consume_in(tx, held, None, held["revision"], held["digest"], None, now * 1000,
+                                             store=self._store)
                 return None if refusal is None else (refusal,)
 
             refusal = self._in_store(work)

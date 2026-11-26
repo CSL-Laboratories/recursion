@@ -20,12 +20,19 @@ path).
 
 ``consume_in`` is the one place a record is consumed, whoever consumes it (the approval queue's ``consume`` and
 the plugin gate's ``take``): the deadline and the veto are read there, in the transaction that marks it consumed.
+The deadline read there is the end every reader of the store enforces (``end_of``): the record's own
+``expires_at``, or, if earlier, its request time plus the shortest end a plugin gate on that store declared
+(``declare_end``), so a gate made again with a shorter deadline or stall time ends a record for every consumer
+at once. Two consumers of one record therefore never disagree, whichever comes first, and a gate's shorter
+figure is not a rule of that gate alone.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
+import weakref
 
 from recursion_core.approvals import model
 from recursion_core.approvals.effects import text_of
@@ -34,9 +41,9 @@ from recursion_core.approvals.record import milliseconds, shape_problem, summary
 
 log = logging.getLogger(__name__)
 
-__all__ = ["DDL", "LANE", "VERSION", "answered_event", "binding_of", "consume_in", "due", "insert", "list_summaries",
-           "load", "log_of", "mark_shown", "next_deadline", "past_deadline", "pending", "requested_event",
-           "retire_binding", "save", "set_aside", "unresolved_engine", "unshown", "vetoed"]
+__all__ = ["DDL", "LANE", "VERSION", "answered_event", "binding_of", "consume_in", "declare_end", "due", "end_of",
+           "insert", "list_summaries", "load", "log_of", "mark_shown", "next_deadline", "past_deadline", "pending",
+           "requested_event", "retire_binding", "save", "set_aside", "unresolved_engine", "unshown", "vetoed"]
 
 LANE = "approvals"
 VERSION = 1
@@ -143,17 +150,46 @@ def vetoed(tx, digest: str) -> bool:
     return False
 
 
-def past_deadline(record: dict, now_ms: int) -> bool:
-    """Whether an approved record's deadline has come: at its ``expires_at`` or after it nothing carries it out."""
-    return record["state"] == "approved" and now_ms >= milliseconds(record["expires_at"])
+# The ends declared on each store in this process. A plugin gate given an event store declares here, for as long
+# as it lives, the figure after which it ends a record of its source: the earlier of its deadline and its stall
+# time. Held per process, because an event store has one writer process (EVENTS takes a file lock on it).
+_ENDS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # the declaring reader -> (store, source, seconds)
+_ENDS_LOCK = threading.Lock()
 
 
-def consume_in(tx, record: dict, kept, revision, digest, binding, now_ms: int) -> tuple:
+def declare_end(store, reader, source: str, seconds: int) -> None:
+    """``reader`` ends every record of ``source`` on ``store`` at its request time plus ``seconds``, for as long as
+    the reader lives. The shortest end declared on a store is the one every reader of it enforces (``end_of``)."""
+    with _ENDS_LOCK:
+        _ENDS[reader] = (store, source, seconds)
+
+
+def end_of(store, record: dict) -> int:
+    """The moment (epoch milliseconds) a record ends for every reader of ``store``: its own ``expires_at``, or, if
+    earlier, its request time plus the shortest end a living reader declared for its source on that store. What an
+    end has already written (an ``expired`` record) stays so: a longer figure declared later brings nothing back."""
+    end = milliseconds(record["expires_at"])
+    with _ENDS_LOCK:
+        figures = [seconds for held, source, seconds in list(_ENDS.values())
+                   if held is store and source == record["source"]]
+    if figures:
+        end = min(end, milliseconds(record["requested_at"]) + min(figures) * 1000)
+    return end
+
+
+def past_deadline(store, record: dict, now_ms: int) -> bool:
+    """Whether an approved record's end has come (``end_of``): at that moment or after it nothing carries it out."""
+    return record["state"] == "approved" and now_ms >= end_of(store, record)
+
+
+def consume_in(tx, record: dict, kept, revision, digest, binding, now_ms: int, *, store) -> tuple:
     """Consume a record inside the caller's transaction: THE one place it is done, by whichever consumer (the
     approval queue's ``consume``, the plugin gate's ``take``), so two consumers of one record never disagree and
-    a later one cannot leave a rule out.
+    a later one cannot leave a rule out. ``store`` is the event store ``tx`` belongs to: the end read here is the
+    one every reader of it enforces.
 
-    An approved record whose deadline has come (``now_ms`` at or after its ``expires_at``) is written ``expired``
+    An approved record whose end has come (``now_ms`` at or after ``end_of(store, record)``: its own deadline, or
+    its request time plus a shorter end a gate on the store declared) is written ``expired``
     here, with ``approval.answered`` (approval.v1 keeps no answer on an expired record; the event written when it
     was approved still says who approved it), and refused ``approval_expired``. An approved record whose effect
     was refused on this store (vetoed through a gate, or denied through the queue) is refused ``approval_vetoed``
@@ -163,7 +199,7 @@ def consume_in(tx, record: dict, kept, revision, digest, binding, now_ms: int) -
 
     Returns ``(None, the consumed record)``, or ``(code, the record as it now stands)``: the caller raises the
     refusal only once its transaction has ended, so an expiry that was due is kept."""
-    if past_deadline(record, now_ms):
+    if past_deadline(store, record, now_ms):
         ended = dict(record, state="expired", answered_by=None, answer=None, answered_at=None)
         save(tx, ended, answered=True)
         return "approval_expired", ended

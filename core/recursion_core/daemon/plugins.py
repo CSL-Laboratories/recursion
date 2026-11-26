@@ -88,7 +88,14 @@ LEDGER_FILE = 'ledger.sqlite3'          # installer-created; never created here
 APPROVAL_EVENTS = 'approval-events.sqlite3'
 EFFECT_NOTES = 'effect-receipts.json'   # envelope and receipt, so a later process can return effect_replayed
 _TOKEN_CAP = 256
-_NOTE_CAP = 1024 * 1024
+# The approval notes file's figures. Each becomes a row of the person's one settings file, with this
+# value as its shipped default, once that file exists; None is 'no limit'. They are read at each use,
+# so this is the one place they come from. An approval's notes are always kept while it is approved
+# and not yet consumed; the figures govern only the notes of consumed approvals, and the size figure
+# prunes the oldest of those first, so a file of finished notes never refuses a new approval.
+NOTES_SIZE_LIMIT_BYTES = 1024 * 1024   # the most bytes the notes file holds after pruning
+NOTES_KEEP_FOR_S = 30 * 24 * 3600      # a consumed approval's notes are kept this many seconds
+NOTES_KEEP_AT_MOST = 1000              # the notes of at most this many consumed approvals are kept, the newest
 _CGROUP_CAP = 64 * 1024
 # Not an approver. approval.answer refuses it scope_refused before it reads the record.
 _STRANGER = {'kind': 'plugin', 'id': 'plugin'}
@@ -346,53 +353,140 @@ class _EffectNotes:
     Same-uid limit, as on the ledger: a plugin in this process can rewrite this file. It is not a
     boundary against that. It is what a later call in this uid reads so ``effect_replayed`` can
     return the receipt the first charge produced, without a second spend.
+
+    ``consumed`` maps an approval id to ``[time, sequence]``: when its approval was seen consumed (or
+    otherwise no longer carriable), in order. Every write prunes first: the notes of consumed
+    approvals past ``NOTES_KEEP_FOR_S``, then past ``NOTES_KEEP_AT_MOST``, then, while the file would
+    pass ``NOTES_SIZE_LIMIT_BYTES``, the oldest consumed ones. Notes of an approval not yet consumed
+    are never pruned: only when those alone pass the size figure is a write refused, with words that
+    name the file, how many approvals hold it and how to free it.
     """
 
-    def __init__(self, path):
+    def __init__(self, path, *, clock=time.time, states=None):
         self.path = Path(path)
         self._lock = threading.Lock()
+        self._clock = clock
+        self._states = states  # approval ids -> their queue state; None: nothing is taken as consumed
 
     def read(self):
         with self._lock:
             return self._read()
 
-    def update(self, mutator):
+    def update(self, mutator, *, charged=False):
+        """Change the notes, prune, write. Returns the approval ids whose notes were pruned."""
         with self._lock:
             data = self._read()
             mutator(data)
-            self._write(data)
+            dropped = self._prune(data)
+            self._write(data, charged=charged)
+            return dropped
 
     def _read(self):
         try:
             fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except FileNotFoundError:
-            return {'envelopes': {}, 'receipts': {}}
+            return {'envelopes': {}, 'receipts': {}, 'consumed': {}}
         except OSError as exc:
             raise Refused('approval_note_unreadable', type(exc).__name__) from None
         try:
             info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > _NOTE_CAP):
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
                 raise Refused('approval_note_untrusted')
-            raw = os.read(fd, _NOTE_CAP + 1)
+            # No size refusal here: a file past the size figure (one written before the figure was
+            # lowered) is pruned down at the next write instead of refusing every approval.
+            chunks, left = [], info.st_size + 1
+            while left > 0:
+                chunk = os.read(fd, left)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                left -= len(chunk)
+            raw = b''.join(chunks)
         finally:
             os.close(fd)
-        if len(raw) > _NOTE_CAP:
-            raise Refused('approval_note_untrusted')
         try:
             data = json.loads(raw.decode('utf-8'))
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise Refused('approval_note_unreadable', type(exc).__name__) from None
-        if (type(data) is not dict or set(data) != {'envelopes', 'receipts'}
-                or type(data['envelopes']) is not dict or type(data['receipts']) is not dict):
+        keys = set(data) if type(data) is dict else None
+        if (keys not in ({'envelopes', 'receipts'}, {'envelopes', 'receipts', 'consumed'})
+                or any(type(data[key]) is not dict for key in keys)):
+            raise Refused('approval_note_unreadable', 'shape')
+        data.setdefault('consumed', {})
+        if not all(type(seen) is list and len(seen) == 2 and all(type(v) in (int, float) for v in seen)
+                   for seen in data['consumed'].values()):
             raise Refused('approval_note_unreadable', 'shape')
         return data
 
-    def _write(self, data):
+    @staticmethod
+    def _payload(data):
+        return json.dumps(data, sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+    @staticmethod
+    def _entry_bytes(data, approval_id):
+        return sum(len(json.dumps({approval_id: data[key][approval_id]}, separators=(',', ':'))) - 1
+                   for key in ('envelopes', 'receipts', 'consumed') if approval_id in data[key])
+
+    @staticmethod
+    def _forget(data, approval_id):
+        for key in ('envelopes', 'receipts', 'consumed'):
+            data[key].pop(approval_id, None)
+
+    def mark_consumed(self, data, approval_id):
+        """Record that ``approval_id`` was seen consumed now, after every earlier one."""
+        if approval_id in data['consumed']:
+            return
+        sequence = max((seen[1] for seen in data['consumed'].values()), default=0) + 1
+        data['consumed'][approval_id] = [self._clock(), sequence]
+
+    def _prune(self, data):
+        envelopes, receipts, consumed = data['envelopes'], data['receipts'], data['consumed']
+        held = set(envelopes) | set(receipts)
+        for gone in [approval_id for approval_id in consumed if approval_id not in held]:
+            del consumed[gone]
+        unseen = sorted(held - set(consumed))
+        if unseen and self._states is not None:
+            states = self._states(unseen)
+            for approval_id in unseen:
+                if approval_id in states and states[approval_id] != 'approved':
+                    self.mark_consumed(data, approval_id)  # consumed, or gone: no carry reads it again
+        now = self._clock()
+        finished = sorted(consumed, key=lambda approval_id: (consumed[approval_id][1], approval_id))
+        keep_for, keep_at_most, limit = NOTES_KEEP_FOR_S, NOTES_KEEP_AT_MOST, NOTES_SIZE_LIMIT_BYTES
+        dropped = []
+        if keep_for is not None:
+            dropped += [approval_id for approval_id in finished if now - consumed[approval_id][0] >= keep_for]
+            finished = [approval_id for approval_id in finished if approval_id not in set(dropped)]
+        if keep_at_most is not None and len(finished) > keep_at_most:
+            cut = len(finished) - keep_at_most
+            dropped += finished[:cut]
+            finished = finished[cut:]
+        for approval_id in dropped:
+            self._forget(data, approval_id)
+        if limit is not None:
+            size = len(self._payload(data))
+            while finished and size > limit:
+                approval_id = finished.pop(0)
+                size -= self._entry_bytes(data, approval_id)
+                self._forget(data, approval_id)
+                dropped.append(approval_id)
+                if size <= limit:
+                    size = len(self._payload(data))  # exact again before it stops
+        return dropped
+
+    def _write(self, data, *, charged=False):
         directory = private_dir(self.path.parent)
-        payload = json.dumps(data, sort_keys=True, separators=(',', ':')).encode('utf-8')
-        if len(payload) > _NOTE_CAP:
-            raise Refused('approval_note_untrusted', 'size')
+        payload = self._payload(data)
+        limit = NOTES_SIZE_LIMIT_BYTES
+        if limit is not None and len(payload) > limit:
+            awaiting = len((set(data['envelopes']) | set(data['receipts'])) - set(data['consumed']))
+            done = ('the charge was made, and its receipt is held in this process only' if charged
+                    else 'nothing was charged')
+            raise Refused('approval_notes_full',
+                          f'the approval notes file {self.path} is full: {awaiting} approval(s) approved and not '
+                          f'yet consumed hold notes that alone pass its size figure of {limit} bytes; {done}; '
+                          'carry those approvals to their end (PluginEffectSink.carry), or raise the figure '
+                          'NOTES_SIZE_LIMIT_BYTES, then approve again')
         tmp = directory / (self.path.name + '.tmp')
         fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
@@ -506,7 +600,7 @@ class PluginEffectApprover:
     def __init__(self, host, queue, notes_path):
         from recursion_core.approvals.sink import PluginEffectSink
         self._host, self._queue = host, queue
-        self._notes = _EffectNotes(notes_path)
+        self._notes = _EffectNotes(notes_path, clock=lambda: host._clock(), states=self._record_states)
         self._envelopes = {}
         self._receipts = _EffectReceipts()
         self.sink = PluginEffectSink(queue, self.charge)
@@ -538,7 +632,54 @@ class PluginEffectApprover:
         if answer != 'approve' or answered.get('code') != 'ok':
             return answered
         self._note_envelope(approval_id, authority)
-        return self.sink.carry(approval_id, effect)
+        carried = self.sink.carry(approval_id, effect)
+        try:
+            self._update(lambda data: self._notes.mark_consumed(data, approval_id))
+        except (Refused, OSError) as refused:  # charged and consumed already; a later write marks it from the queue
+            log.warning('approval %s was carried; its notes were not marked consumed: %s', approval_id,
+                        getattr(refused, 'code', type(refused).__name__))
+        return carried
+
+    def _record_states(self, approval_ids):
+        """The queue state of each approval id that reads whole; a missing record reads 'missing'."""
+        from recursion_core.approvals import store as approval_rows
+        from recursion_core.approvals.model import ApprovalRefused
+        store = self._queue.store
+        if store is None:
+            return {}
+        states = {}
+        try:
+            with store.transaction() as tx:
+                for approval_id in approval_ids:
+                    try:
+                        record = approval_rows.load(tx, approval_id)
+                    except ApprovalRefused:
+                        continue  # unreadable: not taken as consumed, so it is kept
+                    states[approval_id] = record.get('state') if type(record) is dict else 'missing'
+        except Exception as exc:  # noqa: BLE001 - an unreadable store prunes nothing it cannot see
+            log.warning('approval states unreadable for the notes file: %s', type(exc).__name__)
+            return {}
+        return states
+
+    def _update(self, mutator, *, charged=False):
+        for approval_id in self._notes.update(mutator, charged=charged):
+            self._envelopes.pop(approval_id, None)
+            self._receipts._memory.pop(approval_id, None)
+
+    def notes_status(self):
+        """The notes file's figures ('no limit' for None) and how many approvals' notes it holds."""
+        shown = {'path': str(self._notes.path)}
+        for name, value in (('size_limit_bytes', NOTES_SIZE_LIMIT_BYTES), ('keep_for_s', NOTES_KEEP_FOR_S),
+                            ('keep_at_most', NOTES_KEEP_AT_MOST)):
+            shown[name] = 'no limit' if value is None else value
+        try:
+            data = self._notes.read()
+        except Refused as refused:
+            shown.update(held=None, awaiting_carry=None, unreadable=refused.code)
+            return shown
+        held = set(data['envelopes']) | set(data['receipts'])
+        shown.update(held=len(held), awaiting_carry=len(held - set(data['consumed'])))
+        return shown
 
     def _admit(self, peer):
         # Exact type, not a subclass: a plugin cannot widen admission by inheriting the proof.
@@ -576,7 +717,7 @@ class PluginEffectApprover:
         def put(data):
             data['envelopes'][approval_id] = held
 
-        self._notes.update(put)
+        self._update(put)
 
     def _envelope_for(self, approval_id):
         if approval_id in self._envelopes:
@@ -603,7 +744,7 @@ class PluginEffectApprover:
         def put(data):
             data['receipts'][approval_id] = receipt
 
-        self._notes.update(put)
+        self._update(put, charged=True)
 
     def charge(self, effect, approval_id):
         """Charge this approval through the core's one charge path (``CoreService.authorize_effect``).
@@ -881,6 +1022,7 @@ class PluginHost:
             plugins.append(item)
         return {'plugins': plugins, 'verification': self.verification, 'core_poisoned': self.health.poisoned,
                 'authority_profile': self.authority_state, 'approvals_drawn': len(self.pending_approvals),
+                'effect_notes': self._approver.notes_status() if self._approver is not None else None,
                 'approval_surface': ('owner socket or device token, through approval.answer'
                                      if self._approver is not None else
                                      'none: no surface can approve or veto yet, so no effect is authorized'),

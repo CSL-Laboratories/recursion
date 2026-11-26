@@ -1084,6 +1084,8 @@ def _allowed_words(row: settings.Setting) -> str:
     """What a note tells the person they can write instead, made from the row's own declaration."""
     if row.type is bool:
         return "true or false"
+    if getattr(row, "choices", None) is not None:
+        return "one of " + ", ".join(settings._shown(choice) for choice in row.choices)
     kind = {int: "a whole number", float: "a number", str: "a text"}[row.type]
     if row.floor is not None and row.ceiling is not None:
         return f"{kind} from {settings._shown(row.floor)} to {settings._shown(row.ceiling)}"
@@ -1095,6 +1097,8 @@ def _another_value(row: settings.Setting) -> object:
     if row.type is bool:
         return not row.default
     if row.type is str:
+        if getattr(row, "choices", None):
+            return next((choice for choice in row.choices if choice != row.default), row.default)
         return row.default + "x"
     step = 1 if row.type is int else 0.25
     for value in (row.default + step, row.default - step, row.floor, row.ceiling):
@@ -1144,6 +1148,24 @@ def _row_faults(row: settings.Setting, names: list) -> list[str]:
                                                        or (row.ceiling is not None and row.default > row.ceiling)):
         faults.append(f"{who} has its default {row.default!r} outside its own floor and ceiling; give it a default "
                       "inside them")
+    choices = getattr(row, "choices", None)
+    if choices is not None:
+        if row.type is not str:
+            faults.append(f"{who} has a list of choices but is not a text; take the choices away or make the row a "
+                          "text")
+        elif not isinstance(choices, (tuple, list)) or not choices:
+            faults.append(f"{who} has an empty list of choices; give it each text a person may write, or take the "
+                          "choices away")
+        else:
+            if any(not isinstance(choice, str) for choice in choices):
+                faults.append(f"{who} has a choice that is not a text; write each choice as a text")
+            doubled = sorted({choice for choice in choices if choices.count(choice) > 1}, key=repr)
+            if doubled:
+                faults.append(f"{who} has a choice written twice ({', '.join(map(repr, doubled))}); write each "
+                              "choice once")
+            if type(row.default) is str and row.default not in choices:
+                faults.append(f"{who} has a default {row.default!r} that is not one of its choices; give it a "
+                              "default from the list")
     says = row.says
     if not isinstance(says, str) or not says.strip():
         faults.append(f"{who} has no description; say in one sentence what a person trades by changing it")
@@ -1164,7 +1186,7 @@ def _registry(case: unittest.TestCase, rows) -> None:
 
 @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
 class EveryRowOfTheRegistry(_Folder):
-    """Seven cases for each row of ``settings.SETTINGS``, each made from the row itself."""
+    """The cases for each row of ``settings.SETTINGS``, each made from the row itself."""
 
     def read(self, text: str):
         self.put(text)
@@ -1215,6 +1237,36 @@ class EveryRowOfTheRegistry(_Folder):
                     self.assertIn(f"; allowed: {_allowed_words(row)}; ", detail)  # what the person can write instead
                     kept = f"the default {settings._shown(row.default)} stays in force"
                     self.assertTrue(detail.endswith(kept), detail)
+
+    def test_every_row_with_choices_refuses_a_text_outside_its_list_and_names_each_choice(self) -> None:
+        for row in settings.SETTINGS:
+            if getattr(row, "choices", None) is None:
+                continue
+            outside = row.default + "x"
+            while outside in row.choices:
+                outside += "x"
+            with self.subTest(row=row.name, found=outside):
+                loaded = self.read(f"version = 1\n{row.name} = {_toml(outside)}\n")
+                self.assertEqual((row.default, settings.SOURCE_DEFAULT),
+                                 (loaded[row.name], loaded.values[row.name].source))
+                self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
+                detail = loaded.notes[0].detail
+                self.assertTrue(detail.startswith(f"{row.name}: found {settings._shown(outside)}; "), detail)
+                self.assertIn("; allowed: one of ", detail)
+                for choice in row.choices:
+                    self.assertIn(settings._shown(choice), detail.split("; allowed: ", 1)[1])
+                self.assertIn(f"; allowed: {_allowed_words(row)}; ", detail)
+                self.assertTrue(detail.endswith(f"the default {settings._shown(row.default)} stays in force"), detail)
+
+    def test_every_row_with_choices_takes_each_of_its_choices_with_its_source(self) -> None:
+        for row in settings.SETTINGS:
+            for choice in (getattr(row, "choices", None) or ()):
+                with self.subTest(row=row.name, choice=choice):
+                    loaded = self.read(f"version = 1\n{row.name} = {_toml(choice)}\n")
+                    self.assertEqual([], self.codes(loaded))
+                    self.assertEqual((choice, settings.SOURCE_FILE), (loaded[row.name], loaded.values[row.name].source))
+                    self.assertIn(f"{row.name} = {settings._shown(choice)} (default {settings._shown(row.default)}; "
+                                  "source: settings file)", settings.lines(loaded))
 
     def test_every_row_holds_its_floor_and_ceiling_at_their_edges(self) -> None:
         for row in settings.SETTINGS:
@@ -1284,6 +1336,44 @@ class TheWordsOfStatusForRowsTheTestRegisters(_Folder):
         _registry(self, GOLDEN_ROWS)
         self.put(GOLDEN_FILE)
         self.assertEqual(GOLDEN_LINES, settings.lines(settings.load(self.environ)))
+
+
+def _mode_row() -> settings.Setting:
+    """A row of this test only whose value is one of a list of choices; made inside each test method, so that
+    the file still loads where ``Setting`` takes no choices."""
+    return settings.Setting("test_only.mode", str, "first", "Which way the throwaway row works; a row of this test "
+                            "only.", choices=("first", "second"))
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class TheWordsOfStatusForARowWithChoices(_Folder):
+    """The exact words of the note and of the status lines for a row whose value is one of a list of choices."""
+
+    def test_a_text_outside_the_list_keeps_the_default_and_the_note_names_every_choice(self) -> None:
+        _registry(self, (_mode_row(),))
+        self.put('version = 1\n\n[test_only]\nmode = "third"\n')
+        loaded = settings.load(self.environ)
+        self.assertEqual("first", loaded["test_only.mode"])
+        self.assertEqual([
+            "test_only.mode = 'first' (default 'first'; source: default)",
+            "note settings_value_out_of_range: test_only.mode: found 'third'; allowed: one of 'first', 'second'; "
+            "the default 'first' stays in force",
+        ], settings.lines(loaded))
+
+    def test_a_choice_is_taken_and_shown_with_its_source(self) -> None:
+        _registry(self, (_mode_row(),))
+        self.put('version = 1\n\n[test_only]\nmode = "second"\n')
+        self.assertEqual(["test_only.mode = 'second' (default 'first'; source: settings file)"],
+                         settings.lines(settings.load(self.environ)))
+
+    def test_a_value_of_another_type_names_the_choices_too(self) -> None:
+        _registry(self, (_mode_row(),))
+        self.put("version = 1\n\n[test_only]\nmode = 1\n")
+        self.assertEqual([
+            "test_only.mode = 'first' (default 'first'; source: default)",
+            "note settings_value_out_of_range: test_only.mode: found 1; allowed: one of 'first', 'second'; the "
+            "default 'first' stays in force",
+        ], settings.lines(settings.load(self.environ)))
 
 
 @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
@@ -1464,6 +1554,35 @@ class ANewRowNeedsNoTestEdit(_Folder):
                 self.assertTrue(result.failures, f"a row that {lack} passed")
                 self.assertIn(repr(row.name), text)
                 self.assertIn(lack, text)
+
+    def test_a_row_with_choices_passes_every_case_made_from_the_registry(self) -> None:
+        result = self.run_with(settings.SETTINGS + (_mode_row(),), lambda test: isinstance(test, EveryRowOfTheRegistry))
+        self.assertEqual({}, self.failed(result))
+        self.assertEqual(len(unittest.defaultTestLoader.getTestCaseNames(EveryRowOfTheRegistry)), result.testsRun)
+
+    def test_a_row_with_choices_passes_every_test_of_this_file_but_the_published_places(self) -> None:
+        result = self.run_with(settings.SETTINGS + (_mode_row(),),
+                               lambda test: test.id().rsplit(".", 1)[-1] not in PUBLISHED_PLACES)
+        self.assertEqual({}, self.failed(result))
+
+    def test_a_row_with_choices_that_lacks_something_fails_with_words_that_name_it_and_what_it_lacks(self) -> None:
+        text = "How many, a count; a row of this test only."
+        lacking = (
+            (settings.Setting("lacking.number", int, 1, text, choices=(1, 2)), "has a list of choices but is not a text"),
+            (settings.Setting("lacking.empty", str, "a", text, choices=()), "has an empty list of choices"),
+            (settings.Setting("lacking.twice", str, "a", text, choices=("a", "b", "a")), "has a choice written twice"),
+            (settings.Setting("lacking.outside", str, "c", text, choices=("a", "b")),
+             "is not one of its choices"),
+            (settings.Setting("lacking.kind", str, "a", text, choices=("a", 2)), "has a choice that is not a text"),
+        )
+        for row, lack in lacking:
+            with self.subTest(row=row.name, lacks=lack):
+                result = self.run_with(settings.SETTINGS + (row,), lambda test: test.id().endswith(
+                    ".test_every_row_is_declared_with_a_name_a_type_a_default_and_a_description"))
+                text_found = "\n".join(self.failed(result).values())
+                self.assertTrue(result.failures, f"a row that {lack} passed")
+                self.assertIn(repr(row.name), text_found)
+                self.assertIn(lack, text_found)
 
 
 if __name__ == "__main__":

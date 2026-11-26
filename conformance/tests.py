@@ -1487,6 +1487,34 @@ class RulesTest(unittest.TestCase):
                     seen = {keyword for keyword, location, _ in client.leaf_errors(validator, changed) if location == at}
                     self.assertLessEqual(keywords, seen)
 
+    def test_a_runs_change_carries_a_record_and_the_transcript_rule_never_raises_on_one_without(self):
+        """A run's state.changed whose post-image has neither the daemon's row nor the stored record fitted event.v1,
+        and transcript_fields then raised TypeError reading its state (a reader of the pull request showed it from the
+        good run fixture). Now the schema refuses it (``not`` at the post-image), and the transcript rule answers a
+        typed problem for it, ``refused:post_image``, instead of raising, on a raw page too."""
+        rules = self.rules
+        event = client.read_json(self.folder / "fixtures" / "good" / "event.v1" / "h01-state-changed-run-as-it-was-committed.json")
+        self.assertTrue(rules.fits("event.v1.json", event))
+        self.assertEqual(rules.transcript_fields([event])[0]["state"], event["payload"]["post_image"]["control_record"]["state"]
+                         if event["payload"]["post_image"]["control_record"] else event["payload"]["post_image"]["daemon_row"]["state"])
+        empty = copy.deepcopy(event)
+        empty["payload"]["post_image"] = {"daemon_row": None, "control_record": None}
+        empty["payload"]["post_image_sha256"] = rules.post_image_digest(empty["payload"]["post_image"])
+        self.assertFalse(rules.fits("event.v1.json", empty))
+        errors = {(keyword, at) for keyword, at, _ in client.leaf_errors(self.schemas.validator("event.v1.json"), empty)}
+        self.assertIn(("not", "/payload/post_image"), errors)
+        self.refused("post_image", rules.transcript_fields, [empty])
+        line = dict(rules.transcript_fields([event])[0], seq=empty["seq"])
+        self.assertEqual(rules.transcript_problems([empty], [line]), ["refused:post_image"])
+        for half in ("daemon_row", "control_record"):
+            if event["payload"]["post_image"][half] is not None:
+                with self.subTest(only=half):
+                    one = copy.deepcopy(event)
+                    one["payload"]["post_image"] = {"daemon_row": None, "control_record": None, half: event["payload"]["post_image"][half]}
+                    one["payload"]["post_image_sha256"] = rules.post_image_digest(one["payload"]["post_image"])
+                    self.assertTrue(rules.fits("event.v1.json", one), "one record alone still fits")
+                    self.assertEqual(rules.transcript_fields([one])[0]["state"], one["payload"]["post_image"][half]["state"])
+
     # ---- the delivery of a queue item
     def test_a_refused_delivery_step_changes_nothing_and_raises_nothing_but_a_refusal(self):
         rules = self.rules

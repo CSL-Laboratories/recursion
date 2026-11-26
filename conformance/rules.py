@@ -931,6 +931,8 @@ def transcript_fields(events: list) -> list:
             image = payload["post_image"]
             if payload["entity"] == "run":
                 image = image["control_record"] or image["daemon_row"]
+                if image is None:
+                    raise Refused("post_image")     # a run's change with no record: event.v1 refuses it
             state = image["state"]
         else:
             state = payload[_STATE_FROM[kind]] if kind in _STATE_FROM else None

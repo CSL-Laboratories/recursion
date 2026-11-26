@@ -1,0 +1,21 @@
+{
+  "seq": 1,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": null,
+  "time": "2026-11-13T07:34:01.037Z",
+  "type": "state.changed",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "entity": "run",
+    "entity_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "post_image": {
+      "daemon_row": null,
+      "control_record": null
+    },
+    "post_image_sha256": "a4e8bb31277cb4cfc05f901e0ce84998be60a73a7b28b2fdbe087979fdc214ac",
+    "reason": "commit",
+    "coalesced": null
+  }
+}

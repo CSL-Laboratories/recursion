@@ -4,6 +4,7 @@ did not list."""
 from __future__ import annotations
 
 import copy
+import inspect
 import itertools
 import json
 import re
@@ -93,21 +94,31 @@ def with_limits(limits, where="default"):
 CODEX = copy.deepcopy(ROUTES["codex"]["route"])
 OPENCODE = copy.deepcopy(ROUTES["opencode"]["route"])
 LIMIT = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("connection", "test.typed", reset_at=5000.0)}
+# A snapshot that calls every engine routable (each key opted in): what a test passes, said in the call, when it is
+# about something other than detection. next_after_limit has no default snapshot.
+ALL_ROUTABLE = detection(set(rc.ENGINES))
 
 
 class NextAfterLimitTests(unittest.TestCase):
     def test_the_next_listed_route_in_the_users_order(self) -> None:
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX, OPENCODE]})
         d = router.decide(cfg, SENTRY, {"task_kind": "chat"})
-        out = router.next_after_limit(cfg, d, LIMIT)
+        ready = detect.detect(cfg, route_refusal=None, breaker_state=None, key_state=lambda key_id: "ready", active=None)
+        out = router.next_after_limit(cfg, d, LIMIT, ready, route_refusal=None)
         self.assertEqual((out["action"], out["place"], out["route"], out["source"]), ("switch", 1, CODEX, "routing"))
-        # The route service already tried the first fallback in this request: the next one.
+        # The route service already tried the first fallback in this request: the next one, a key route, because the
+        # snapshot has seen its key opted in.
         notice = {"attempts": [route_limits.describe(ROUTES["claude_code"]["route"]), route_limits.describe(CODEX)]}
-        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": notice})
+        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": notice}, ready, route_refusal=None)
         self.assertEqual((out["action"], out["place"], out["route"]["engine"]), ("switch", 2, "opencode"))
         self.assertEqual(out["skipped"], [{"place": 1, **route_limits.describe(CODEX), "skipped": "already_tried"}])
+        # The same key route whose key is not opted in, or whose key state no source gave, is passed over: ask.
+        for keys, why in ((lambda key_id: "not_opted_in", "key_not_opted_in"), (None, "key_state_unknown")):
+            unseen = detect.detect(cfg, route_refusal=None, breaker_state=None, key_state=keys, active=None)
+            out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": notice}, unseen, route_refusal=None)
+            self.assertEqual((out["action"], out["reason"], out["skipped"][-1]["skipped"]), ("ask", "fallback_exhausted", why))
         notice["attempts"].append(route_limits.describe(OPENCODE))
-        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": notice})
+        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": notice}, ready, route_refusal=None)
         self.assertEqual((out["action"], out["reason"]), ("ask", "fallback_exhausted"))
         self.assertEqual([ch["engine"] for ch in out["choices"]], ["codex", "opencode"])
 
@@ -115,53 +126,53 @@ class NextAfterLimitTests(unittest.TestCase):
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX, OPENCODE]})
         d = router.decide(cfg, SENTRY, {"task_kind": "chat"})
         det = detection({"claude_code", "opencode"}, {"codex": "signed_out"})
-        out = router.next_after_limit(cfg, d, LIMIT, det)
+        out = router.next_after_limit(cfg, d, LIMIT, det, route_refusal=None)
         self.assertEqual((out["action"], out["place"]), ("switch", 2))
         self.assertEqual(out["skipped"][0]["skipped"], "signed_out")
-        out = router.next_after_limit(cfg, d, LIMIT, detection({"claude_code"}))
+        out = router.next_after_limit(cfg, d, LIMIT, detection({"claude_code"}), route_refusal=None)
         self.assertEqual((out["action"], out["reason"]), ("ask", "fallback_exhausted"))
 
     def test_only_a_limit_leads_anywhere(self) -> None:
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {"task_kind": "chat"})
         for code in (c.ENGINE_ERROR, c.AUTH_FAILED, c.SHORT_FAULT, c.ENGINE_EXITED, c.DEADLINE_EXCEEDED, c.PROTOCOL_ERROR, None, "x"):
-            self.assertEqual(router.next_after_limit(cfg, d, {"code": code}), {"action": "none", "reason": "not_a_limit"}, code)
+            self.assertEqual(router.next_after_limit(cfg, d, {"code": code}, ALL_ROUTABLE, route_refusal=None), {"action": "none", "reason": "not_a_limit"}, code)
         for code in (c.PLAN_LIMIT, c.BREAKER_OPEN, c.PROBE_IN_FLIGHT):
-            self.assertEqual(router.next_after_limit(cfg, d, {"code": code})["action"], "switch", code)
+            self.assertEqual(router.next_after_limit(cfg, d, {"code": code}, ALL_ROUTABLE, route_refusal=None)["action"], "switch", code)
         refused = router.decide(cfg, SENTRY, {"hand_pick": {"engine": "pi", "model": None}})
-        self.assertEqual(router.next_after_limit(cfg, refused, LIMIT), {"action": "none", "reason": "no_route"})
+        self.assertEqual(router.next_after_limit(cfg, refused, LIMIT, ALL_ROUTABLE, route_refusal=None), {"action": "none", "reason": "no_route"})
 
     def test_ask_and_wait_are_the_users_settings(self) -> None:
         cfg = with_limits({"on_limit": "ask", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {"task_kind": "chat"})
-        self.assertEqual(router.next_after_limit(cfg, d, LIMIT),
+        self.assertEqual(router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE, route_refusal=None),
                          {"action": "ask", "reason": "on_limit_ask", "choices": [route_limits.describe(CODEX)]})
         cfg = with_limits({"on_limit": "wait"})
         d = router.decide(cfg, SENTRY, {"task_kind": "chat"})
-        self.assertEqual(router.next_after_limit(cfg, d, LIMIT), {"action": "wait", "until": 5000.0, "choices": []})
-        self.assertEqual(router.next_after_limit(cfg, d, {"code": c.BREAKER_OPEN, "retry_at": 7.0})["until"], 7.0)
+        self.assertEqual(router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE, route_refusal=None), {"action": "wait", "until": 5000.0, "choices": []})
+        self.assertEqual(router.next_after_limit(cfg, d, {"code": c.BREAKER_OPEN, "retry_at": 7.0}, ALL_ROUTABLE, route_refusal=None)["until"], 7.0)
         # Nothing configured anywhere: the user's default, show and ask.
         d = router.decide(config(), SENTRY, {"task_kind": "chat"})
-        self.assertEqual(router.next_after_limit(config(), d, LIMIT), {"action": "ask", "reason": "on_limit_ask", "choices": []})
+        self.assertEqual(router.next_after_limit(config(), d, LIMIT, ALL_ROUTABLE, route_refusal=None), {"action": "ask", "reason": "on_limit_ask", "choices": []})
 
     def test_a_hand_pick_is_never_switched_away_from(self) -> None:
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {"hand_pick": {"engine": "claude_code", "model": None}})
-        self.assertEqual(router.next_after_limit(cfg, d, LIMIT)["action"], "ask")
-        self.assertEqual(router.next_after_limit(cfg, d, LIMIT)["reason"], "hand_pick")
+        self.assertEqual(router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE, route_refusal=None)["action"], "ask")
+        self.assertEqual(router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE, route_refusal=None)["reason"], "hand_pick")
 
     def test_routes_json_limits_apply_when_the_routing_file_gives_none(self) -> None:
         routes = copy.deepcopy(ROUTES)
         routes["codex"]["route"]["limits"] = {"on_limit": "fallback", "fallback": [copy.deepcopy(ROUTES["claude_code"]["route"])]}
         cfg = config(routes=routes)
         d = router.decide(cfg, SENTRY, {"task_kind": "review"})
-        out = router.next_after_limit(cfg, d, LIMIT)
+        out = router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE, route_refusal=None)
         self.assertEqual((out["action"], out["route"]["engine"], out["source"]), ("switch", "claude_code", "routes"))
         # The routing file's own limits for a route win over routes.json's.
         raw = copy.deepcopy(CONFIG)
         raw["rules"][0]["route"]["limits"] = {"on_limit": "ask"}
         d = router.decide(config(raw, routes), SENTRY, {"task_kind": "review"})
-        self.assertEqual(router.next_after_limit(config(raw, routes), d, LIMIT)["action"], "ask")
+        self.assertEqual(router.next_after_limit(config(raw, routes), d, LIMIT, ALL_ROUTABLE, route_refusal=None)["action"], "ask")
 
     def test_never_a_route_the_user_did_not_list(self) -> None:
         listed = [CODEX, OPENCODE, copy.deepcopy(ROUTES["pi"]["route"])]
@@ -174,7 +185,7 @@ class NextAfterLimitTests(unittest.TestCase):
                     d = router.decide(cfg, det, {"task_kind": "chat"})
                     for tried in range(len(order) + 1):
                         notice = {"attempts": [route_limits.describe(r) for r in order[:tried]]}
-                        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": notice}, det)
+                        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": notice}, det, route_refusal=None)
                         self.assertIn(out["action"], ("switch", "ask"))
                         if out["action"] == "switch":
                             self.assertIn(out["route"], list(order))
@@ -263,16 +274,16 @@ class AnswerEdgeCaseTests(unittest.TestCase):
         cfg = with_limits({"on_limit": "wait"})
         decision = router.decide(cfg, SENTRY, {})
         result = c.result("review", c.PLAN_LIMIT, limit=c.limit_signal("connection", "review.typed"), retry_at=7000.0)
-        self.assertEqual(router.next_after_limit(cfg, decision, result)["until"], 7000.0)
+        self.assertEqual(router.next_after_limit(cfg, decision, result, ALL_ROUTABLE, route_refusal=None)["until"], 7000.0)
         zero = c.result("review", c.PLAN_LIMIT, limit=c.limit_signal("connection", "review.typed", reset_at=0.0),
                         retry_at=7000.0)
-        self.assertEqual(router.next_after_limit(cfg, decision, zero)["until"], 0.0)  # an explicit zero is kept
+        self.assertEqual(router.next_after_limit(cfg, decision, zero, ALL_ROUTABLE, route_refusal=None)["until"], 0.0)  # an explicit zero is kept
 
     def test_primary_not_reoffered_without_notice(self) -> None:
         primary = copy.deepcopy(ROUTES["claude_code"]["route"])
         cfg = with_limits({"on_limit": "fallback", "fallback": [primary, CODEX]})
         decision = router.decide(cfg, SENTRY, {})
-        answer = router.next_after_limit(cfg, decision, LIMIT)
+        answer = router.next_after_limit(cfg, decision, LIMIT, ALL_ROUTABLE, route_refusal=None)
         self.assertEqual(answer["route"]["engine"], "codex")
         self.assertEqual(answer["skipped"][0]["skipped"], "already_tried")
 
@@ -281,7 +292,7 @@ class AnswerEdgeCaseTests(unittest.TestCase):
         other["model"] = "claude-model-b"
         cfg = with_limits({"on_limit": "fallback", "fallback": [other, CODEX]})
         decision = router.decide(cfg, SENTRY, {})
-        self.assertEqual(router.next_after_limit(cfg, decision, LIMIT)["route"], other)
+        self.assertEqual(router.next_after_limit(cfg, decision, LIMIT, ALL_ROUTABLE, route_refusal=None)["route"], other)
 
     def test_a_route_with_no_model_anywhere_is_not_routable(self) -> None:
         routes = copy.deepcopy(ROUTES)
@@ -329,8 +340,8 @@ class AnswerEdgeCaseTests(unittest.TestCase):
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {})
         for wrong in (router.route_decision(d), None, {}, "decision"):
-            self.assertEqual(router.next_after_limit(cfg, wrong, LIMIT), {"action": "none", "reason": "no_decision"}, wrong)
-        self.assertEqual(router.next_after_limit(cfg, d, LIMIT)["action"], "switch")
+            self.assertEqual(router.next_after_limit(cfg, wrong, LIMIT, ALL_ROUTABLE, route_refusal=None), {"action": "none", "reason": "no_decision"}, wrong)
+        self.assertEqual(router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE, route_refusal=None)["action"], "switch")
 
     def test_a_snapshot_that_cannot_be_walked_is_malformed(self) -> None:
         class Hostile(Mapping):
@@ -351,7 +362,7 @@ class AnswerEdgeCaseTests(unittest.TestCase):
         self.assertIn("EXPLAIN_PARAMS", routing.__all__)
         for active in ("codex", b"codex"):
             with self.assertRaises(TypeError):
-                detect.detect(config(), active=active)
+                detect.detect(config(), active=active, route_refusal=None, breaker_state=None, key_state=None)
 
     def test_a_rule_without_model_is_skipped_or_refused(self) -> None:
         routes = copy.deepcopy(ROUTES)
@@ -384,21 +395,21 @@ class NullAndUnreadableInputTests(unittest.TestCase):
     def test_a_null_attempts_list_and_a_decision_in_name_only(self) -> None:
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {})
-        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": {"attempts": None}})
-        self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"))
+        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": {"attempts": None}}, ALL_ROUTABLE, route_refusal=None)
+        self.assertEqual((out["action"], out["reason"]), ("ask", "attempts_unreadable"))  # a notice holds a list
         for partial in ({"ok": True}, {"ok": True, "reason": "config", "engine": "codex"},
                         {**d, "connection": None}, {**d, "connection": {"kind": "subscription"}},
                         {k: v for k, v in d.items() if k != "rule"}):
-            self.assertEqual(router.next_after_limit(cfg, partial, LIMIT), {"action": "none", "reason": "no_decision"}, partial)
+            self.assertEqual(router.next_after_limit(cfg, partial, LIMIT, ALL_ROUTABLE, route_refusal=None), {"action": "none", "reason": "no_decision"}, partial)
         # Each member alone, and a connection that is not a mapping or has no kind.
         for missing in ("reason", "rule", "engine", "model", "connection"):
             partial = {k: v for k, v in d.items() if k != missing}
-            self.assertEqual(router.next_after_limit(cfg, partial, LIMIT), {"action": "none", "reason": "no_decision"}, missing)
+            self.assertEqual(router.next_after_limit(cfg, partial, LIMIT, ALL_ROUTABLE, route_refusal=None), {"action": "none", "reason": "no_decision"}, missing)
         for connection in ({"id": "claude-main"}, ["kind", "id"], _LikeAMapping(("kind", "id"), "x")):
-            self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT),
+            self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT, ALL_ROUTABLE, route_refusal=None),
                              {"action": "none", "reason": "no_decision"}, connection)
         refused = router.decide(cfg, SENTRY, {"hand_pick": {"engine": "pi", "model": None}})
-        self.assertEqual(router.next_after_limit(cfg, refused, LIMIT), {"action": "none", "reason": "no_route"})
+        self.assertEqual(router.next_after_limit(cfg, refused, LIMIT, ALL_ROUTABLE, route_refusal=None), {"action": "none", "reason": "no_route"})
 
     def test_an_invalid_routes_json_limits_block_falls_back_to_ask(self) -> None:
         for bad in ({"on_limit": "sometimes"}, {"on_limit": "ask", "x": 1}, []):
@@ -407,7 +418,7 @@ class NullAndUnreadableInputTests(unittest.TestCase):
                 routes["claude_code"]["route"]["limits"] = bad
                 cfg = config(routes=routes)
                 d = router.decide(cfg, SENTRY, {})
-                self.assertEqual(router.next_after_limit(cfg, d, LIMIT),
+                self.assertEqual(router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE, route_refusal=None),
                                  {"action": "ask", "reason": "on_limit_ask", "choices": []})
 
     def test_an_exhausted_list_names_each_listed_route_once_in_order(self) -> None:
@@ -416,7 +427,7 @@ class NullAndUnreadableInputTests(unittest.TestCase):
         cfg = with_limits({"on_limit": "fallback", "fallback": order})
         d = router.decide(cfg, SENTRY, {})
         notice = {"attempts": [route_limits.describe(r) for r in order]}
-        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": notice})
+        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": notice}, ALL_ROUTABLE, route_refusal=None)
         self.assertEqual((out["action"], out["reason"]), ("ask", "fallback_exhausted"))
         self.assertEqual(out["skipped"], [{"place": n, **route_limits.describe(r), "skipped": "already_tried"}
                                           for n, r in enumerate(order, 1)])
@@ -516,13 +527,13 @@ class UnreadableDetectionParamsAndDecisionTests(unittest.TestCase):
         cfg = config()  # the default route has no limits of its own, so routes.json's are looked up by engine
         d = router.decide(cfg, SENTRY, {})
         for odd in ({**d, "engine": ["codex"]}, {**d, "engine": None}, {**d, "model": ["m"]}):
-            self.assertEqual(router.next_after_limit(cfg, odd, LIMIT), {"action": "none", "reason": "no_decision"}, odd)
-        self.assertEqual(router.next_after_limit(cfg, d, LIMIT)["action"], "ask")
+            self.assertEqual(router.next_after_limit(cfg, odd, LIMIT, ALL_ROUTABLE, route_refusal=None), {"action": "none", "reason": "no_decision"}, odd)
+        self.assertEqual(router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE, route_refusal=None)["action"], "ask")
 
     def test_a_limit_result_that_cannot_be_read_is_not_a_limit(self) -> None:
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {})
-        self.assertEqual(router.next_after_limit(cfg, d, _Unreadable("all")), {"action": "none", "reason": "not_a_limit"})
+        self.assertEqual(router.next_after_limit(cfg, d, _Unreadable("all"), ALL_ROUTABLE, route_refusal=None), {"action": "none", "reason": "not_a_limit"})
 
         class FailsOn(dict):
             """A limit result whose get answers ``code`` and fails on one other member."""
@@ -543,14 +554,14 @@ class UnreadableDetectionParamsAndDecisionTests(unittest.TestCase):
         dw = router.decide(wait, SENTRY, {})
         not_a_limit = {"action": "none", "reason": "not_a_limit"}
         for member in ("limit", "retry_at"):  # the wait path's reads
-            self.assertEqual(router.next_after_limit(wait, dw, FailsOn(member)), not_a_limit, member)
-        self.assertEqual(router.next_after_limit(cfg, d, FailsOn("limit_notice")), not_a_limit)  # the switch path's
-        # The nested reads too: the vendor's signal and the notice. An attempt in it that cannot be read is dropped
-        # like any other non-attempt, so the limit itself still leads where the user listed.
-        self.assertEqual(router.next_after_limit(wait, dw, {"code": c.PLAN_LIMIT, "limit": Broken()}), not_a_limit)
-        self.assertEqual(router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit_notice": Broken()}), not_a_limit)
-        self.assertEqual(router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit_notice": {"attempts": [Broken()]}})["action"],
-                         "switch")
+            self.assertEqual(router.next_after_limit(wait, dw, FailsOn(member), ALL_ROUTABLE, route_refusal=None), not_a_limit, member)
+        self.assertEqual(router.next_after_limit(cfg, d, FailsOn("limit_notice"), ALL_ROUTABLE, route_refusal=None), not_a_limit)  # the switch path's
+        # The nested reads too: the vendor's signal and the notice. An attempt in it that cannot be read makes the
+        # history unreadable, like any other non-attempt: the limit still leads to ask, never to a switch.
+        self.assertEqual(router.next_after_limit(wait, dw, {"code": c.PLAN_LIMIT, "limit": Broken()}, ALL_ROUTABLE, route_refusal=None), not_a_limit)
+        self.assertEqual(router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit_notice": Broken()}, ALL_ROUTABLE, route_refusal=None), not_a_limit)
+        self.assertEqual(router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit_notice": {"attempts": [Broken()]}},
+                                                 ALL_ROUTABLE, route_refusal=None)["action"], "ask")
 
 
 class WrongTypedDecisionAndMissingSnapshotTests(unittest.TestCase):
@@ -583,10 +594,10 @@ class WrongTypedDecisionAndMissingSnapshotTests(unittest.TestCase):
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {})
         no_decision = {"action": "none", "reason": "no_decision"}
-        self.assertEqual(router.next_after_limit(cfg, _Unreadable("contains"), LIMIT), no_decision)
-        self.assertEqual(router.next_after_limit(cfg, UnreadableDecision(d), LIMIT), no_decision)
+        self.assertEqual(router.next_after_limit(cfg, _Unreadable("contains"), LIMIT, ALL_ROUTABLE, route_refusal=None), no_decision)
+        self.assertEqual(router.next_after_limit(cfg, UnreadableDecision(d), LIMIT, ALL_ROUTABLE, route_refusal=None), no_decision)
         connection = UnwalkableConnection(kind="subscription", id="claude-main")
-        self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT), no_decision)
+        self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT, ALL_ROUTABLE, route_refusal=None), no_decision)
 
     def test_a_missing_snapshot_is_detection_unavailable(self) -> None:
         for missing in (None, 5, "engines", ["engines"]):
@@ -599,7 +610,7 @@ class WrongTypedDecisionAndMissingSnapshotTests(unittest.TestCase):
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {})
         structured = {"engine": "codex", "model": CODEX["model"], "connection": dict(CODEX["connection"])}
-        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": {"attempts": [structured]}})
+        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": {"attempts": [structured]}}, ALL_ROUTABLE, route_refusal=None)
         self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]), ("ask", "fallback_exhausted", "already_tried"))
 
 
@@ -624,7 +635,7 @@ class DecisionMembersAndAttemptShapeTests(unittest.TestCase):
                 return super().__getitem__(key)
         rule = router.decide(self.cfg, SENTRY, {"task_kind": "review"})  # a decision from a rule, which reads its rule
         for member, decision in (("engine", self.d), ("model", self.d), ("reason", self.d), ("rule", rule)):
-            self.assertEqual(router.next_after_limit(self.cfg, FailsOn(member, decision), LIMIT),
+            self.assertEqual(router.next_after_limit(self.cfg, FailsOn(member, decision), LIMIT, ALL_ROUTABLE, route_refusal=None),
                              {"action": "none", "reason": "no_decision"}, member)
 
     def test_a_connection_that_iterates_but_cannot_be_indexed_is_no_decision(self) -> None:
@@ -637,7 +648,7 @@ class DecisionMembersAndAttemptShapeTests(unittest.TestCase):
 
             def __len__(self):
                 return 2
-        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": Unindexable()}, LIMIT),
+        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": Unindexable()}, LIMIT, ALL_ROUTABLE, route_refusal=None),
                          {"action": "none", "reason": "no_decision"})
 
     def test_route_decision_refuses_members_dict_would_accept(self) -> None:
@@ -652,10 +663,10 @@ class DecisionMembersAndAttemptShapeTests(unittest.TestCase):
     def test_a_bare_connection_word_in_attempts_counts_as_tried(self) -> None:
         word = route_limits.describe(CODEX)["connection"]
         for attempts in ([word], word):  # a list of words, or the one word on its own
-            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}})
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}}, ALL_ROUTABLE, route_refusal=None)
             self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]),
                              ("ask", "fallback_exhausted", "already_tried"), attempts)
-        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": ["subscription:other"]}})
+        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": ["subscription:other"]}}, ALL_ROUTABLE, route_refusal=None)
         self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"))
 
     def test_a_wait_until_is_a_time_or_the_retry_time(self) -> None:
@@ -664,7 +675,7 @@ class DecisionMembersAndAttemptShapeTests(unittest.TestCase):
 
         def until(reset_at, retry_at):
             signal = {"scope": "connection", "model": None, "reset_at": reset_at, "source": "test.typed"}
-            return router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit": signal, "retry_at": retry_at})["until"]
+            return router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit": signal, "retry_at": retry_at}, ALL_ROUTABLE, route_refusal=None)["until"]
         self.assertEqual(until(["x"], 7000.0), 7000.0)
         self.assertEqual(until({"a": 1}, 7000.0), 7000.0)
         self.assertIsNone(until(True, "soon"))
@@ -674,14 +685,15 @@ class DecisionMembersAndAttemptShapeTests(unittest.TestCase):
     def test_ok_must_be_exactly_true_or_false(self) -> None:
         for ok in (1, "yes", None):
             self.assertIsNone(router.route_decision({**self.d, "ok": ok}), ok)
-            self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "ok": ok}, LIMIT),
+            self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "ok": ok}, LIMIT, ALL_ROUTABLE, route_refusal=None),
                              {"action": "none", "reason": "no_decision"}, ok)
-        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "ok": False}, LIMIT), {"action": "none", "reason": "no_route"})
+        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "ok": False}, LIMIT, ALL_ROUTABLE, route_refusal=None), {"action": "none", "reason": "no_route"})
 
     def test_attempts_that_are_not_a_list_are_no_attempts(self) -> None:
+        # Not a list of attempts: the history cannot be read, so ask, never a switch.
         for notice in ({"attempts": 5}, {"attempts": {"a": 1}}, {"attempts": [5, None]}, ["x"]):
-            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": notice})
-            self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), notice)
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": notice}, ALL_ROUTABLE, route_refusal=None)
+            self.assertEqual((out["action"], out["reason"]), ("ask", "attempts_unreadable"), notice)
 
 
 class _EvilEq:
@@ -734,8 +746,8 @@ class _EvilFloatInt(int):
 
 class UncomparableValuesAndFiniteWaitTests(unittest.TestCase):
     """Values that cannot be compared or formatted, and words that are str subclasses, give no decision and no
-    attempt; an unreadable attempts entry is dropped without the limit; a wait time is finite; a published
-    connection has its kind and id."""
+    attempt; an unreadable attempts entry makes the history unreadable (ask), never the limit unread; a wait time
+    is finite; a published connection has its kind and id."""
 
     def setUp(self) -> None:
         self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
@@ -749,29 +761,33 @@ class UncomparableValuesAndFiniteWaitTests(unittest.TestCase):
                          {**self.d, "rule": ["review-to-codex"]},
                          {**self.d, "connection": {"kind": _EvilFormat(), "id": "claude-main"}},
                          {**self.d, "connection": {"kind": "subscription", "id": _EvilFormat()}}):
-            self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), no_decision, decision)
+            self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT, ALL_ROUTABLE, route_refusal=None), no_decision, decision)
         self.assertIsNone(router.route_decision({**self.d, "reason": _EvilEq()}))
 
     def test_an_attempt_whose_parts_are_not_words_is_not_an_attempt(self) -> None:
         for entry in ({"engine": _EvilEq(), "model": "y", "connection": "z"},
                       {"engine": _EvilEq(), "model": CODEX["model"], "connection": self.word},
                       {"engine": "codex", "model": CODEX["model"], "connection": 5}):
-            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [entry]}})
-            self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), entry)
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [entry]}}, ALL_ROUTABLE,
+                                          route_refusal=None)
+            self.assertEqual((out["action"], out["reason"]), ("ask", "attempts_unreadable"), entry)
 
     def test_an_unreadable_attempts_entry_is_dropped_not_the_limit(self) -> None:
         class GetRaises(dict):
             def get(self, key, default=None):
                 raise RuntimeError("get")
         unreadable = GetRaises(engine="codex", model=CODEX["model"], connection=self.word)
-        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [unreadable]}})
-        self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"))
-        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [unreadable, self.word]}})
-        self.assertEqual((out["action"], out["reason"]), ("ask", "fallback_exhausted"))
-        # A list or tuple that cannot be iterated is dropped like an entry, not the limit with it.
+        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [unreadable]}}, ALL_ROUTABLE,
+                                      route_refusal=None)
+        self.assertEqual((out["action"], out["reason"]), ("ask", "attempts_unreadable"))
+        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [unreadable, self.word]}},
+                                      ALL_ROUTABLE, route_refusal=None)
+        self.assertEqual((out["action"], out["reason"]), ("ask", "attempts_unreadable"))
+        # A list or tuple that cannot be iterated makes the history unreadable like an entry, never the limit unread.
         for attempts in (_EvilIterList([self.word]), _EvilIterTuple((self.word,))):
-            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}})
-            self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), type(attempts))
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}}, ALL_ROUTABLE,
+                                          route_refusal=None)
+            self.assertEqual((out["action"], out["reason"]), ("ask", "attempts_unreadable"), type(attempts))
 
     def test_a_wait_until_is_finite(self) -> None:
         cfg = with_limits({"on_limit": "wait"})
@@ -779,7 +795,7 @@ class UncomparableValuesAndFiniteWaitTests(unittest.TestCase):
 
         def until(reset_at, retry_at):
             signal = {"scope": "connection", "model": None, "reset_at": reset_at, "source": "test.typed"}
-            return router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit": signal, "retry_at": retry_at})["until"]
+            return router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit": signal, "retry_at": retry_at}, ALL_ROUTABLE, route_refusal=None)["until"]
         # NaN and the infinities; an int too large for a float (valid JSON) and an int whose conversion raises,
         # which a finiteness check alone would raise on.
         for odd in (float("nan"), float("inf"), float("-inf"), 10**400, -10**400, _EvilFloatInt(5000)):
@@ -794,7 +810,7 @@ class UncomparableValuesAndFiniteWaitTests(unittest.TestCase):
             self.assertIsNone(router.route_decision({**self.d, "connection": connection}), connection)
 
     def test_an_attempt_naming_only_its_connection_counts_as_tried(self) -> None:
-        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [{"connection": self.word}]}})
+        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [{"connection": self.word}]}}, ALL_ROUTABLE, route_refusal=None)
         self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]), ("ask", "fallback_exhausted", "already_tried"))
 
     # One step further: a member that IS a str (a subclass) passes an isinstance check and can still
@@ -806,7 +822,7 @@ class UncomparableValuesAndFiniteWaitTests(unittest.TestCase):
                          {**self.d, "connection": {**conn, "kind": _EvilFormatStr(conn["kind"])}},
                          {**self.d, "connection": {**conn, "id": _EvilFormatStr(conn["id"])}},
                          {**self.d, "engine": _EvilEqStr(self.d["engine"])}, {**self.d, "model": _AlwaysEqStr("x")}):
-            self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), {"action": "none", "reason": "no_decision"},
+            self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT, ALL_ROUTABLE, route_refusal=None), {"action": "none", "reason": "no_decision"},
                              decision)
 
     def test_an_attempt_word_that_is_a_str_subclass_is_read_as_its_text(self) -> None:
@@ -816,13 +832,13 @@ class UncomparableValuesAndFiniteWaitTests(unittest.TestCase):
                       {"engine": "codex", "model": m, "connection": _EvilEqStr(self.word)},
                       {"engine": "codex", "model": m, "connection": {"kind": _EvilFormatStr(conn["kind"]), "id": conn["id"]}},
                       _EvilEqStr(self.word)):
-            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [entry]}})
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [entry]}}, ALL_ROUTABLE, route_refusal=None)
             self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]),
                              ("ask", "fallback_exhausted", "already_tried"), entry)
 
     def test_a_limit_code_that_is_a_str_subclass_is_not_a_limit(self) -> None:
         for code in (_EvilEqStr(c.PLAN_LIMIT), _AlwaysEqStr("x")):
-            self.assertEqual(router.next_after_limit(self.cfg, self.d, {**LIMIT, "code": code}),
+            self.assertEqual(router.next_after_limit(self.cfg, self.d, {**LIMIT, "code": code}, ALL_ROUTABLE, route_refusal=None),
                              {"action": "none", "reason": "not_a_limit"}, type(code))
 
     def test_route_decision_needs_plain_words(self) -> None:  # what next_after_limit refuses is not published
@@ -832,7 +848,7 @@ class UncomparableValuesAndFiniteWaitTests(unittest.TestCase):
                     {"engine": _EvilEqStr(self.d["engine"])}, {"model": _EvilEqStr(self.d["model"])}):
             decision = {**self.d, **odd}
             self.assertIsNone(router.route_decision(decision), odd)
-            self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), {"action": "none", "reason": "no_decision"},
+            self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT, ALL_ROUTABLE, route_refusal=None), {"action": "none", "reason": "no_decision"},
                              odd)
 
 
@@ -872,8 +888,8 @@ class _LikeAMapping:
 
 class StrSubclassWordsAndJsonOnlyOutputTests(unittest.TestCase):
     """Words of the task and of the detection that are str subclasses are read as their text; tags that cannot be
-    read are refused; route_decision publishes only what JSON takes; a mapping or a set of attempts names no
-    attempt."""
+    read are refused; route_decision publishes only what JSON takes; a mapping or a set of attempts is an
+    unreadable history."""
 
     def setUp(self) -> None:
         self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
@@ -987,11 +1003,12 @@ class StrSubclassWordsAndJsonOnlyOutputTests(unittest.TestCase):
                            ("a hand pick that only iterates and indexes", {"hand_pick": _LikeAMapping(("engine", "model"), "codex")})):
             self.assertIsNone(router.route_decision({**self.d, **odd}), label)
 
-    # What is not a list or tuple names no attempt, whatever it holds.
+    # What is not a list or tuple is an unreadable history, whatever it holds: ask, never a switch.
     def test_attempts_in_a_mapping_or_a_set_are_no_attempts(self) -> None:
         for attempts in ({self.word: 1}, {self.word}, frozenset({self.word})):
-            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}})
-            self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), attempts)
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}}, ALL_ROUTABLE,
+                                          route_refusal=None)
+            self.assertEqual((out["action"], out["reason"]), ("ask", "attempts_unreadable"), attempts)
 
 
 class _NothingPresent(Mapping):
@@ -1090,27 +1107,27 @@ class DisappearingMemberTests(unittest.TestCase):
         for key in ("reason", "rule", "engine", "model"):
             with self.subTest(key=key):
                 decision = _GoesOnSecondAsking(d, key)
-                actual = router.next_after_limit(cfg, decision, LIMIT)
+                actual = router.next_after_limit(cfg, decision, LIMIT, ALL_ROUTABLE, route_refusal=None)
                 if not dict.__contains__(decision, key):
                     self.assertEqual(actual, {"action": "none", "reason": "no_decision"})
                 else:
-                    self.assertEqual(actual, router.next_after_limit(cfg, d, LIMIT))
+                    self.assertEqual(actual, router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE, route_refusal=None))
 
     def test_a_primary_cannot_be_reoffered_when_a_member_disappears(self) -> None:
         primary = copy.deepcopy(ROUTES["claude_code"]["route"])
         cfg = with_limits({"on_limit": "fallback", "fallback": [primary, CODEX]})
         d = router.decide(cfg, SENTRY, {})
-        control = router.next_after_limit(cfg, d, LIMIT)
+        control = router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE, route_refusal=None)
         self.assertEqual((control["action"], control["place"], control["route"]["engine"]), ("switch", 2, "codex"))
         for key in ("reason", "rule", "engine", "model"):
             with self.subTest(key=key):
                 decision = _GoesOnSecondAsking(d, key)
-                self.assertEqual(router.next_after_limit(cfg, decision, LIMIT), control)
+                self.assertEqual(router.next_after_limit(cfg, decision, LIMIT, ALL_ROUTABLE, route_refusal=None), control)
                 self.assertEqual(decision.asked, 1)  # each member's presence is asked for once
         for key in ("kind", "id"):  # the connection's members are walked once, and nothing asks for one again
             with self.subTest(connection=key):
                 connection = _GoesOnSecondAsking(d["connection"], key)
-                self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT), control)
+                self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT, ALL_ROUTABLE, route_refusal=None), control)
 
 
 class StrSubclassConnectionIdAndUnknownReasonTests(unittest.TestCase):
@@ -1127,7 +1144,7 @@ class StrSubclassConnectionIdAndUnknownReasonTests(unittest.TestCase):
         self.assertIsNone(router.route_decision(decision))
 
     def test_next_after_limit_refuses_unknown_reason(self) -> None:
-        self.assertEqual(router.next_after_limit(self.cfg, {**self.decision, "reason": "learned"}, LIMIT),
+        self.assertEqual(router.next_after_limit(self.cfg, {**self.decision, "reason": "learned"}, LIMIT, ALL_ROUTABLE, route_refusal=None),
                          {"action": "none", "reason": "no_decision"})
 
 
@@ -1168,7 +1185,7 @@ class NonMappingConnectionAndSingleWalkTests(unittest.TestCase):
     def setUp(self) -> None:
         self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         self.d = router.decide(self.cfg, SENTRY, {})
-        self.control = router.next_after_limit(self.cfg, self.d, LIMIT)
+        self.control = router.next_after_limit(self.cfg, self.d, LIMIT, ALL_ROUTABLE, route_refusal=None)
         self.assertEqual(self.control["action"], "switch")
 
     def test_a_connection_that_is_not_a_mapping_is_never_walked(self) -> None:
@@ -1182,17 +1199,17 @@ class NonMappingConnectionAndSingleWalkTests(unittest.TestCase):
 
             def __getitem__(self, key):
                 return "x"
-        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": Counted()}, LIMIT),
+        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": Counted()}, LIMIT, ALL_ROUTABLE, route_refusal=None),
                          {"action": "none", "reason": "no_decision"})
         self.assertEqual(walked, [])
 
     def test_each_members_value_is_read_where_its_presence_is_asked(self) -> None:
         decision = _AskingDeletes(self.d, asked="model", deleted="engine")  # engine is already read by then
-        self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), self.control)
+        self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT, ALL_ROUTABLE, route_refusal=None), self.control)
 
     def test_the_connections_members_are_read_from_its_one_walk(self) -> None:
         connection = _AskingDeletes(self.d["connection"], asked="kind", deleted="id")  # nothing asks it again
-        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": connection}, LIMIT), self.control)
+        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": connection}, LIMIT, ALL_ROUTABLE, route_refusal=None), self.control)
 
 
 class DaemonRefusedRouteIsPassedOverTests(unittest.TestCase):
@@ -1244,6 +1261,310 @@ class DaemonRefusedRouteIsPassedOverTests(unittest.TestCase):
         self.assertEqual((out["action"], out["place"], out["route"]["model"]), ("switch", 2, "codex-model-b"))
         self.assertEqual((out["skipped"][0]["place"], out["skipped"][0]["skipped"]), (1, "launch_refused"))
         self.assertIsNone(daemon({"route": out["route"]}))  # the route it switches to is one the daemon launches
+
+
+# -- Fail closed: no default widens an answer, an unreadable history is never 'nothing tried', the walk ends ---------
+# Made-up key states only: no key store is read.
+NO_SOURCES = {"route_refusal": None, "breaker_state": None, "key_state": None, "active": None}
+CLAUDE = copy.deepcopy(ROUTES["claude_code"]["route"])
+PI = copy.deepcopy(ROUTES["pi"]["route"])
+
+
+def keys_answering(state):
+    return lambda key_id: state
+
+
+def detected(cfg, **given):
+    """``detect.detect`` with every source the call does not give passed as None, said here in one place."""
+    return detect.detect(cfg, **{**NO_SOURCES, **given})
+
+
+def limited_to(fallback, routes=None, on_limit="fallback"):
+    """The fixtures' config with the default route's limits set: on_limit and the fallback list, in order."""
+    raw = copy.deepcopy(CONFIG)
+    raw["default"] = {"engine": "claude_code", "model": None,
+                      "limits": {"on_limit": on_limit, "fallback": copy.deepcopy(fallback)}}
+    return config(raw, routes)
+
+
+def width(answer):
+    """How wide an answer of next_after_limit is: a switch (a run started on a route) is wider than ask or wait
+    (nothing starts until the person chooses), and those are wider than none (a refusal)."""
+    return {"switch": 3, "ask": 2, "wait": 2, "none": 1}[answer["action"]]
+
+
+class _IterRaises(list):
+    def __iter__(self):
+        raise RuntimeError("iter")
+
+
+class _GetRaisesEntry(dict):
+    def get(self, *args):
+        raise RuntimeError("get")
+
+
+class FailClosedTests(unittest.TestCase):
+    """A call that leaves a check out is refused with the check's name; a metered route whose key state the call has
+    not seen opted in, or an engine routes.json does not configure, is never switched to."""
+
+    def test_a_call_that_leaves_a_check_out_is_refused_with_its_name(self) -> None:
+        cfg = limited_to([OPENCODE])
+        d = router.decide(cfg, SENTRY, {})
+        with self.assertRaisesRegex(TypeError, "detection"):
+            router.next_after_limit(cfg, d, LIMIT, route_refusal=None)
+        with self.assertRaisesRegex(TypeError, "route_refusal"):
+            router.next_after_limit(cfg, d, LIMIT, ALL_ROUTABLE)
+        for name in NO_SOURCES:
+            with self.assertRaisesRegex(TypeError, name):
+                detect.detect(cfg, **{k: v for k, v in NO_SOURCES.items() if k != name})
+        with self.assertRaisesRegex(TypeError, "breaker"):
+            detect.daemon_route_refusal()
+
+    def test_a_metered_route_whose_key_is_not_opted_in_is_never_switched_to(self) -> None:
+        cfg = limited_to([OPENCODE])  # opencode runs on an api_key connection: it spends
+        d = router.decide(cfg, ALL_ROUTABLE, {"task_kind": "chat"})
+        self.assertEqual((d["engine"], d["reason"]), ("claude_code", "default"))
+        for det, why, words in ((None, "detection_unavailable", "run detection"), (5, "detection_unavailable", "run detection"),
+                                ({"engines": []}, "detection_malformed", "run detection"),
+                                (detected(cfg), "key_state_unknown", "opt the key in"),
+                                (detected(cfg, key_state=keys_answering("not_opted_in")), "key_not_opted_in", "opt the key in"),
+                                (detected(cfg, key_state=keys_answering("absent")), "key_absent", "add the key")):
+            for refusal in (None, lambda entry: None):
+                out = router.next_after_limit(cfg, d, LIMIT, det, route_refusal=refusal)
+                self.assertEqual((out["action"], out["reason"], [r["skipped"] for r in out["skipped"]]),
+                                 ("ask", "fallback_exhausted", [why]), det)
+                self.assertIn(words, router.next_steps(out)[0])
+        out = router.next_after_limit(cfg, d, LIMIT, detected(cfg, key_state=keys_answering("ready")), route_refusal=None)
+        self.assertEqual((out["action"], out["route"]), ("switch", OPENCODE))
+
+    def test_an_engine_routes_json_does_not_configure_is_never_switched_to(self) -> None:
+        routes = copy.deepcopy(ROUTES)
+        del routes["pi"]
+        cfg = limited_to([PI], routes)
+        d = router.decide(cfg, ALL_ROUTABLE, {"task_kind": "chat"})
+        for det in (ALL_ROUTABLE, detected(cfg, key_state=keys_answering("ready"))):
+            out = router.next_after_limit(cfg, d, LIMIT, det, route_refusal=None)
+            self.assertEqual((out["action"], [r["skipped"] for r in out["skipped"]]), ("ask", ["route_not_configured"]))
+            self.assertIn("configure the engine", router.next_steps(out)[0])
+
+    def test_no_call_names_a_route_the_user_did_not_list(self) -> None:
+        # The reproduction's grid, its left-out arguments now passed as None: 2628 calls.
+        n = 0
+        for k in range(4):
+            for order in itertools.permutations([OPENCODE, PI, CODEX], k):
+                for on_limit in ("fallback", "ask", "wait"):
+                    if on_limit == "fallback" and not order:
+                        continue
+                    cfg = limited_to(list(order), on_limit=on_limit)
+                    d = router.decide(cfg, ALL_ROUTABLE, {"task_kind": "chat"})
+                    for det in (None, None, detected(cfg), detected(cfg, key_state=keys_answering("not_opted_in")),
+                                detected(cfg, key_state=keys_answering("ready")), ALL_ROUTABLE):
+                        engines = router.snapshot(det)[0] or {}
+                        for refusal in (None, None, lambda entry: None):
+                            for tried in range(len(order) + 1):
+                                notice = {"attempts": [route_limits.describe(r) for r in order[:tried]]}
+                                out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": notice}, det,
+                                                              route_refusal=refusal)
+                                n += 1
+                                if out["action"] == "switch":
+                                    self.assertIn(out["route"], list(order))
+                                    self.assertTrue(engines[out["route"]["engine"]]["routable"])  # the snapshot said so
+        self.assertEqual(n, 2628)
+
+
+class UnreadableHistoryTests(unittest.TestCase):
+    """A history of routes tried that cannot be read is never read as nothing tried: ask, never a switch. A notice
+    that is absent or null means the route service made none: only the decided route counts as tried."""
+
+    def setUp(self) -> None:
+        self.cfg = limited_to([CLAUDE, CODEX, OPENCODE])  # the decided route itself, then codex, then opencode
+        self.d = router.decide(self.cfg, SENTRY, {"task_kind": "chat"})
+        self.good = route_limits.describe(CODEX)
+        self.word = self.good["connection"]
+
+    def answer(self, notice, det=ALL_ROUTABLE, absent=False):
+        limit = dict(LIMIT) if absent else {**LIMIT, "limit_notice": notice}
+        return router.next_after_limit(self.cfg, self.d, limit, det, route_refusal=None)
+
+    def test_codex_switched_to_and_limited_is_never_offered_again_on_an_unreadable_history(self) -> None:
+        def gen():
+            yield self.good
+        unreadable = [lambda: 5, lambda: {}, lambda: ["x"], lambda: {"attempts": None}, lambda: {"attempts": 5},
+                      lambda: {"attempts": {self.word}}, lambda: {"attempts": frozenset({self.word})},
+                      lambda: {"attempts": {self.word: self.good}}, lambda: {"attempts": [5, None]},
+                      lambda: {"attempts": gen()}, lambda: {"attempts": _IterRaises([self.good])},
+                      lambda: {"attempts": [("codex", CODEX["model"], self.word)]},
+                      lambda: {"attempts": [_GetRaisesEntry(self.good)]}, lambda: {"attempts": [{**self.good, "engine": 5}]},
+                      lambda: {"attempts": [{**self.good, "connection": 7}]}, lambda: {"attempts": [self.good, None]}]
+        for make in unreadable:
+            for det in (ALL_ROUTABLE, SENTRY):
+                out = self.answer(make(), det)
+                self.assertEqual((out["action"], out["reason"]), ("ask", "attempts_unreadable"), make())
+                self.assertIn("could not be read", router.next_steps(out)[-1])
+        for readable in ({"attempts": [self.good]}, {"attempts": (self.good,)}, {"attempts": self.word}, {"attempts": [self.word]}):
+            out = self.answer(readable)
+            self.assertEqual((out["action"], out["place"], out["route"]["engine"]), ("switch", 3, "opencode"), readable)
+        # Absent or null: the route service made none. A readable empty list, and names of no listed route, name nothing.
+        for notice, absent in ((None, True), (None, False), ({"attempts": []}, False),
+                               ({"attempts": [{**self.good, "engine": "nosuch"}]}, False), ({"attempts": ["subscription:nosuch"]}, False),
+                               ({"attempts": [{**self.good, "model": "zzz"}]}, False), ({"attempts": [self.word.upper()]}, False)):
+            out = self.answer(notice, absent=absent)
+            self.assertEqual((out["action"], out["place"], out["route"]["engine"]), ("switch", 2, "codex"), notice)
+
+    def test_a_caller_that_feeds_the_history_back_never_gets_a_route_twice(self) -> None:
+        steps = []
+        for history in ([], {"set": True}):
+            seen, out = [], None
+            for _ in range(8):
+                attempts = ([route_limits.describe(r) for r in seen] if isinstance(history, list)
+                            else {route_limits.describe(r)["connection"] for r in seen} or {self.word})
+                out = self.answer({"attempts": attempts})
+                if out["action"] != "switch":
+                    break
+                self.assertNotIn(out["route"], seen)
+                seen.append(out["route"])
+            steps.append(([r["engine"] for r in seen], out["action"], out.get("reason")))
+        self.assertEqual(steps, [(["codex", "opencode"], "ask", "fallback_exhausted"), ([], "ask", "attempts_unreadable")])
+
+
+class TheWalkEndsTests(unittest.TestCase):
+    """For every order, on_limit, snapshot, refusal and first history the grid holds, feeding each answer back as the
+    history ends in ask, wait or none within the length of the list, never the same route twice."""
+
+    def test_every_walk_ends_within_the_list_and_never_offers_a_route_twice(self) -> None:
+        pool = [CODEX, OPENCODE, PI, {**CLAUDE, "model": "claude-model-b"}]
+        firsts = ("absent", [], [route_limits.describe(CODEX)], {"attempts": {"x"}}, [route_limits.describe(CLAUDE)])
+        walks = 0
+        for k in range(4):
+            for order in itertools.permutations(pool, k):
+                for on_limit in ("fallback", "ask", "wait"):
+                    if on_limit == "fallback" and not order:
+                        continue
+                    cfg = limited_to(list(order), on_limit=on_limit)
+                    d = router.decide(cfg, ALL_ROUTABLE, {"task_kind": "chat"})
+                    snaps = (None, ALL_ROUTABLE, detected(cfg), detected(cfg, key_state=keys_answering("ready")))
+                    refusals = (None, lambda entry: "launch_refused" if entry["route"]["engine"] == "codex" else None)
+                    for det, refusal, first in itertools.product(snaps, refusals, firsts):
+                        seen, out = [], None
+                        for _ in range(len(order) + 2):  # one more than a walk may take: a walk that does not end fails
+                            if first == "absent" and not seen:
+                                limit = dict(LIMIT)
+                            elif first == "absent" or isinstance(first, list):
+                                done = [] if first == "absent" else list(first)
+                                limit = {**LIMIT, "limit_notice": {"attempts": done + [route_limits.describe(r) for r in seen]}}
+                            else:
+                                limit = {**LIMIT, "limit_notice": first}
+                            out = router.next_after_limit(cfg, d, limit, det, route_refusal=refusal)
+                            if out["action"] != "switch":
+                                break
+                            self.assertNotIn(out["route"], seen)
+                            self.assertIn(out["route"], list(order))
+                            seen.append(out["route"])
+                        else:
+                            self.fail(f"the walk did not end: {order} {on_limit} {seen}")
+                        self.assertIn(out["action"], ("ask", "wait", "none"))
+                        self.assertLessEqual(len(seen), len(order))
+                        walks += 1
+        self.assertGreater(walks, 1000)
+
+
+class NoDefaultWidensAnAnswerTests(unittest.TestCase):
+    """No public callable of the routing package has a defaulted argument that could turn a check off.
+
+    Wider is decided by what an answer lets start: a switch is wider than ask or wait, and those are wider than none
+    (a refusal); for a snapshot, more routable engines is wider. A defaulted argument is allowed only on the list
+    below, each one a value that decides nothing; any other fails this test, so that an argument added later with a
+    default that skips a check is caught here. Making it required (no default) is the way to pass."""
+
+    DECIDES_NOTHING = {
+        ("config.ConfigError", "detail"): "the error's words; nothing reads them to decide",
+        ("config.Route", "model"): "None reads the model routes.json configures; a route with no model anywhere is "
+                                   "refused route_no_model",
+        ("config.Route", "limits"): "None reads the limits routes.json configures, else the user's default (ask)",
+    }
+
+    @staticmethod
+    def defaulted():
+        found = {}
+        for module in (rc, router, detect):
+            short = module.__name__.rsplit(".", 1)[-1]
+            for name, obj in vars(module).items():
+                if name.startswith("_") or getattr(obj, "__module__", None) != module.__name__:
+                    continue
+                if not (inspect.isfunction(obj) or inspect.isclass(obj)):
+                    continue
+                try:
+                    signature = inspect.signature(obj)
+                except (TypeError, ValueError):  # a class whose constructor is a builtin's: it takes no default of ours
+                    continue
+                for parameter in signature.parameters.values():
+                    if parameter.default is not inspect.Parameter.empty:
+                        found[(f"{short}.{name}", parameter.name)] = parameter.default
+        return found
+
+    def test_no_public_callable_has_a_default_that_could_turn_a_check_off(self) -> None:
+        found = self.defaulted()
+        self.assertEqual(sorted(set(found) - set(self.DECIDES_NOTHING)), [],
+                         "a defaulted argument of a public routing callable: make it required, so that no call can leave "
+                         "its check out by leaving it out")
+        self.assertEqual(sorted(set(self.DECIDES_NOTHING) - set(found)), [])  # the list stays exact
+
+    def test_the_callables_that_check_take_every_check_as_a_required_argument(self) -> None:
+        for fn, names in ((router.next_after_limit, ("detection", "route_refusal")),
+                          (detect.detect, ("route_refusal", "breaker_state", "key_state", "active")),
+                          (detect.daemon_route_refusal, ("breaker",))):
+            parameters = inspect.signature(fn).parameters
+            for name in names:
+                self.assertIs(parameters[name].default, inspect.Parameter.empty, (fn.__name__, name))
+
+    def test_a_caller_with_no_source_gets_the_narrowest_answer(self) -> None:
+        # The explicit call a caller without any source can make is never wider than any other explicit call.
+        for order in itertools.permutations([OPENCODE, PI, CODEX], 2):
+            cfg = limited_to(list(order))
+            d = router.decide(cfg, ALL_ROUTABLE, {})
+            nothing = router.next_after_limit(cfg, d, LIMIT, None, route_refusal=None)
+            for det in (ALL_ROUTABLE, SENTRY, detected(cfg), detected(cfg, key_state=keys_answering("ready"))):
+                for refusal in (None, lambda entry: None, lambda entry: "launch_refused"):
+                    self.assertLessEqual(width(nothing), width(router.next_after_limit(cfg, d, LIMIT, det, route_refusal=refusal)))
+            self.assertEqual((nothing["action"], {r["skipped"] for r in nothing["skipped"]}), ("ask", {"detection_unavailable"}))
+
+
+class NextStepsTests(unittest.TestCase):
+    """Every ask, wait and none, and every listed route passed over, says what stopped the walk and what the person can
+    do next (opt the key in, configure the engine, list another route, choose a route)."""
+
+    def test_every_code_detection_or_the_walk_can_give_has_its_own_words(self) -> None:
+        codes = set(re.findall(r'return "([a-z_]+)"', inspect.getsource(detect._engine_reason)))
+        codes |= set(re.findall(r'return "([a-z_]+)"', inspect.getsource(router._state)))
+        codes |= {"already_tried", "detection_source_failed", "detection_unavailable", "detection_malformed",
+                  "route_no_model", "route_refused", "launch_refused"}
+        self.assertGreater(len(codes), 10)
+        self.assertEqual(sorted(codes - set(router._SKIP_STEPS)), [])
+        for code, words in router._SKIP_STEPS.items():
+            self.assertTrue(": " in words and ("list another route" in words or "choose a route" in words), code)
+
+    def test_every_answer_of_the_walk_names_what_the_person_can_do(self) -> None:
+        reasons = set()
+        for order in ([], [CODEX], [OPENCODE, CODEX]):
+            for on_limit in ("fallback", "ask", "wait"):
+                if on_limit == "fallback" and not order:
+                    continue
+                cfg = limited_to(order, on_limit=on_limit)
+                for task in ({}, {"hand_pick": {"engine": "claude_code", "model": None}}):
+                    d = router.decide(cfg, ALL_ROUTABLE, task)
+                    for det in (None, ALL_ROUTABLE, detected(cfg)):
+                        for limit in (LIMIT, {"code": "x"}, {**LIMIT, "limit_notice": {"attempts": 5}}):
+                            for decision in (d, {"ok": False}, {"ok": 1}):
+                                out = router.next_after_limit(cfg, decision, limit, det, route_refusal=None)
+                                steps = router.next_steps(out)
+                                self.assertTrue(steps, out)
+                                self.assertEqual(len(steps), len(out.get("skipped", [])) + 1)
+                                if out["action"] in ("ask", "none"):
+                                    reasons.add(out["reason"])
+                                    self.assertEqual(steps[-1], router._ANSWER_STEPS[out["reason"]])
+                                self.assertTrue(all(": " in s or "; " in s for s in steps), steps)
+        self.assertTrue({"attempts_unreadable", "fallback_exhausted", "hand_pick", "on_limit_ask", "not_a_limit", "no_route",
+                         "no_decision"} <= reasons, reasons)
 
 
 if __name__ == "__main__":

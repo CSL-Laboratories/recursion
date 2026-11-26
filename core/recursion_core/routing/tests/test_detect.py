@@ -49,7 +49,7 @@ class DetectTests(unittest.TestCase):
         return {eng: entry["reason"] for eng, entry in snap["engines"].items()}
 
     def test_every_engine_is_answered_and_the_snapshot_is_one_decide_accepts(self) -> None:
-        snap = detect.detect(self.cfg, key_state=keys(READY))
+        snap = detect.detect(self.cfg, key_state=keys(READY), route_refusal=None, breaker_state=None, active=None)
         self.assertEqual(set(snap["engines"]), set(rc.ENGINES))
         self.assertEqual(router.snapshot(snap)[1], None)
         self.assertEqual(self.reasons(snap), {"claude_code": None, "codex": None, "opencode": None, "pi": None,
@@ -58,14 +58,14 @@ class DetectTests(unittest.TestCase):
             self.assertEqual(entry["routable"], entry["reason"] is None)
 
     def test_a_key_route_needs_its_key_present_and_opted_in(self) -> None:
-        self.assertEqual(self.reasons(detect.detect(self.cfg))["opencode"], "key_state_unknown")  # no key source: never
+        self.assertEqual(self.reasons(detect.detect(self.cfg, route_refusal=None, breaker_state=None, key_state=None, active=None))["opencode"], "key_state_unknown")  # no key source: never
         states = {"anthropic-api": "absent", "xai-api": "not_opted_in"}
-        r = self.reasons(detect.detect(self.cfg, key_state=keys(states)))
+        r = self.reasons(detect.detect(self.cfg, key_state=keys(states), route_refusal=None, breaker_state=None, active=None))
         self.assertEqual((r["opencode"], r["pi"]), ("key_absent", "key_not_opted_in"))
-        self.assertEqual(self.reasons(detect.detect(self.cfg, key_state=lambda k: "maybe"))["opencode"], "key_state_unknown")
+        self.assertEqual(self.reasons(detect.detect(self.cfg, key_state=lambda k: "maybe", route_refusal=None, breaker_state=None, active=None))["opencode"], "key_state_unknown")
         # A sign-in route asks no key source at all.
         asked = []
-        detect.detect(self.cfg, key_state=lambda k: asked.append(k) or "ready")
+        detect.detect(self.cfg, key_state=lambda k: asked.append(k) or "ready", route_refusal=None, breaker_state=None, active=None)
         self.assertEqual(sorted(asked), ["anthropic-api", "xai-api"])
 
     def test_an_open_or_unreadable_breaker_fences_its_connection(self) -> None:
@@ -75,19 +75,19 @@ class DetectTests(unittest.TestCase):
             seen.append(key)
             return {"subscription:chatgpt-main": "open", "subscription:grok-sign-in": "unknown",
                     "subscription:claude-main": "half_open"}.get(key, "closed")
-        r = self.reasons(detect.detect(self.cfg, breaker_state=breaker, key_state=keys(READY)))
+        r = self.reasons(detect.detect(self.cfg, breaker_state=breaker, key_state=keys(READY), route_refusal=None, active=None))
         self.assertEqual((r["codex"], r["hermes"], r["claude_code"], r["opencode"]), ("breaker_open", "breaker_unknown", None, None))
         self.assertIn("api_key:anthropic-api", seen)  # the connection key: kind and id, never the engine
-        self.assertEqual(self.reasons(detect.detect(self.cfg, breaker_state=lambda k: "tripped", key_state=keys(READY)))["codex"],
+        self.assertEqual(self.reasons(detect.detect(self.cfg, breaker_state=lambda k: "tripped", key_state=keys(READY), route_refusal=None, active=None))["codex"],
                          "breaker_unknown")
 
     def test_a_route_the_daemon_would_refuse_is_not_routable(self) -> None:
         refusals = {"codex": "breaker_model_unrepresentable", "pi": "no credential custody: a passthrough route is not launched"}
-        r = self.reasons(detect.detect(self.cfg, route_refusal=lambda e: refusals.get(e["route"]["engine"]), key_state=keys(READY)))
+        r = self.reasons(detect.detect(self.cfg, route_refusal=lambda e: refusals.get(e["route"]["engine"]), key_state=keys(READY), breaker_state=None, active=None))
         self.assertEqual((r["codex"], r["pi"], r["claude_code"]), ("breaker_model_unrepresentable", "route_refused", None))
 
     def test_an_engine_the_engine_table_cannot_launch_is_not_routable(self) -> None:
-        r = self.reasons(detect.detect(self.cfg, active=("claude_code", "codex"), key_state=keys(READY)))
+        r = self.reasons(detect.detect(self.cfg, active=("claude_code", "codex"), key_state=keys(READY), route_refusal=None, breaker_state=None))
         self.assertEqual({e for e, why in r.items() if why is None}, {"claude_code", "codex"})
         self.assertEqual((r["opencode"], r["recursion_loop"]), ("engine_not_active", "engine_not_active"))
 
@@ -96,27 +96,27 @@ class DetectTests(unittest.TestCase):
             if key == "subscription:chatgpt-main":
                 raise RuntimeError("store gone")
             return "closed"
-        r = self.reasons(detect.detect(self.cfg, breaker_state=breaker, key_state=keys(READY)))
+        r = self.reasons(detect.detect(self.cfg, breaker_state=breaker, key_state=keys(READY), route_refusal=None, active=None))
         self.assertEqual(r["codex"], "detection_source_failed")
         self.assertIsNone(r["claude_code"])
 
     def test_recursion_loop_is_routable_only_on_a_present_opted_in_key(self) -> None:
         cfg = loop_config()
         self.assertEqual(cfg.engine_login["recursion_loop"], "openai-key")
-        self.assertIsNone(self.reasons(detect.detect(cfg, key_state=keys(READY)))["recursion_loop"])
-        self.assertEqual(self.reasons(detect.detect(cfg, key_state=keys({**READY, "openai-api": "not_opted_in"})))["recursion_loop"],
+        self.assertIsNone(self.reasons(detect.detect(cfg, key_state=keys(READY), route_refusal=None, breaker_state=None, active=None))["recursion_loop"])
+        self.assertEqual(self.reasons(detect.detect(cfg, key_state=keys({**READY, "openai-api": "not_opted_in"}), route_refusal=None, breaker_state=None, active=None))["recursion_loop"],
                          "key_not_opted_in")
         sub = loop_config("subscription")
-        self.assertEqual(self.reasons(detect.detect(sub, key_state=keys(READY)))["recursion_loop"], "recursion_loop_needs_key")
+        self.assertEqual(self.reasons(detect.detect(sub, key_state=keys(READY), route_refusal=None, breaker_state=None, active=None))["recursion_loop"], "recursion_loop_needs_key")
         # And the decision follows: a task tagged "tools" goes to the own loop only when it is routable.
         task = {"task_kind": "chat", "tags": ["tools"]}
-        self.assertEqual(router.decide(cfg, detect.detect(cfg, key_state=keys(READY)), task)["engine"], "recursion_loop")
-        d = router.decide(cfg, detect.detect(cfg, key_state=keys({**READY, "openai-api": "absent"})), task)
+        self.assertEqual(router.decide(cfg, detect.detect(cfg, key_state=keys(READY), route_refusal=None, breaker_state=None, active=None), task)["engine"], "recursion_loop")
+        d = router.decide(cfg, detect.detect(cfg, key_state=keys({**READY, "openai-api": "absent"}), route_refusal=None, breaker_state=None, active=None), task)
         self.assertEqual((d["engine"], d["candidates"][0]["skipped"]), ("claude_code", "key_absent"))
 
     def test_decide_on_a_detected_snapshot_skips_a_fenced_rule(self) -> None:
         snap = detect.detect(self.cfg, breaker_state=lambda k: "open" if k == "subscription:chatgpt-main" else "closed",
-                             key_state=keys(READY))
+                             key_state=keys(READY), route_refusal=None, active=None)
         d = router.decide(self.cfg, snap, {"task_kind": "review"})
         self.assertEqual((d["reason"], d["engine"], d["candidates"][0]["skipped"]), ("default", "claude_code", "breaker_open"))
         d = router.decide(self.cfg, snap, {"hand_pick": {"engine": "codex", "model": None}})
@@ -139,7 +139,7 @@ class SourceAdapterTests(unittest.TestCase):
         now[0] = 1000.0
         breaker.record("subscription:chatgpt-main", "codex-model-a", "t1",
                        {"code": c.PLAN_LIMIT, "limit": c.limit_signal("connection", "test.typed")})
-        r = detect.detect(cfg, breaker_state=view, key_state=keys(READY))["engines"]
+        r = detect.detect(cfg, breaker_state=view, key_state=keys(READY), route_refusal=None, active=None)["engines"]
         self.assertEqual(r["codex"], {"routable": False, "reason": "breaker_open"})
 
     def test_breaker_view_reads_a_stored_trip_as_route_list_does(self) -> None:
@@ -167,7 +167,7 @@ class SourceAdapterTests(unittest.TestCase):
 
     def test_daemon_route_refusal_uses_the_daemons_own_functions(self) -> None:
         try:
-            refusal = detect.daemon_route_refusal()
+            refusal = detect.daemon_route_refusal(None)
         except ImportError as exc:  # pragma: no cover - the daemon imports on Linux only
             self.skipTest(f"daemon not importable here: {exc}")
         self.assertIsNone(refusal(ROUTES["claude_code"]))

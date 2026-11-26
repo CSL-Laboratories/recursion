@@ -94,13 +94,15 @@ def _engine_reason(engine: str, entry: object, *, route_refusal, breaker_state, 
     return None
 
 
-def detect(config: Config, *, route_refusal: Callable | None = None, breaker_state: Callable | None = None,
-           key_state: Callable | None = None, active: Iterable[str] | None = None) -> dict:
+def detect(config: Config, *, route_refusal: Callable | None, breaker_state: Callable | None,
+           key_state: Callable | None, active: Iterable[str] | None) -> dict:
     """The detection snapshot for ``config``'s machine. A source that raises an ``Exception`` makes its engine
     unroutable (``detection_source_failed``); a ``BaseException`` such as ``KeyboardInterrupt`` is not caught
     and stops the caller.
 
-    A source left out (None) is not consulted, except the key state: a key route with no key source is
+    Every source is a keyword the caller passes, none of them defaulted, so that no call leaves a check out by
+    leaving an argument out (a call without one raises ``TypeError`` naming it). A source passed as None, said
+    so by the caller, is not consulted, except the key state: a key route with no key source is
     ``key_state_unknown``, never routable, because spending needs a positive opt-in.
 
     ``active`` is not a source: it is the caller's own iterable of engine ids (the composition's engine
@@ -153,8 +155,11 @@ def breaker_view(breaker) -> Callable[[str], str]:
     return state
 
 
-def daemon_route_refusal(breaker=None) -> Callable[[Mapping], str | None]:
-    """The daemon's own pre-launch refusals of a loaded route entry, as a typed code (Linux only)."""
+def daemon_route_refusal(breaker) -> Callable[[Mapping], str | None]:
+    """The daemon's own pre-launch refusals of a loaded route entry, as a typed code (Linux only).
+
+    ``breaker`` is the daemon's breaker, or None, passed by a caller that has none: it is not defaulted, so a
+    call cannot leave the breaker's own refusals (a connection it cannot key) out by forgetting it."""
     from recursion_core.daemon.control_adapter import route_unbindable, route_unsupported
     from recursion_core.routes import contract
 

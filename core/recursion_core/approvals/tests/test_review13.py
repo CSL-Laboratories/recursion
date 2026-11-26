@@ -1,11 +1,14 @@
-"""The end any reader of the store enforces, and what counts as a running queue, on the REAL event store.
+"""The end every gate and every consumer of the store enforces, and what counts as a running queue, on the
+REAL event store.
 
 Each test here is red on ``f60c3c6b`` and green after this round, unless its docstring says it holds what must
 stay. Every wait is bounded, so that a broken build fails instead of hanging.
 
 * A gate made again on the same store with a shorter deadline or stall time ends a kept approval at that shorter
   end, and the one function that consumes a record ends it there too: the queue's ``consume`` and the gate's
-  ``take`` refuse it alike, in either order. A longer figure made later never brings it back.
+  ``take`` refuse it alike, in either order. A longer figure made later never brings it back. With two gates
+  alive on one store, the shorter end decides for both consumers; once that gate is gone, the remaining gate's
+  end decides.
 * Whether the queue runs is the queue's own record that it was started and not stopped: a deadline worker that
   ended without a stop is started again by the next start, which recovers nothing and says so.
 """
@@ -36,6 +39,7 @@ BOUND_S = 10  # how long a join may take before the test fails instead of hangin
 SHORTER = 60  # a figure below the gate's default deadline, in seconds
 LONGER = 600  # a figure above it
 LATER = 100  # how long after the approval the consumers come: past SHORTER, before the default deadline
+MIDDLE = 200  # a second gate's figure: past LATER, before the default deadline
 
 needs_store = unittest.skipUnless(EventStore is not None and os.name == "posix", "EVENTS' store needs a POSIX host")
 
@@ -195,6 +199,41 @@ class AWorkerThatEndedWithoutAStopTests(_OnTheRealStore):
         held = self.held(approved)
         self.assertEqual(_code(self.queue.consume, approved, held["revision"], held["digest"], binding),
                          ("refused", "binding_mismatch"))
+
+
+@needs_fakes
+@needs_store
+class TwoLivingGatesTests(_OnTheRealStore):
+    def another_gate(self, **figures):
+        return ApprovalGate(lambda *drawn: None, authenticate, self.clock, store=self.store, declare_tables=False,
+                            **figures)
+
+    def test_the_shorter_of_two_living_gates_decides_then_the_remaining_one(self) -> None:
+        names = ("queue-first", "gate-first", "queue-in-time", "gate-in-time", "queue-late", "gate-late")
+        made = {name: self.approved("two-" + name) for name in names}
+        self.remake(ttl_seconds=MIDDLE)
+        shorter = self.another_gate(ttl_seconds=SHORTER)
+        self.clock.now += LATER
+        self.assertEqual(self.consume_through("queue", made["queue-first"], "two-queue-first"),
+                         ("refused", "approval_expired"))
+        self.assertEqual(self.held(made["queue-first"])["state"], "expired")
+        self.assertEqual(self.consume_through("gate", made["queue-first"], "two-queue-first"),
+                         ("refused", "approval_expired"))
+        self.assertEqual(self.consume_through("gate", made["gate-first"], "two-gate-first"),
+                         ("refused", "approval_expired"))
+        self.assertEqual(self.consume_through("queue", made["gate-first"], "two-gate-first")[0], "refused")
+        self.assertEqual(self.held(made["gate-first"])["state"], "expired")
+        del shorter
+        gc.collect()
+        self.assertEqual(self.consume_through("queue", made["queue-in-time"], "two-queue-in-time")[0], "ok")
+        self.assertEqual(self.consume_through("gate", made["gate-in-time"], "two-gate-in-time")[0], "ok")
+        self.clock.now += MIDDLE - LATER
+        self.assertEqual(self.consume_through("queue", made["queue-late"], "two-queue-late"),
+                         ("refused", "approval_expired"))
+        self.assertEqual(self.consume_through("gate", made["gate-late"], "two-gate-late"),
+                         ("refused", "approval_expired"))
+        self.assertEqual([self.held(made[name])["state"] for name in names],
+                         ["expired", "expired", "consumed", "consumed", "expired", "expired"])
 
 
 if __name__ == "__main__":

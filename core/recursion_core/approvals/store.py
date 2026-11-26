@@ -20,11 +20,13 @@ path).
 
 ``consume_in`` is the one place a record is consumed, whoever consumes it (the approval queue's ``consume`` and
 the plugin gate's ``take``): the deadline and the veto are read there, in the transaction that marks it consumed.
-The deadline read there is the end every reader of the store enforces (``end_of``): the record's own
-``expires_at``, or, if earlier, its request time plus the shortest end a plugin gate on that store declared
-(``declare_end``), so a gate made again with a shorter deadline or stall time ends a record for every consumer
-at once. Two consumers of one record therefore never disagree, whichever comes first, and a gate's shorter
-figure is not a rule of that gate alone.
+The deadline read there is the end every gate and every consumer of the store enforces (``end_of``): the
+record's own ``expires_at``, or, if earlier, its request time plus the shortest end a plugin gate on that store
+declared (``declare_end``), so a gate made again with a shorter deadline or stall time ends a record for every
+consumer at once. Two consumers of one record therefore never disagree, whichever comes first, and a gate's
+shorter figure is not a rule of that gate alone. The queue's own answer path does not read that end: it reads
+the record's stored ``expires_at`` (as the queue's deadline sweep and its listing do), so an answer given after
+a gate's shorter end is still taken, and the record is then refused by both consumers.
 """
 
 from __future__ import annotations
@@ -153,21 +155,24 @@ def vetoed(tx, digest: str) -> bool:
 # The ends declared on each store in this process. A plugin gate given an event store declares here, for as long
 # as it lives, the figure after which it ends a record of its source: the earlier of its deadline and its stall
 # time. Held per process, because an event store has one writer process (EVENTS takes a file lock on it).
-_ENDS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # the declaring reader -> (store, source, seconds)
+_ENDS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # the declaring gate -> (store, source, seconds)
 _ENDS_LOCK = threading.Lock()
 
 
 def declare_end(store, reader, source: str, seconds: int) -> None:
-    """``reader`` ends every record of ``source`` on ``store`` at its request time plus ``seconds``, for as long as
-    the reader lives. The shortest end declared on a store is the one every reader of it enforces (``end_of``)."""
+    """``reader``, the declaring gate, ends every record of ``source`` on ``store`` at its request time plus
+    ``seconds``, for as long as it lives. The shortest end declared on a store is the one every gate and every
+    consumer of it enforces (``end_of``); the queue's answer path reads the record's stored ``expires_at``."""
     with _ENDS_LOCK:
         _ENDS[reader] = (store, source, seconds)
 
 
 def end_of(store, record: dict) -> int:
-    """The moment (epoch milliseconds) a record ends for every reader of ``store``: its own ``expires_at``, or, if
-    earlier, its request time plus the shortest end a living reader declared for its source on that store. What an
-    end has already written (an ``expired`` record) stays so: a longer figure declared later brings nothing back."""
+    """The moment (epoch milliseconds) a record ends for every gate and every consumer of ``store`` (each gate's
+    read and take, and the queue's ``consume``; the queue's answer path reads the record's stored ``expires_at``
+    instead): its own ``expires_at``, or, if earlier, its request time plus the shortest end a living gate
+    declared for its source on that store. What an end has already written (an ``expired`` record) stays so: a
+    longer figure declared later brings nothing back."""
     end = milliseconds(record["expires_at"])
     with _ENDS_LOCK:
         figures = [seconds for held, source, seconds in list(_ENDS.values())
@@ -186,7 +191,7 @@ def consume_in(tx, record: dict, kept, revision, digest, binding, now_ms: int, *
     """Consume a record inside the caller's transaction: THE one place it is done, by whichever consumer (the
     approval queue's ``consume``, the plugin gate's ``take``), so two consumers of one record never disagree and
     a later one cannot leave a rule out. ``store`` is the event store ``tx`` belongs to: the end read here is the
-    one every reader of it enforces.
+    one every gate and every consumer of it enforces.
 
     An approved record whose end has come (``now_ms`` at or after ``end_of(store, record)``: its own deadline, or
     its request time plus a shorter end a gate on the store declared) is written ``expired``

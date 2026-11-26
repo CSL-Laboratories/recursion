@@ -37,6 +37,13 @@ from collections.abc import Callable, Iterator
 CATALOGUE = ('claude_code', 'codex', 'opencode', 'grok', 'antigravity', 'cursor', 'gemini_cli', 'pi', 'hermes',
              'recursion_loop')
 SEEDED = ('claude_code', 'codex')   # the engines a daemon builds an adapter for today, in today's order
+# The release's routes: six engines are routes at the release. Three are detected and shown, not routed: a route,
+# a fallback or a run start naming one refuses ``engine_not_routed`` before anything is spawned (routes.contract).
+# A point release routes one by moving its name to RELEASE_ROUTED.
+# With 'recursion_loop' the two lists are exactly CATALOGUE.
+RELEASE_ROUTED = ('claude_code', 'codex', 'opencode', 'cursor', 'hermes', 'antigravity')
+DETECTED_NOT_ROUTED = ('grok', 'pi', 'gemini_cli')
+NOT_ROUTED_DETAIL = 'detected, not routed in this release'
 
 
 class EngineTableError(Exception):

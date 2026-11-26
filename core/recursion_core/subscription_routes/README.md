@@ -144,6 +144,11 @@ note says Gemini CLI stopped serving consumer accounts on 2026-06-18, and its
 [transition post](https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/)
 names Antigravity CLI as the subscription path.
 
+The owner's answer of Nov 18 keeps it so: *"Yes we dropped it, let's keep it dropped." (Lucas, Nov 18 2026; lucas-decisions-1116-research3.md entry 79, D14)*
+Gemini CLI is detected and shown, not routed: `gemini_cli` is in `routes.engines.DETECTED_NOT_ROUTED`, so a
+route or a run start naming it refuses `engine_not_routed` ("detected, not routed in this release")
+before anything is spawned. The Nov 9 owner call above stays as the earlier call.
+
 Nothing else about Google changed. A Google or Gemini sign-in label in a Pi, Hermes or
 OpenCode profile (`google*`, `gemini*`, `antigravity*`) still refuses
 `google_subscription_refused`, and a `gemini` API-key provider still refuses

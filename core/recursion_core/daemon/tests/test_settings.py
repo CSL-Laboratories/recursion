@@ -121,7 +121,11 @@ class TheFileAndItsDefaults(_Folder):
                           "and 4 more (default ['key', 'keys', 'token', 'tokens', 'secret', 'secrets', 'password'], "
                           "and 4 more; source: default)",
                           "status.shown_names = [] (default []; source: default)",
-                          "status.digest_chars = 8 (default 8; source: default; advised: at most 64)"],
+                          "status.digest_chars = 8 (default 8; source: default; advised: at most 64)",
+                          "status.label_by_rule = false (default false; source: default)",
+                          "status.label_words = ['password', 'passwd', 'secret', 'apikey', 'bearer', 'token'], and "
+                          "6 more (default ['password', 'passwd', 'secret', 'apikey', 'bearer', 'token'], and 6 "
+                          "more; source: default)"],
                          settings.lines(loaded))
 
     def test_a_dotted_key_is_the_same_setting(self) -> None:

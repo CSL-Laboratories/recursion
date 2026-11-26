@@ -66,6 +66,32 @@
           "minimum": 6,
           "default": 8,
           "description": "How many hex characters of the SHA-256 digest of a key's text, with what the sign-in rule hides taken out, a key cut at the cap carries in a note, so two long keys that differ only past the cap read apart; a key that fits the cap carries none. The least is 6, since below it two keys read the same too often; past 64, the whole digest, nothing more is shown, so 64 is the advised most. A cut key carries only as many as fit the cap beside its first 8 characters, and never fewer than 6."
+        },
+        "label_by_rule": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether a text with no declared kind (a list item, a refused value, a key of the file) is also hidden whole when a word of status.label_words or status.hidden_names stands in it as a password label by rule: as a part of a name or the end of its last part, in any case, read again with percent-escapes, look-alike letters and format characters folded, with anything after it, and a known key prefix in any case. False as shipped keeps the earlier rule, which hides less ordinary text (such as 'a token budget of 5') and lets more ways of writing a password through; true hides those, and what it hides stays in your settings file as you wrote it."
+        },
+        "label_words": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "password",
+            "passwd",
+            "secret",
+            "apikey",
+            "bearer",
+            "token",
+            "pwd",
+            "pass",
+            "passphrase",
+            "pw",
+            "auth",
+            "pin"
+          ],
+          "description": "The words read as a password label when status.label_by_rule is true, beside the words of status.hidden_names; not read while it is false. The words a settings file lists are added to these shipped words, which no settings file can take away; an empty list keeps the shipped words alone."
         }
       },
       "additionalProperties": true

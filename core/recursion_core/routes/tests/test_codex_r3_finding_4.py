@@ -4,7 +4,7 @@ The first three tests are Astra's red tests from the R3 review (Codex GPT-6 Astr
 reviewed base 1abd2f77), copied unchanged apart from the class name; the rest are this lane's, and
 ``ErrorBoundaryTest`` answers the two reads of #393 (an engine's error names never reach the result
 unless the protocol defines them; a null in one place does not hide a typed error in the other). Under
-Lucas's D0 (Nov 12, 2026: "take the stricter, fail-closed option that the reviewer's test already
+the owner's D0 (Nov 12, 2026: "take the stricter, fail-closed option that the reviewer's test already
 encodes; reuse an existing refusal code where one fits"): only the exact ChatGPT-auth error is ignored;
 ``usageLimitExceeded`` is ``plan_limit``, ``unauthorized`` ``auth_failed``, EOF ``engine_exited``; raw
 error text never reaches an event. Fakes only: no real ``codex``, no credential, no network.

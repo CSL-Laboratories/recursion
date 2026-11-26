@@ -1,6 +1,6 @@
 # Recursion X1 inventory: pre-x1 tag and test disposition table
 
-Prepared by Grok Bot Liaison for Lucas. WP14, Recursion half. Related to CSL-495. Proposed
+Prepared by Grok Bot Liaison for the owner. WP14, Recursion half. Related to CSL-495. Proposed
 for Dan's review. Nothing in this change deletes, moves or edits legacy code or tests.
 
 This is gate data for the X1 deletion, not research prose. It lives here because
@@ -9,7 +9,7 @@ route to the private research vault is granted to this task, so no vault record 
 
 ## 1. Decision and sources
 
-Lucas decided (his words, Mon 2026-10-26 11:59 AM PT): "Decision 3: approve keep-paths and
+The owner decided (his words, Mon 2026-10-26 11:59 AM PT): "Decision 3: approve keep-paths and
 boundary, push pre-x1 tags, delete after the Nov 10 rehearsal".
 
 - Keep-paths: `scripts/v3/route_adapter/**` and the receipt tests
@@ -22,7 +22,7 @@ boundary, push pre-x1 tags, delete after the Nov 10 rehearsal".
 - Base: `master` at `2f1fc17ec2ab6271f06f4d99a6d55f97cbf2efb0` (fetched 2026-10-26).
 
 Changed 2026-10-29 (CSL-578), for the harness half only. Asked whether to keep the harness until
-CSL-460 lands or delete it, Lucas said: "I think we should just delete it. It served no
+CSL-460 lands or delete it, the owner said: "I think we should just delete it. It served no
 functionality when we are literally redesigning the entire thing". Told that this overrides
 Decision 3's timing and the port calls in section 9, he answered: "Actually cancel that. Delete
 and drop tests too, they aren't relevant". So `scripts/v3/harness/**`, its tests and fixtures,
@@ -55,7 +55,7 @@ git push origin refs/tags/pre-x1-recursion-20261026
   directory named `planning/` exists at the repository root. So `planning/**` is read as
   `scripts/v3/planning/**`. This reading was an inference. Dan confirmed it in his tip review
   of PR #303 (review `PRR_kwDOTuH3ps8AAAABUTlc8w`, 2026-10-26) and Samir agreed in his review
-  (`PRR_kwDOTuH3ps8AAAABUTzE6w`). Lucas's own words do not spell it out; his Decision 3 text
+  (`PRR_kwDOTuH3ps8AAAABUTzE6w`). The owner's own words do not spell it out; his Decision 3 text
   says only `planning/**`.
 - Legacy test files "under the boundary" are the ones whose subject is boundary code. By
   imports that is everything in `scripts/tests/v3/planning/` (and, before CSL-578,
@@ -67,14 +67,14 @@ git push origin refs/tags/pre-x1-recursion-20261026
   boundary does not overlap it.
 - "The receipt tests" are `tools/test_claude_fixer_guard.py`,
   `tools/test_claude_fixer_publish.py` and `tools/test_claude_fixer_receipts.py`
-  (`tools/test_claude_fixer_*`). Lucas decided that on CSL-495 comment `611d6aa4`
+  (`tools/test_claude_fixer_*`). The owner decided that on CSL-495 comment `611d6aa4`
   (his words, Mon 2026-10-26 1:47 PM PT: "I agree with your recommendations.").
   Those files sit outside the deletion boundary and are kept. The receipt checks inside
   P1 and P5 stay `port`. The floor pins the three files and fails if one is missing.
 
 ## 4. Disposition table
 
-Dispositions below are the ones Lucas accepted on CSL-495 (comment `611d6aa4`,
+Dispositions below are the ones the owner accepted on CSL-495 (comment `611d6aa4`,
 Mon 2026-10-26 1:47 PM PT). `port` means the contract survives and a
 successor carrier must run it green before the legacy file is deleted. `drop` means the file
 tests only legacy implementation detail. `keep` means the file stays as is. The test requires
@@ -172,7 +172,7 @@ Checked by search on the base SHA. The deletion PR must handle each, after the N
 | `experiments/v3/effect-evidence/` (`ee_common.py`) | Imports the planning kernel and validators. Not part of general CI (packet-scoped). | `ee_common.py` lines 5 to 7 |
 | `docs/v3/M1A-*.md` | Document the planning kernel. | grep at base SHA |
 
-Lucas's comment `611d6aa4` says the thin direct-Claude fallback is new code under
+The owner's comment `611d6aa4` says the thin direct-Claude fallback is new code under
 `route_adapter/`, not a keep of `scripts/v3/harness/`. It is labeled as not satisfying X2.
 
 CSL-578 handled the harness rows of this table: the `harness.test.py` pin in
@@ -180,12 +180,12 @@ CSL-578 handled the harness rows of this table: the `harness.test.py` pin in
 `*.test.py` file pinned so a discovery miss still fails the gate, and the README harness section
 was removed. `docs/v3/harness/` stays as history under CSL-536.
 
-Workflow wiring for Lucas: none is needed. The `linux`, `windows` and `macos` job names are
+Workflow wiring for the owner: none is needed. The `linux`, `windows` and `macos` job names are
 unchanged and this test runs in each.
 
 ## 9. Decisions recorded 2026-10-26
 
-Lucas decided these on CSL-495, comment `611d6aa4-100f-4dc5-b8eb-88a710049287`
+The owner decided these on CSL-495, comment `611d6aa4-100f-4dc5-b8eb-88a710049287`
 (Mon 2026-10-26 1:47 PM PT). His words: "I agree with your recommendations."
 The same comment says none of these block this PR. They bind the post-Nov 10 deletion PR.
 Dan was asked there to confirm the port and drop calls.
@@ -205,12 +205,12 @@ Dan was asked there to confirm the port and drop calls.
    cell stays `none` and the oracle stays `pending`. The approved thin direct-Claude
    fallback is built as new code under `route_adapter/`, not kept in `scripts/v3/harness/`.
 
-Items 3 and 4 no longer apply to the harness oracles: on 2026-10-29 (CSL-578) Lucas had the
+Items 3 and 4 no longer apply to the harness oracles: on 2026-10-29 (CSL-578) the owner had the
 harness deleted and O-H1 to O-H5 dropped without a port (section 1). The P6 and `perf_bench.py`
 parts of item 3 still stand.
 
 Execution record: no Linear claim was posted, and none will be added retroactively.
-Lucas's comment `611d6aa4` says the PR and its review request are the record. Commits
+The owner's comment `611d6aa4` says the PR and its review request are the record. Commits
 carry no `Agent-Claim` trailer for that reason.
 
 ## 10. Verification and unverified items

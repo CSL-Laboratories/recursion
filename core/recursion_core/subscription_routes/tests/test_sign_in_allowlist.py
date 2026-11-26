@@ -240,7 +240,7 @@ class AllowlistTests(_Base):
     def test_own_store_is_never_read_and_the_decision_says_it_was_not_inspected(self) -> None:
         # red-team #321 F1: an OAuth-labelled .hermes/auth.json (it could hold a login `hermes auth` adopted) is
         # not read, so the route may not pass silently: the decision flags the uninspected store. Whether to
-        # read or refuse such stores is open for Lucas.
+        # read or refuse such stores is open for the owner.
         (self.home / ".hermes").mkdir()
         (self.home / ".hermes" / "auth.json").write_text(FAKE_OAUTH)
         real_open = builtins.open

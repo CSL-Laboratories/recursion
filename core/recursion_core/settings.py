@@ -64,7 +64,8 @@ EXIT_WARNED = 1      # the command's end when a note warns: a key, a table or th
 
 @dataclass(frozen=True)
 class Setting:
-    """One declared setting: its dotted name, type, default, floor and ceiling (numbers only), and what it does."""
+    """One declared setting: its dotted name, type, default, floor and ceiling (numbers only), what it does, and the
+    texts it may take (a text setting whose values are a closed list; any other text keeps the default)."""
 
     name: str
     type: type
@@ -72,6 +73,7 @@ class Setting:
     says: str
     floor: int | float | None = None
     ceiling: int | float | None = None
+    choices: tuple | None = None
 
 
 # Append-only. The type is bool, int, float or str. A row that loosens safety has the safe value as its default,
@@ -148,6 +150,8 @@ def _shown(value: object) -> str:
 def _allowed(row: Setting) -> str:
     if row.type is bool:
         return "true or false"
+    if row.choices is not None:
+        return "one of " + ", ".join(_shown(choice) for choice in row.choices)
     kind = {int: "a whole number", float: "a number", str: "a text"}[row.type]
     if row.floor is not None and row.ceiling is not None:
         return f"{kind} from {_shown(row.floor)} to {_shown(row.ceiling)}"
@@ -158,7 +162,7 @@ def _fits(row: Setting, value: object) -> bool:
     if row.type is bool:
         return isinstance(value, bool)
     if row.type is str:
-        return isinstance(value, str)
+        return isinstance(value, str) and (row.choices is None or value in row.choices)
     if isinstance(value, bool) or not isinstance(value, (int, float) if row.type is float else int):
         return False
     if isinstance(value, float) and not math.isfinite(value):

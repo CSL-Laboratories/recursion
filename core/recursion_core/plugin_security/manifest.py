@@ -57,6 +57,7 @@ _ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
 RESERVED_PLUGIN_IDS = frozenset({"host"})
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+(:[0-9]{1,5})?")
+_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?")
 _CRED = re.compile(r"[a-z][a-z0-9_.:/-]{1,127}")
 
 
@@ -370,10 +371,25 @@ class Grant:
 
 @dataclass(frozen=True)
 class ReservedEffects:
-    """Credentials and destinations only an effect owner may hold (injected; consumer-neutral)."""
+    """Credentials and destinations only an effect owner may hold (injected; consumer-neutral).
+
+    Each host is written in the one plain form a manifest destination's host has: lower
+    case, no trailing dot, no port. One label alone in that form (``localhost``, ``com``)
+    is taken too: it reserves every destination under it. An entry in any other form would
+    match no destination and reserve nothing, so it is refused when the list is made
+    (``reserved_host_form``, naming the entry), not rewritten. The hosts are read once into
+    a frozenset, so a list given as a one-shot iterable keeps every entry.
+    """
 
     hosts: frozenset = frozenset()
     credential_prefixes: tuple = ()
+
+    def __post_init__(self) -> None:
+        hosts = frozenset(self.hosts)
+        object.__setattr__(self, "hosts", hosts)
+        for host in hosts:
+            if type(host) is not str or ":" in host or not (_HOST.fullmatch(host) or _LABEL.fullmatch(host)):
+                raise Refused("reserved_host_form", host if type(host) is str else repr(host))
 
     def host_reserved(self, destination: str) -> bool:
         host = destination.split(":", 1)[0]

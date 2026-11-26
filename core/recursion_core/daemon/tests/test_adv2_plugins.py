@@ -243,6 +243,27 @@ class Adv2FilesystemTests(Adv2HostCase):
                 self.assertEqual(host.records[0]['state'], 'refused')
                 self.assertFalse(self.marker.exists())
 
+    def test_a_reserved_host_in_a_refused_form_refuses_every_plugin(self):
+        src = self.touch() + ANSWER
+        fx.write_install(self.config, grants=[fx.grant_for(src), fx.grant_for(src, plugin_id='fixture.two')],
+                         reserved={'hosts': ['venue.example', 'Venue.Example']})
+        fx.write_plugin(self.plugins / 'one', src)
+        fx.write_plugin(self.plugins / 'two', src, plugin_id='fixture.two')
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            host = self.host()
+        self.assertEqual([(r['state'], r['code']) for r in host.records],
+                         [('refused', 'reserved_host_form')] * 2)
+        self.assertFalse(self.marker.exists())
+
+    def test_an_install_file_with_one_word_reserved_hosts_still_loads_and_reserves(self):
+        fx.write_install(self.config, grants=[fx.grant_for(ANSWER)], reserved={'hosts': ['localhost', 'com']})
+        fx.write_plugin(self.plugins / 'one', ANSWER)
+        reserved = plugins.read_install(self.plugins)['reserved']
+        self.assertTrue(reserved.host_reserved('api.localhost'))
+        self.assertTrue(reserved.host_reserved('api.example.com'))
+        self.assertFalse(reserved.host_reserved('api.example.org'))
+        self.assertEqual(self.host().records[0]['state'], 'loaded')
+
     def test_parser_overflow_artifact_refuses_typed(self):
         # The plugin is unsigned, as everywhere in this file, so nothing here needs a signature backend.
         deep = b'~' * 10_000 + b'1'

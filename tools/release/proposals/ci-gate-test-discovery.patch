@@ -1,0 +1,45 @@
+Proposal (lane RELEASE): let hosted CI run lane EVAL's and lane RELEASE's tests.
+
+Not applied: tools/ci_gate.py is frozen; only Lucas applies this, by his hand or his
+word (the Liaison's ruling of 4:20 PM, Nov 14, 2026 asked for it; the question is in
+his list). Apply from the repository root, after the change that adds tools/release/:
+
+    git apply --check tools/release/proposals/ci-gate-test-discovery.patch
+    git apply --index tools/release/proposals/ci-gate-test-discovery.patch
+
+Why: the frozen gate fails on a file named test_*.py outside its globs and runs only
+what its globs find. eval/ (lane EVAL) and tools/release/ (lane RELEASE) are outside
+them, so today hosted CI runs neither lane's tests: lane RELEASE's tests are named
+*_checks.py so that the gate does not fail on them, and nothing in hosted CI fails on
+an unpinned or unhashed line in requirements-ci.txt.
+
+What it does:
+- tools/ci_gate.py: adds "eval/**/test_*.py" and "tools/release/test_*.py" to
+  TEST_GLOBS; the gate then runs every such file on Linux, Windows and macOS through
+  its usual runner (run_test_file);
+- renames tools/release/hash_lock_checks.py to tools/release/test_hash_lock.py and
+  tools/release/proposal_checks.py to tools/release/test_proposals.py, unchanged.
+Lane RELEASE's other *_checks.py files (licence, dry run) are on branches not yet on
+master; a later patch renames them the same way once they are.
+
+diff --git a/tools/ci_gate.py b/tools/ci_gate.py
+index c98bd2f30d3e5956df17def69a7c1aebc57d9776..216680df52ecb1672894451f706341db7deb039f 100644
+--- a/tools/ci_gate.py
++++ b/tools/ci_gate.py
+@@ -60,6 +60,8 @@ TEST_GLOBS = (
+     "experiments/**/*_tests.py",
+     "experiments/**/*.test.py",
+     "core/**/test_*.py",
++    "eval/**/test_*.py",
++    "tools/release/test_*.py",
+ )
+
+ # The rebuilt core (CSL-795, PRODUCT.md A19/A38). Its tests import the package
+diff --git a/tools/release/hash_lock_checks.py b/tools/release/test_hash_lock.py
+similarity index 100%
+rename from tools/release/hash_lock_checks.py
+rename to tools/release/test_hash_lock.py
+diff --git a/tools/release/proposal_checks.py b/tools/release/test_proposals.py
+similarity index 100%
+rename from tools/release/proposal_checks.py
+rename to tools/release/test_proposals.py

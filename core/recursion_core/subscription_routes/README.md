@@ -378,7 +378,21 @@ What it never relaxes:
 `launch_option_denied` now also covers `engine_config` and `model`.
 `hermes_config_blocks_adopt_override` now means a `config.yaml` that is not exactly
 Recursion's own, or a switch that could not be put in place without replacing something
-(the staging rename found `.hermes` filled, or the link into `.hermes` failed). No refusal text or `repr` here carries a key, a token or an env value.
+(the staging rename found `.hermes` filled, or the link into `.hermes` failed). No refusal text or `repr` here carries a key, a token or an env value, except one used as an address's
+host name (below).
+An address (the proxy's `base_url`) is put into words only as `recursion_core.shown_address.shown_address`
+builds it: the scheme only when it is http or https, the host (an IPv6 zone id left out) and the port;
+fixed words for a sign-in, a path, a query and a fragment; an address with white space or an unprintable
+character inside it, or one that does not parse, is described, not shown. A user name or a password is
+shown nowhere. A path is shown in one place only, the doctor's `address` for an address the route takes,
+and only a plain one (letters, digits, `/`, `-`, `_`, `.`), so a secret written as a plain path of a
+taken address is shown there, to the person who ran the doctor. A secret used as a host name is shown
+wherever the host is, since nothing tells it from a name. A decision's `base_url` keeps the address as
+given, the value the run works with.
+The route takes and refuses the same addresses as before; a user name or a password in the authority is
+refused first, as `recursion_holds_no_token`. The doctor's `address` is that shown form; a decision's `repr` shows no path and its child environment by
+names only. A structure test of the product tree (`shown_address/tests/test_shown_address.py`) holds
+every place to it.
 
 ## Tests
 

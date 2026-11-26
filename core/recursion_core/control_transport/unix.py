@@ -42,6 +42,7 @@ from .errors import (FrameError, InsecureSocketPath, PeerNotAdmitted, PeerRefuse
 from .framing import HEADER, MAX_FRAME_BYTES, decode_body, encode_frame, read_frame, write_frame
 from .handlers import Connection, Handler, Message
 from .peercred import PeerCred, get_peer_cred
+from ..shown_address import shown_address
 
 PeerCredGetter = Callable[[socket.socket], PeerCred]
 
@@ -95,7 +96,8 @@ def refuse_remote_bind(address: object) -> str:
     permissions and relative paths depend on the cwd; both raise ``InsecureSocketPath``.
     """
     if isinstance(address, (tuple, list, int)) or isinstance(address, bool):
-        raise RemoteBindRefused(f"remote_bind_refused: {address!r} is not an AF_UNIX path")
+        raise RemoteBindRefused(f"remote_bind_refused: a {type(address).__name__} is a network address, not an "
+                                "AF_UNIX path; give the control socket's absolute path")
     if isinstance(address, os.PathLike):
         address = os.fspath(address)
     if isinstance(address, bytes):
@@ -106,11 +108,11 @@ def refuse_remote_bind(address: object) -> str:
     if not isinstance(address, str):
         raise RemoteBindRefused(f"remote_bind_refused: {type(address).__name__} is not an AF_UNIX path")
     if _URL_SCHEME.match(address) and not address.startswith("unix://"):
-        raise RemoteBindRefused(f"remote_bind_refused: {address!r}")
+        raise RemoteBindRefused(_network_address(shown_address(address)))
     if address.startswith("unix://"):
         address = address[len("unix://"):]
     if _HOST_PORT.match(address) or _is_host(address):
-        raise RemoteBindRefused(f"remote_bind_refused: {address!r}")
+        raise RemoteBindRefused(_network_address(shown_address("//" + address)))
     if not address or address.startswith("\0"):
         raise InsecureSocketPath("abstract or empty socket names are refused; use a 0700 directory")
     if "\0" in address:
@@ -120,6 +122,12 @@ def refuse_remote_bind(address: object) -> str:
     if len(os.fsencode(address)) > _MAX_SUN_PATH:
         raise InsecureSocketPath("socket path is longer than sun_path allows")
     return address
+
+
+def _network_address(shown: str) -> str:
+    # ``shown`` comes from shown_address: an address given here is never put into words as it was written.
+    return (f"remote_bind_refused: {shown} is a network address, given where the control socket's absolute "
+            "AF_UNIX path belongs; remote control reaches the socket over an SSH stdio relay")
 
 
 def require_unix_transport() -> None:

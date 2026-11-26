@@ -57,6 +57,15 @@ recheck of the current state holds: a poison, fault or trip that lands after the
 section's recheck and before its commit does not refuse that one commit, and a direct trip
 that a direct reset clears before the recheck is not seen. Those are requests to their
 keeper; ``commit_fence`` is injectable so that one fence can be shared with them.
+
+The one charge path. ``CoreService.authorize_effect`` is the only caller of ``Authority.charge``
+in the product. ``effect.authorize`` (a plugin presenting the in-memory gate's approval) and the
+daemon's approved path (the owner or a paired device answering through the approval queue) both
+go through it, so every charge takes the fence position first, passes every check above for the
+effect's plugin, and commits through the commit section. The approval is the caller's: an object
+with ``take(approval_id, effect)``, called after the checks and before the fence, which returns
+the digest or refuses, and ``recheck()``, called inside the fence, which refuses when the approval
+may no longer be carried (for the gate: a veto of the digest).
 """
 
 from __future__ import annotations
@@ -145,6 +154,24 @@ class CommitFence:
             pass
 
 
+class _GateApproval:
+    """The in-memory gate's one-use approval, as ``authorize_effect`` carries it."""
+
+    __slots__ = ("_gate", "_digest")
+
+    def __init__(self, gate: ApprovalGate) -> None:
+        self._gate = gate
+        self._digest: str | None = None
+
+    def take(self, approval_id: str, effect: dict) -> str:
+        self._digest = self._gate.take(approval_id, effect)
+        return self._digest
+
+    def recheck(self) -> None:
+        if self._gate.is_vetoed(self._digest):
+            raise Refused("approval_vetoed")
+
+
 class CoreService:
     def __init__(self, *, loader: PluginLoader, gate: ApprovalGate, breaker: ConnectionBreaker,
                  health: CoreHealth, authority: Authority | None,
@@ -196,15 +223,17 @@ class CoreService:
             raise Refused("effect_kind_unmapped")
         return self._effect_permissions[family]
 
-    def _check_plugin_effect(self, caller: str, effect: dict) -> tuple[str, dict]:
+    def _check_plugin_effect(self, caller: str | None, effect: dict) -> tuple[str, dict]:
+        # caller None: no plugin is the caller (the approved path); every other check is for the effect's plugin.
         self._health.require_healthy()
         check_effect(effect)
-        if caller != effect["plugin_id"]:
+        if caller is not None and caller != effect["plugin_id"]:
             raise Refused("caller_not_effect_plugin")
+        plugin_id = effect["plugin_id"]
         permission = self._permission_for(effect["kind"])
-        if permission not in self._loader.permissions(caller):
+        if permission not in self._loader.permissions(plugin_id):
             raise Refused("permission_required", permission)
-        run = self._breaker.check(effect["run_id"], effect["connection"], caller)
+        run = self._breaker.check(effect["run_id"], effect["connection"], plugin_id)
         return permission, run
 
     def _op_plugin_permissions(self, caller: str, plugin_id: str) -> dict:
@@ -217,34 +246,50 @@ class CoreService:
 
     def _op_effect_authorize(self, caller: str, effect: dict, approval_id: object,
                              authority: object) -> dict:
+        return self.authorize_effect(effect, approval_id, authority, approval=_GateApproval(self._gate),
+                                     caller=caller)
+
+    def authorize_effect(self, effect: object, approval_id: object, authority: object, *, approval: object,
+                         caller: str | None = None) -> dict:
+        """The one path that charges a plugin effect: every check, then the commit section, then the ledger.
+
+        ``caller`` is the plugin asking (``effect.authorize``), or None where no plugin is the caller
+        (the owner or a device answering through the approval queue); every other check is for the
+        effect's own plugin. ``approval`` is the caller's approval object (module text). A refusal of
+        any check is raised as itself and nothing is charged. An approval object with a ``seal`` (the
+        approval queue's record) is consumed by it inside the ledger's own transaction, after the charge
+        row and before its commit, so no failure leaves a charge made with its approval still approved.
+        """
         started = self.commit_fence.position()  # before any check: from here the call is in flight
         permission, run = self._check_plugin_effect(caller, effect)
         if type(approval_id) is not str:
             raise Refused("approval_required")
-        digest = self._gate.take(approval_id, effect)
-        commit = self._commit_section(caller, effect, digest, started)
+        digest = approval.take(approval_id, effect)
+        commit = self._commit_section(caller, effect, approval, started)
+        seal = getattr(approval, "seal", None)
         if permission not in self._authority_required:
             with commit:
-                pass  # nothing is charged: the end of this section is the commit; the answer follows
+                if seal is not None:  # nothing is charged: the end of this section is the commit
+                    seal()
             return {"authorized": True, "digest": digest, "charge": None}
         if self._authority is None:
             raise Refused("authority_unconfigured")
+        plugin_id = effect["plugin_id"]
         charge = self._authority.charge(
-            authority, plugin_id=caller, artifact_sha256=self._loader.artifact(caller),
+            authority, plugin_id=plugin_id, artifact_sha256=self._loader.artifact(plugin_id),
             scope=effect["scope"], kind=effect["kind"], provider=run["provider"],
             model_version=run["model_version"], currency=effect["currency"], amount_minor=effect["amount_minor"],
-            idempotency_key=approval_id, commit_guard=commit)
+            idempotency_key=approval_id, commit_guard=commit, **({} if seal is None else {"before_commit": seal}))
         return {"authorized": True, "digest": digest, "charge": charge}
 
     @contextlib.contextmanager
-    def _commit_section(self, caller: str, effect: dict, digest: str, started: int) -> Iterator[None]:
-        """Hold the fence, check every halt again, then let the caller commit inside."""
+    def _commit_section(self, caller: str | None, effect: dict, approval: object, started: int) -> Iterator[None]:
+        """Hold the fence, check every halt and the approval again, then let the caller commit inside."""
         with self.commit_fence:
             self._check_plugin_effect(caller, effect)  # poison, permission, run fault, trip now
             if self.commit_fence.trip_changed_since(effect["connection"], started):
                 raise Refused("connection_tripped")  # tripped (or reset) while in flight
-            if self._gate.is_vetoed(digest):
-                raise Refused("approval_vetoed")
+            approval.recheck()  # the gate: a veto of the digest; the queue: the record still approved
             yield
 
     def _acknowledge_halt(self, change: Callable[[], object]) -> object:

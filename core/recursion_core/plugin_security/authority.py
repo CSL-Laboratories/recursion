@@ -229,7 +229,8 @@ class Authority:
 
     def charge(self, envelope: object, *, plugin_id: str, artifact_sha256: str, scope: dict,
                kind: str, provider: str, model_version: str, currency: str, amount_minor: object,
-               idempotency_key: str, commit_guard: ContextManager[object] | None = None) -> dict:
+               idempotency_key: str, commit_guard: ContextManager[object] | None = None,
+               before_commit: Callable[[], object] | None = None) -> dict:
         """Charge one effect against the profile. Refuses before writing anything if any check fails.
 
         ``commit_guard``, when given, is a context manager entered once the ledger's write
@@ -245,6 +246,12 @@ class Authority:
         success. The core passes its commit section with the halt recheck (R4-1), whose exit only
         releases the fence; so signature verification never runs under it and a halt never waits
         for one.
+
+        ``before_commit``, when given, is called inside that transaction after the charge row is written
+        and before ``COMMIT``: the caller's own step that must hold if and only if the charge holds (the
+        plugin host consumes the approval there). If it raises, the transaction rolls back and nothing is
+        charged. If ``COMMIT`` then fails, its step has happened and the charge has not: the side a caller
+        chooses as the safe one.
         """
         profile, digest = self._check_profile(envelope)
         now = self._clock()
@@ -291,6 +298,8 @@ class Authority:
                     raise Refused("budget_total_exceeded")
                 self._db.execute("INSERT INTO charges VALUES (?, ?, ?)",
                                  (idempotency_key, profile["profile_id"], amount_minor))
+                if before_commit is not None:
+                    before_commit()  # a raise here rolls the charge row back
                 self._db.execute("COMMIT")
             except BaseException as error:
                 failure = error
@@ -300,6 +309,30 @@ class Authority:
             raise failure
         return {"profile_id": profile["profile_id"], "spent_minor": spent + amount_minor,
                 "remaining_minor": profile["budgets"]["total_minor"] - spent - amount_minor}
+
+    def receipt(self, envelope: object, idempotency_key: str) -> dict | None:
+        """The receipt the charge with ``idempotency_key`` returned, read back from the ledger; None if none.
+
+        The envelope is checked as a charge checks it (signature and fields) and must be the profile that
+        charge was made under. ``spent_minor`` counts that profile's charges up to and including this one in
+        the order the ledger wrote them (no row is ever removed), so it equals what the charge returned.
+        Nothing is written.
+        """
+        profile, digest = self._check_profile(envelope)
+        if type(idempotency_key) is not str or not _ID.fullmatch(idempotency_key):
+            raise Refused("idempotency_key_invalid")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT c.profile_id, p.digest, (SELECT SUM(d.amount_minor) FROM charges d"
+                " WHERE d.profile_id = c.profile_id AND d.rowid <= c.rowid)"
+                " FROM charges c JOIN profiles p ON p.profile_id = c.profile_id"
+                " WHERE c.idempotency_key=?", (idempotency_key,)).fetchone()
+        if row is None:
+            return None
+        if (row[0], row[1]) != (profile["profile_id"], digest):
+            raise Refused("receipt_profile_mismatch")
+        return {"profile_id": row[0], "spent_minor": row[2],
+                "remaining_minor": profile["budgets"]["total_minor"] - row[2]}
 
     def close(self) -> None:
         with self._lock:

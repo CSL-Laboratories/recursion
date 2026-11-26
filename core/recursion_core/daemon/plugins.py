@@ -41,16 +41,24 @@ No silent verification skip: when ``cryptography`` cannot be imported, no signat
 so every installed plugin is refused ``plugin_verification_unavailable`` and none is loaded, signed
 or not.
 
-Not here: any surface that can approve or veto (so no effect is ever authorized), a plugin-owned
+A plugin effect is approved by the OS user who owns the daemon, over the owner-only socket, or by
+the device token, and only through ``approval.answer`` and then ``PluginEffectSink.carry`` (the
+effect is charged, then the approval is consumed, once). The charge goes through the core's one
+charge path, ``CoreService.authorize_effect``, with every check a plugin's own charge passes: core
+health, the permission a key revocation removes, the run and its connection, the commit fence a
+halt drains, and the queue record still approved, read again inside that fence. The in-memory gate still names no
+principal, so a decision there authorizes nothing. Not here: a plugin principal and a plugin-owned
 run (every run is bound to ``host``), the O7 interventions, and an installer (the authority ledger
 is never created by the daemon; without it an order effect refuses ``authority_unconfigured``).
 """
 from __future__ import annotations
 
 import collections
+import hmac
 import json
 import logging
 import os
+import secrets
 from pathlib import Path
 import re
 import sqlite3
@@ -77,6 +85,30 @@ INSTALL_FILE = 'install.json'
 MANIFEST, SIGNATURE, ARTIFACT = 'manifest.json', 'manifest.sig', 'plugin.py'
 REVOCATION_FILE = 'revoked.sqlite3'     # <state dir>/plugin-security/
 LEDGER_FILE = 'ledger.sqlite3'          # installer-created; never created here
+APPROVAL_EVENTS = 'approval-events.sqlite3'
+EFFECT_NOTES = 'effect-receipts.json'   # envelope and receipt, so a later process can return effect_replayed
+EFFECT_NOTES_NEEDED = 'effect-receipts-needed.json'  # the notes of approvals whose charge has not finished
+_TOKEN_CAP = 256
+# The approval notes files' figures. Each becomes a row of the person's one settings file, by the
+# name in NOTES_ROWS, with this value as its shipped default, once that file exists; None is
+# 'no limit'. They are read at each use, so this is the one place they come from. The first three
+# govern only finished notes (an approval consumed, or one whose charge was refused: given and not
+# carried out), and the size figure prunes the oldest of those first, so the finished file never
+# refuses an approval. Notes still needed for a carry are kept in the needed file, whose size row
+# ships as 'no limit'.
+NOTES_SIZE_LIMIT_BYTES = 1024 * 1024   # the most bytes the finished notes file holds after pruning
+NOTES_KEEP_FOR_S = 30 * 24 * 3600      # a finished approval's notes are kept this many seconds
+NOTES_KEEP_AT_MOST = 1000              # the notes of at most this many finished approvals are kept, the newest
+NOTES_NEEDED_SIZE_LIMIT_BYTES = None   # the most bytes the needed notes file holds; None: no limit of ours
+NOTES_ROWS = {
+    'NOTES_SIZE_LIMIT_BYTES': 'plugin_effect_notes.size_limit_bytes',
+    'NOTES_KEEP_FOR_S': 'plugin_effect_notes.keep_for_s',
+    'NOTES_KEEP_AT_MOST': 'plugin_effect_notes.keep_at_most',
+    'NOTES_NEEDED_SIZE_LIMIT_BYTES': 'plugin_effect_notes.needed_size_limit_bytes',
+}
+_CGROUP_CAP = 64 * 1024
+# Not an approver. approval.answer refuses it scope_refused before it reads the record.
+_STRANGER = {'kind': 'plugin', 'id': 'plugin'}
 MAX_MANIFEST_BYTES, MAX_ARTIFACT_BYTES, MAX_INSTALL_BYTES = 64 * 1024, 8 * 1024 * 1024, 1024 * 1024
 VERIFICATION_UNAVAILABLE = 'plugin_verification_unavailable'
 CRYPTOGRAPHY_MISSING = 'cryptography missing; install recipe in plugin_security/README.md'
@@ -213,12 +245,876 @@ def read_install(directory):
             'reserved': ReservedEffects(frozenset(hosts), tuple(prefixes)), 'authority_anchor': anchor}
 
 
+class OwnerSocketPeer:
+    """A peer the daemon admitted on its owner-only socket.
+
+    A plugin's canonical JSON cannot be this object, so a plugin cannot present itself as the owner.
+    """
+
+    __slots__ = ('uid', 'pid')
+
+    def __init__(self, uid, pid):
+        self.uid, self.pid = uid, pid
+
+
+class DevicePresentation:
+    """A device token presented to the daemon. A plugin's canonical JSON cannot be this object."""
+
+    __slots__ = ('token',)
+
+    def __init__(self, token):
+        self.token = token
+
+
+def _command_id():
+    return 'cmd' + secrets.token_hex(8)
+
+
+def _peer_in_run_unit(pid):
+    """True when ``pid`` is inside a ``recursion-run-*`` cgroup, or that cgroup cannot be read.
+
+    The same fail-closed rule as the control socket: an unreadable cgroup is not the owner. Kept
+    here so this module does not import the control adapter (that adapter imports ``PluginHost``).
+    """
+    if type(pid) is not int or pid <= 0:
+        return True
+    try:
+        fd = os.open(f'/proc/{pid}/cgroup', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return True
+    try:
+        info = os.fstat(fd)
+        # procfs reports size 0 for a file that still has bytes. Read a capped amount.
+        if not stat.S_ISREG(info.st_mode):
+            return True
+        raw = os.read(fd, _CGROUP_CAP + 1)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    if len(raw) > _CGROUP_CAP:
+        return True
+    text = raw.decode('utf-8', 'replace')
+    return any('recursion-run-' in part for line in text.splitlines() for part in line.split('/'))
+
+
+def _device_token_bytes(path):
+    """The owner-only device token, without its one trailing newline, or None when it cannot be used."""
+    if path is None:
+        runtime = os.environ.get('XDG_RUNTIME_DIR')
+        if not isinstance(runtime, str) or not runtime or '\x00' in runtime:
+            return None
+        path = Path(runtime) / 'recursion' / 'gui-device-token'
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or not 1 <= info.st_size <= _TOKEN_CAP):
+            return None
+        raw = os.read(fd, _TOKEN_CAP)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(raw) != info.st_size:
+        return None
+    if raw.endswith(b'\n'):
+        raw = raw[:-1]
+    if not raw or b'\n' in raw:
+        return None
+    return raw
+
+
+def _token_matches(presented, path):
+    if type(presented) is not str or not presented:
+        return False
+    try:
+        offered = presented.encode('utf-8')
+    except UnicodeError:
+        return False
+    held = _device_token_bytes(path)
+    if held is None or len(offered) != len(held):
+        return False
+    return hmac.compare_digest(offered, held)
+
+
+class _ApprovalCall:
+    """The slice of a method context ``approval.answer`` reads: principal, transaction, after commit."""
+
+    __slots__ = ('principal', 'tx', 'after_commit')
+
+    def __init__(self, principal, tx, after_commit):
+        self.principal, self.tx, self.after_commit = principal, tx, after_commit
+
+
+class _EffectReceipts:
+    """Receipts this process has already been given. The notes file is what a later call reads."""
+
+    def __init__(self):
+        self._memory = {}
+
+
+class _EffectNotes:
+    """Owner-only JSON of the envelopes and receipts for plugin-effect charges, in two files.
+
+    Same-uid limit, as on the ledger: a plugin in this process can rewrite these files. They are not a
+    boundary against that. They are what a later call in this uid reads so ``effect_replayed`` can
+    return the receipt the first charge produced, without a second spend.
+
+    The needed file (``needed_path``) holds the notes still needed for a carry: an approval approved
+    whose charge has not finished (not charged yet, or charged and not yet consumed). Nothing prunes
+    them, and the file has no size figure of ours: ``NOTES_NEEDED_SIZE_LIMIT_BYTES`` ships as None
+    ('no limit'); only when the person sets that row is a write refused, with words that name the
+    file, how many approvals hold it, why they stay and what the person can do.
+
+    The finished file (``path``) holds the rest. ``consumed`` maps an approval id to
+    ``[time, sequence]``: when its approval was seen consumed (or no longer approved). ``refused`` maps
+    one to what happened to it: ``answered`` 'approve', ``carried`` False, ``code`` (the refusing
+    check's own code), ``at`` and ``sequence``. Every write prunes those first, in the order seen:
+    past ``NOTES_KEEP_FOR_S``, then past ``NOTES_KEEP_AT_MOST``, then, while the finished file would
+    pass ``NOTES_SIZE_LIMIT_BYTES``, the oldest; so the finished file never refuses an approval.
+    """
+
+    _REFUSED_KEYS = frozenset({'answered', 'carried', 'code', 'at', 'sequence'})
+
+    def __init__(self, path, *, needed_path=None, clock=time.time, states=None):
+        self.path = Path(path)
+        self.needed_path = (Path(needed_path) if needed_path is not None
+                            else self.path.with_name(self.path.stem + '-needed' + self.path.suffix))
+        self._lock = threading.Lock()
+        self._clock = clock
+        self._states = states  # approval ids -> their queue state; None: nothing is taken as consumed
+
+    def read(self):
+        with self._lock:
+            return self._read()
+
+    def update(self, mutator, *, charged=False, keep=frozenset()):
+        """Change the notes, prune, write. Returns the approval ids whose notes were pruned.
+
+        ``keep`` names approvals whose notes stay needed whatever the queue says: charged approvals whose
+        receipt is not on file yet. A write the system refuses (a full disk, a read-only directory) is
+        ``approval_note_unwritable``, its detail the notes directory and the system's reason.
+        """
+        with self._lock:
+            data = self._read()
+            mutator(data)
+            dropped = self._prune(data, keep)
+            try:
+                self._write(data, charged=charged)
+            except OSError as exc:
+                raise Refused('approval_note_unwritable', _unwritable(self.path.parent, exc)) from None
+            return dropped
+
+    def _read(self):
+        """Both files as one: the finished file, with the needed file's notes added."""
+        data = self._read_one(self.path, finished=True)
+        needed = self._read_one(self.needed_path, finished=False)
+        for key in ('envelopes', 'receipts'):
+            for approval_id, value in needed[key].items():
+                data[key].setdefault(approval_id, value)
+        return data
+
+    def _read_one(self, path, *, finished):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return {'envelopes': {}, 'receipts': {}, 'consumed': {}, 'refused': {}}
+        except OSError as exc:
+            raise Refused('approval_note_unreadable', type(exc).__name__) from None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                raise Refused('approval_note_untrusted')
+            # No size refusal here: a file past the size figure (one written before the figure was
+            # lowered) is pruned down at the next write instead of refusing every approval.
+            chunks, left = [], info.st_size + 1
+            while left > 0:
+                chunk = os.read(fd, left)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                left -= len(chunk)
+            raw = b''.join(chunks)
+        finally:
+            os.close(fd)
+        try:
+            data = json.loads(raw.decode('utf-8'))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise Refused('approval_note_unreadable', type(exc).__name__) from None
+        keys = set(data) if type(data) is dict else None
+        shapes = (({'envelopes', 'receipts'}, {'envelopes', 'receipts', 'consumed'},
+                   {'envelopes', 'receipts', 'consumed', 'refused'}) if finished else ({'envelopes', 'receipts'},))
+        if keys not in shapes or any(type(data[key]) is not dict for key in keys):
+            raise Refused('approval_note_unreadable', 'shape')
+        data.setdefault('consumed', {})
+        data.setdefault('refused', {})
+        if not all(type(seen) is list and len(seen) == 2 and all(type(v) in (int, float) for v in seen)
+                   for seen in data['consumed'].values()):
+            raise Refused('approval_note_unreadable', 'shape')
+        if not all(type(entry) is dict and set(entry) == self._REFUSED_KEYS and entry['answered'] == 'approve'
+                   and entry['carried'] is False and type(entry['code']) is str
+                   and type(entry['at']) in (int, float) and type(entry['sequence']) is int
+                   for entry in data['refused'].values()):
+            raise Refused('approval_note_unreadable', 'shape')
+        return data
+
+    @staticmethod
+    def _payload(data):
+        return json.dumps(data, sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+    @staticmethod
+    def _split(data):
+        """The finished file's content and the needed file's content."""
+        finished = set(data['consumed']) | set(data['refused'])
+        done = {key: {k: v for k, v in data[key].items() if k in finished} for key in ('envelopes', 'receipts')}
+        done.update(consumed=data['consumed'], refused=data['refused'])
+        needed = {key: {k: v for k, v in data[key].items() if k not in finished} for key in ('envelopes', 'receipts')}
+        return done, needed
+
+    @staticmethod
+    def _entry_bytes(data, approval_id):
+        return sum(len(json.dumps({approval_id: data[key][approval_id]}, separators=(',', ':'))) - 1
+                   for key in ('envelopes', 'receipts', 'consumed', 'refused') if approval_id in data[key])
+
+    @staticmethod
+    def _forget(data, approval_id):
+        for key in ('envelopes', 'receipts', 'consumed', 'refused'):
+            data[key].pop(approval_id, None)
+
+    @staticmethod
+    def _seen(data, approval_id):
+        """``[time, sequence]`` of a finished approval."""
+        if approval_id in data['consumed']:
+            return data['consumed'][approval_id]
+        entry = data['refused'][approval_id]
+        return [entry['at'], entry['sequence']]
+
+    @staticmethod
+    def _next_sequence(data):
+        return max([seen[1] for seen in data['consumed'].values()]
+                   + [entry['sequence'] for entry in data['refused'].values()], default=0) + 1
+
+    def mark_consumed(self, data, approval_id):
+        """Record that ``approval_id`` was seen consumed now, after every earlier finished one."""
+        if approval_id in data['consumed']:
+            return
+        sequence = self._next_sequence(data)
+        data['refused'].pop(approval_id, None)
+        data['consumed'][approval_id] = [self._clock(), sequence]
+
+    def mark_refused(self, data, approval_id, code):
+        """Record that ``approval_id`` was approved and not carried out: its charge was refused ``code``."""
+        if approval_id in data['consumed']:
+            return
+        data['refused'][approval_id] = {'answered': 'approve', 'carried': False, 'code': code,
+                                        'at': self._clock(), 'sequence': self._next_sequence(data)}
+
+    @staticmethod
+    def clear_refused(data, approval_id):
+        data['refused'].pop(approval_id, None)
+
+    def _prune(self, data, keep=frozenset()):
+        envelopes, receipts, consumed, refused = data['envelopes'], data['receipts'], data['consumed'], data['refused']
+        held = set(envelopes) | set(receipts)
+        for gone in [approval_id for approval_id in consumed if approval_id not in held]:
+            del consumed[gone]
+        unseen = sorted(held - set(consumed) - set(refused) - set(keep))  # kept: its receipt is not on file yet
+        if unseen and self._states is not None:
+            states = self._states(unseen)
+            for approval_id in unseen:
+                if approval_id in states and states[approval_id] != 'approved':
+                    self.mark_consumed(data, approval_id)  # consumed, or gone: no carry reads it again
+        now = self._clock()
+        finished = sorted(set(consumed) | set(refused),
+                          key=lambda approval_id: (self._seen(data, approval_id)[1], approval_id))
+        keep_for, keep_at_most, limit = NOTES_KEEP_FOR_S, NOTES_KEEP_AT_MOST, NOTES_SIZE_LIMIT_BYTES
+        dropped = []
+        if keep_for is not None:
+            dropped += [approval_id for approval_id in finished if now - self._seen(data, approval_id)[0] >= keep_for]
+            finished = [approval_id for approval_id in finished if approval_id not in set(dropped)]
+        if keep_at_most is not None and len(finished) > keep_at_most:
+            cut = len(finished) - keep_at_most
+            dropped += finished[:cut]
+            finished = finished[cut:]
+        for approval_id in dropped:
+            self._forget(data, approval_id)
+        if limit is not None:
+            size = len(self._payload(self._split(data)[0]))
+            while finished and size > limit:
+                approval_id = finished.pop(0)
+                size -= self._entry_bytes(data, approval_id)
+                self._forget(data, approval_id)
+                dropped.append(approval_id)
+                if size <= limit:
+                    size = len(self._payload(self._split(data)[0]))  # exact again before it stops
+        return dropped
+
+    def _write(self, data, *, charged=False):
+        directory = private_dir(self.path.parent)
+        done, needed = self._split(data)
+        needed_payload = self._payload(needed)
+        limit = NOTES_NEEDED_SIZE_LIMIT_BYTES
+        if limit is not None and len(needed_payload) > limit:
+            row = NOTES_ROWS['NOTES_NEEDED_SIZE_LIMIT_BYTES']
+            awaiting = len(set(needed['envelopes']) | set(needed['receipts']))
+            if charged:
+                tail = ('the charge was made and stands in the authority ledger, and its receipt is held in this '
+                        f"process only, so do not request the effect again; set the row {row} to 'no limit' (its "
+                        'shipped default) or to a larger figure so its receipt is kept')
+            else:
+                tail = (f"nothing was charged; set the row {row} to 'no limit' (its shipped default) or to a "
+                        'larger figure, then request the effect again')
+            raise Refused('approval_notes_full',
+                          f'the file of approval notes still needed, {self.needed_path}, is at its size row {row} of '
+                          f'{limit} bytes: {awaiting} approval(s) were approved and their charge has not finished (not '
+                          'charged yet, or charged and not yet consumed); their notes cannot be dropped, because a '
+                          "later carry of the same approval reads them to return the first charge's receipt instead "
+                          f'of charging again; {tail}')
+        self._replace(directory, self.path, self._payload(done))
+        self._replace(directory, self.needed_path, needed_payload)
+
+    @staticmethod
+    def _replace(directory, path, payload):
+        tmp = directory / (path.name + '.tmp')
+        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            try:
+                os.fchmod(fd, 0o600)
+                view = memoryview(payload)
+                while view:
+                    written = os.write(fd, view)
+                    if not written:
+                        raise Refused('approval_note_unreadable', 'short write')
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)  # a part-written copy takes no room it does not need
+            except OSError:
+                pass
+            raise
+        os.chmod(path, 0o600)
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+
+# What a person reads when an approved charge is stopped: what stopped it, that nothing was charged,
+# and what to do next. The code stays the refusing check's own; ``{detail}`` is that check's detail.
+_RUN_NOT_BOUND = ('the run named by the effect is not bound to this plugin on this connection; nothing was '
+                  'charged; bind the run, then request the effect again')
+_CHARGE_STOPPED = {
+    'core_poisoned_restart_required': 'the plugin core is poisoned ({detail}), so no plugin effect can be charged; '
+                                      'nothing was charged; restart the daemon, then request the effect again',
+    'permission_required': "the plugin does not hold the '{detail}' permission now (its signing key was revoked, or "
+                           'its grant does not give it); nothing was charged; install a grant that gives it again, '
+                           'then request the effect again',
+    'run_faulted': 'the run was halted by a run fault; nothing was charged; start a new run, then request the '
+                   'effect again',
+    'connection_tripped': "the connection's breaker tripped before or during this charge; nothing was charged; "
+                          'reset the connection with a leased probe, then request the effect again',
+    'run_unknown': _RUN_NOT_BOUND, 'run_not_owned': _RUN_NOT_BOUND, 'run_connection_mismatch': _RUN_NOT_BOUND,
+    'approval_not_approved': 'the approval is no longer approved (it is {detail} now); nothing was charged; '
+                             'request the effect again if it is still wanted',
+    'core_unavailable': 'no plugin core is composed in this daemon (it has no breaker store), so no plugin effect '
+                        'can be charged; nothing was charged; restart the daemon once its state directory opens',
+    'authority_unconfigured': 'no authority ledger is installed, so no order can be charged; nothing was charged; '
+                              'create the ledger with the installer, then request the effect again',
+    'effect_replayed': 'this approval was charged earlier and its receipt is not held here; nothing was charged '
+                       'again; read the charge in the authority ledger',
+}
+_CHARGE_STOPPED['approval_store_unwritable'] = (
+    'the approval store could not record this approval as used ({detail}), so the charge was undone before it '
+    'was committed; nothing was charged; the approval stays approved and is not carried out; free space where '
+    'the daemon keeps its state, then request the effect again and approve the new request')
+_NEXT_REQUEST = 'request the effect again and approve the new request'
+_CHARGE_STOPPED_OTHER = ('the charge was refused ({code}{detail}); nothing was charged; correct what the code names, '
+                         'then request the effect again')
+
+
+def _reason(exc):
+    """The system's own reason for a failed write, as a person reads it."""
+    if isinstance(exc, OSError) and exc.strerror:
+        return exc.strerror
+    return str(exc) or type(exc).__name__
+
+
+def _unwritable(directory, exc):
+    return f'{directory} ({_reason(exc)})'
+
+
+def _store_errors():
+    """What a store raises when it cannot be read or written: the approval store's and the ledger's."""
+    from recursion_core.events.db import StoreError
+    return (sqlite3.Error, OSError, StoreError)
+
+
+def _note_stopped(refused):
+    """A refused write of an approval note before the charge, in words; other refusals pass unchanged."""
+    if refused.code != 'approval_note_unwritable':
+        return refused
+    return Refused(refused.code, f'the approval note could not be written to {refused.detail}, so the charge was '
+                                 'not tried; nothing was charged; the approval stays approved and is not carried '
+                                 f'out; free space there, then {_NEXT_REQUEST}')
+
+
+def _charge_stopped(refused):
+    """The same refusal, its code unchanged, with the words a person reads."""
+    detail = refused.detail or ''
+    words = _CHARGE_STOPPED.get(refused.code)
+    if words is None:
+        words = _CHARGE_STOPPED_OTHER.format(code=refused.code, detail=': ' + detail if detail else '')
+    else:
+        words = words.format(detail=detail or 'unknown')
+    return Refused(refused.code, words)
+
+
+class _QueuedApproval:
+    """The approval queue's record of one approved plugin effect, as the core's one charge path carries it.
+
+    ``take`` reads the record after the core's checks; ``recheck`` reads it again inside the commit
+    fence, so a record that stopped being approved in between is not charged. ``consumed`` passes
+    as well: the sink consumes only after a charge, so the ledger then refuses ``effect_replayed``
+    and the stored receipt is returned (a later process carrying it again).
+    """
+
+    __slots__ = ('_queue', '_approval_id', '_seen')
+
+    def __init__(self, queue):
+        self._queue = queue
+        self._approval_id = self._seen = None
+
+    def _read(self):
+        from recursion_core.approvals import store as approval_rows
+        from recursion_core.approvals.model import ApprovalRefused
+        store = self._queue.store
+        if store is None:
+            raise Refused('approval_not_approved', 'unreadable: no approval store')
+        try:
+            with store.transaction() as tx:
+                record = approval_rows.load(tx, self._approval_id)
+        except ApprovalRefused as refused:  # a record that does not read whole is not an approved one
+            raise Refused('approval_not_approved', f'unreadable: {refused.code}') from None
+        state = record.get('state') if type(record) is dict else None
+        if state not in ('approved', 'consumed'):
+            raise Refused('approval_not_approved', state if type(state) is str else 'unknown')
+        return record['revision'], record['digest']
+
+    def take(self, approval_id, _effect):
+        self._approval_id = approval_id
+        self._seen = self._read()
+        return self._seen[1]
+
+    def recheck(self):
+        if self._read() != self._seen:
+            raise Refused('approval_not_approved', 'changed')
+
+    def seal(self):
+        """Consume the record inside the ledger's own transaction: after the charge row, before its commit.
+
+        If the consumption fails the charge is rolled back: nothing is charged and the record stays
+        approved. If the ledger's commit fails after it, the record is consumed and nothing is charged.
+        No failure leaves a charge made with its record still approved.
+        """
+        from recursion_core.approvals.model import ApprovalRefused
+        revision, digest = self._seen
+        try:
+            self._queue.consume(self._approval_id, revision, digest, None)
+        except ApprovalRefused as refused:
+            if refused.code == 'store_busy':
+                raise Refused('approval_store_unwritable', 'it stayed busy or full') from None
+            raise Refused('approval_not_approved',
+                          'consumed' if refused.code == 'already_consumed' else refused.code) from None
+
+
+class PluginEffectApprover:
+    """The daemon's owner, or the device token, answering a plugin effect through ``approval.answer``.
+
+    ``authenticate`` is the in-memory gate's authenticator. It returns None for every credential,
+    proof objects included, so that gate still names no principal and cannot mark an effect
+    approved with nothing charged. ``answer`` is the path that charges.
+    """
+
+    def __init__(self, host, queue, notes_path):
+        from recursion_core.approvals.sink import PluginEffectSink
+        self._host, self._queue = host, queue
+        self._notes = _EffectNotes(notes_path, needed_path=Path(notes_path).with_name(EFFECT_NOTES_NEEDED),
+                                   clock=lambda: host._clock(), states=self._record_states)
+        self._envelopes = {}
+        self._envelope_unwritten = set()  # envelopes not on file yet: no charge is tried without its note
+        self._receipts = _EffectReceipts()
+        self._unwritten = {}  # approval id -> (envelope, receipt) of a charge whose note is not on file yet
+        self._unwritten_lock = threading.Lock()
+        self._notices = {}  # approval id -> the words for the person when its note could not be written
+        self.sink = PluginEffectSink(queue, self.charge)
+
+    def authenticate(self, _credential):
+        return None
+
+    def request(self, effect):
+        return self.sink.request(effect)
+
+    def answer(self, peer, approval_id, effect, *, authority, answer='approve'):
+        admitted = self._admit(peer)
+        if admitted is None:
+            return self._method('approval.answer', _STRANGER, {
+                'command_id': _command_id(), 'approval_id': approval_id, 'surface': 'cli',
+                'expected_revision': 1, 'digest': '0' * 64, 'answer': 'deny'})
+        principal, surface = admitted
+        opened = self._method('approval.open', principal, {
+            'command_id': _command_id(), 'approval_id': approval_id, 'surface': surface})
+        if opened.get('code') != 'ok':
+            return opened
+        shown = opened['approval']
+        answered = self._method('approval.answer', principal, {
+            'command_id': _command_id(), 'approval_id': approval_id, 'surface': surface,
+            'expected_revision': shown['revision'], 'digest': shown['digest'], 'answer': answer})
+        if answered.get('code') == 'conflict' and answered.get('detail') in ('already_resolved', 'already_consumed'):
+            from recursion_core.approvals.model import ApprovalRefused
+            raise ApprovalRefused(answered['detail'])
+        if answer != 'approve' or answered.get('code') != 'ok':
+            return answered
+        try:
+            self._note_envelope(approval_id, authority)
+        except Refused as refused:
+            self._mark_refused(approval_id, refused.code)  # approved, and not carried out: the notes say so
+            raise _note_stopped(refused) from None
+        try:
+            carried = self.sink.carry(approval_id, effect)
+        except _store_errors() as failed:
+            raise self._store_failed(approval_id, failed) from None
+        if approval_id not in self._unwritten:
+            try:
+                self._update(lambda data: self._notes.mark_consumed(data, approval_id))
+            except (Refused, OSError) as refused:  # charged and consumed already; a later write marks it
+                log.warning('approval %s was carried; its notes were not marked consumed: %s', approval_id,
+                            getattr(refused, 'code', type(refused).__name__))
+        notice = self._notices.pop(approval_id, None)
+        if notice is not None and approval_id in self._unwritten:
+            carried = dict(carried, notice=notice)
+        return carried
+
+    def _store_failed(self, approval_id, failed):
+        """A store error out of the carry, in words that say whether the charge was made."""
+        if approval_id in self._receipts._memory:  # the charge returned in this process
+            return Refused('approval_unread_after_charge',
+                           'the charge was made and stands in the authority ledger, and this approval was used up '
+                           f'with it; reading the approval back afterwards failed ({_reason(failed)}); nothing '
+                           'needs approving again; do not request the effect again')
+        self._mark_refused(approval_id, 'approval_store_unwritable')
+        return Refused('approval_store_unwritable',
+                       f'the approval store could not be read or written ({_reason(failed)}), so the charge was not '
+                       'tried; nothing was charged; free space where the daemon keeps its state (restart the daemon '
+                       f'if the store stays failed), then {_NEXT_REQUEST}')
+
+    def recover_receipts(self):
+        """At a start: write the receipt of every charged approval whose note was lost, read from the ledger.
+
+        An approval whose envelope is on file, whose receipt is not, and whose queue record reads consumed
+        was charged or not; the ledger says which. Its receipt is rebuilt there and written (held until the
+        next write if that fails). Returns the approval ids rebuilt.
+        """
+        authority = self._host.authority
+        if authority is None:
+            return []
+        data = self._notes.read()
+        missing = sorted(set(data['envelopes']) - set(data['receipts']))
+        states = self._record_states(missing) if missing else {}
+        rebuilt = []
+        for approval_id in missing:
+            if states.get(approval_id) != 'consumed':
+                continue
+            receipt = self._ledger_receipt(approval_id, data['envelopes'][approval_id])
+            if receipt in (None, _UNREAD):
+                continue
+            envelope = data['envelopes'][approval_id]
+            self._envelopes[approval_id] = envelope
+            self._receipts._memory[approval_id] = receipt
+            with self._unwritten_lock:
+                self._unwritten[approval_id] = (envelope, receipt)
+            rebuilt.append(approval_id)
+        if rebuilt:
+            try:
+                self._update(lambda _data: None, charged=True)
+            except (Refused, OSError) as failed:
+                log.warning('%d receipt(s) rebuilt from the ledger are held until the next write: %s', len(rebuilt),
+                            getattr(failed, 'code', type(failed).__name__))
+        return rebuilt
+
+    def _ledger_receipt(self, approval_id, envelope):
+        """The ledger's receipt of this approval's charge; None if it holds none; _UNREAD if it cannot say."""
+        authority = self._host.authority
+        if authority is None or type(envelope) is not dict:
+            return _UNREAD
+        try:
+            return authority.receipt(envelope, approval_id)
+        except (Refused, sqlite3.Error) as failed:
+            log.warning('approval %s: the ledger could not be read for its charge: %s', approval_id,
+                        getattr(failed, 'code', type(failed).__name__))
+            return _UNREAD
+
+    def _record_states(self, approval_ids):
+        """The queue state of each approval id that reads whole; a missing record reads 'missing'."""
+        from recursion_core.approvals import store as approval_rows
+        from recursion_core.approvals.model import ApprovalRefused
+        store = self._queue.store
+        if store is None:
+            return {}
+        states = {}
+        try:
+            with store.transaction() as tx:
+                for approval_id in approval_ids:
+                    try:
+                        record = approval_rows.load(tx, approval_id)
+                    except ApprovalRefused:
+                        continue  # unreadable: not taken as consumed, so it is kept
+                    states[approval_id] = record.get('state') if type(record) is dict else 'missing'
+        except Exception as exc:  # noqa: BLE001 - an unreadable store prunes nothing it cannot see
+            log.warning('approval states unreadable for the notes file: %s', type(exc).__name__)
+            return {}
+        return states
+
+    def _mark_refused(self, approval_id, code):
+        """Note that this approval was given and not carried out, refused with ``code``.
+
+        Its notes are then finished ones, pruned by the person's rows. The queue record is not changed:
+        it stays approved, so a carry of the same approval can still be tried.
+        """
+        try:
+            self._update(lambda data: self._notes.mark_refused(data, approval_id, code))
+        except (Refused, OSError) as failed:  # the refusal itself still reaches the person
+            log.warning('approval %s was refused %s; the notes could not record it: %s', approval_id, code,
+                        getattr(failed, 'code', type(failed).__name__))
+
+    def _update(self, mutator, *, charged=False, keep_also=frozenset()):
+        """Write a change of the notes, and with it every receipt note that could not be written before.
+
+        ``keep_also`` names approvals kept unpruned in this write (a receipt just made reaches the file
+        once before the person's rule can prune it).
+
+        If the write with those held notes is refused (no room yet), this change alone is tried, so a new
+        approval is not refused for an older note; the held notes stay held (never pruned) until a write
+        takes them.
+        """
+        with self._unwritten_lock:
+            pending = dict(self._unwritten)
+        dropped = None
+        if pending:
+            def landing(data):
+                for approval_id, (envelope, receipt) in pending.items():
+                    if envelope is not None:
+                        data['envelopes'].setdefault(approval_id, envelope)
+                    data['receipts'][approval_id] = receipt
+                    self._notes.clear_refused(data, approval_id)
+                mutator(data)
+            try:
+                dropped = self._notes.update(landing, charged=charged, keep=frozenset(pending) | keep_also)
+            except Refused as refused:
+                if refused.code not in ('approval_note_unwritable', 'approval_notes_full'):
+                    raise
+            else:
+                with self._unwritten_lock:
+                    for approval_id, held in pending.items():
+                        if self._unwritten.get(approval_id) is held:
+                            del self._unwritten[approval_id]
+        if dropped is None:
+            with self._unwritten_lock:
+                keep = frozenset(self._unwritten) | keep_also
+            dropped = self._notes.update(mutator, charged=charged, keep=keep)
+        for approval_id in dropped:
+            self._envelopes.pop(approval_id, None)
+            self._receipts._memory.pop(approval_id, None)
+
+    def notes_status(self):
+        """The notes file's figures ('no limit' for None) and how many approvals' notes it holds."""
+        shown = {'path': str(self._notes.path), 'needed_path': str(self._notes.needed_path),
+                 'rows': dict(NOTES_ROWS)}
+        for name, value in (('size_limit_bytes', NOTES_SIZE_LIMIT_BYTES), ('keep_for_s', NOTES_KEEP_FOR_S),
+                            ('keep_at_most', NOTES_KEEP_AT_MOST),
+                            ('needed_size_limit_bytes', NOTES_NEEDED_SIZE_LIMIT_BYTES)):
+            shown[name] = 'no limit' if value is None else value
+        try:
+            data = self._notes.read()
+        except Refused as refused:
+            shown.update(held=None, awaiting_carry=None, refused=None, unreadable=refused.code)
+            return shown
+        held = set(data['envelopes']) | set(data['receipts'])
+        shown.update(held=len(held), awaiting_carry=len(held - set(data['consumed']) - set(data['refused'])),
+                     refused=len(data['refused']))
+        return shown
+
+    def _admit(self, peer):
+        # Exact type, not a subclass: a plugin cannot widen admission by inheriting the proof.
+        if type(peer) is OwnerSocketPeer:
+            if type(peer.uid) is not int or peer.uid != self._host._owner_uid or _peer_in_run_unit(peer.pid):
+                return None
+            return {'kind': 'owner', 'id': 'local'}, 'cli'
+        if type(peer) is DevicePresentation and _token_matches(peer.token, self._host._device_token_path):
+            return {'kind': 'device', 'id': 'page'}, 'page'
+        return None
+
+    def _method(self, name, principal, params):
+        from recursion_core.control.methods import NotAccepted
+        from recursion_core.control.methods.approval import handlers
+        handler = handlers(self._queue)[name]
+        callbacks = []
+
+        def after(fn):
+            callbacks.append(fn)
+
+        try:
+            with self._queue.store.transaction() as tx:
+                result = handler(_ApprovalCall(principal, tx, after), params)
+        except NotAccepted as refused:
+            return refused.answer
+        except _store_errors() as failed:
+            what = {'approval.open': 'that the approval was opened', 'approval.answer': 'the answer'}.get(name, name)
+            raise Refused('approval_store_unwritable',
+                          f'the approval store did not confirm {what} ({_reason(failed)}); nothing was charged; '
+                          'free space where the daemon keeps its state (restart the daemon if the store stays '
+                          'failed), then answer again; if it then reads already answered, '
+                          f'{_NEXT_REQUEST}') from None
+        for fn in callbacks:
+            fn()
+        return result
+
+    def _note_envelope(self, approval_id, authority):
+        # A copy the file can store. The charge reads it back after this process forgets the dict.
+        held = json.loads(json.dumps(authority)) if type(authority) is dict else None
+        self._envelopes[approval_id] = held
+        self._envelope_unwritten.add(approval_id)
+
+        def put(data):
+            data['envelopes'][approval_id] = held
+            self._notes.clear_refused(data, approval_id)  # a new carry of it is about to be tried
+
+        self._update(put)
+        self._envelope_unwritten.discard(approval_id)
+
+    def _envelope_for(self, approval_id):
+        if approval_id in self._envelopes:
+            return self._envelopes[approval_id]
+        data = self._notes.read()
+        if approval_id not in data['envelopes']:
+            return None
+        self._envelopes[approval_id] = data['envelopes'][approval_id]
+        return self._envelopes[approval_id]
+
+    def _receipt_for(self, approval_id):
+        if approval_id in self._receipts._memory:
+            return self._receipts._memory[approval_id]
+        data = self._notes.read()
+        if approval_id not in data['receipts']:
+            return None
+        self._receipts._memory[approval_id] = data['receipts'][approval_id]
+        return self._receipts._memory[approval_id]
+
+    def _remember_receipt(self, approval_id, receipt):
+        # Memory first: a write that fails still answers a replay in this process.
+        self._receipts._memory[approval_id] = receipt
+        envelope = self._envelopes.get(approval_id)
+
+        def put(data):
+            data['receipts'][approval_id] = receipt
+            if envelope is not None:
+                data['envelopes'].setdefault(approval_id, envelope)
+            self._notes.clear_refused(data, approval_id)  # charged: no longer a refused one
+
+        try:
+            self._update(put, charged=True, keep_also=frozenset((approval_id,)))
+        except Refused as failed:  # the charge stands: its note is held and written later, never lost
+            with self._unwritten_lock:
+                self._unwritten[approval_id] = (envelope, receipt)
+            if failed.code == 'approval_note_unwritable':
+                why = failed.detail
+            else:
+                why = f"{self._notes.needed_path}: {failed.code}"
+            self._notices[approval_id] = (
+                'the charge was made and stands in the authority ledger, and this approval was used up with it; '
+                f'its note could not be written to {why}; the note is held in this process and will be written '
+                'there at the next approval once there is room, and at the next start it is rebuilt from the '
+                'ledger; nothing needs approving again; do not request the effect again')
+            log.warning('approval %s was charged; its receipt note is held until the next write: %s', approval_id,
+                        failed.code)
+
+    def charge(self, effect, approval_id):
+        """Charge this approval through the core's one charge path (``CoreService.authorize_effect``).
+
+        Every refusal of a check is raised as itself (its code), with words that say what stopped the
+        charge and that nothing was charged. ``effect_replayed`` returns the receipt already stored.
+        """
+        core = self._host.core
+        if core is None:
+            self._mark_refused(approval_id, 'core_unavailable')
+            raise _charge_stopped(Refused('core_unavailable'))
+        envelope = self._envelope_for(approval_id)
+        if approval_id in self._envelope_unwritten:  # its note never reached the file: no charge without it
+            try:
+                self._note_envelope(approval_id, envelope)
+            except Refused as refused:
+                self._mark_refused(approval_id, refused.code)
+                raise _note_stopped(refused) from None
+        try:
+            outcome = core.authorize_effect(effect, approval_id, envelope, approval=_QueuedApproval(self._queue))
+        except Refused as refused:
+            if refused.code == 'effect_replayed':
+                prior = self._receipt_for(approval_id)
+                if prior is not None:
+                    return prior
+                prior = self._ledger_receipt(approval_id, envelope)  # the ledger is the record; the notes a copy
+                if prior not in (None, _UNREAD):
+                    self._remember_receipt(approval_id, prior)
+                    return prior
+            else:  # the charge was not made: approved, and not carried out
+                self._mark_refused(approval_id, refused.code)
+            raise _charge_stopped(refused) from None
+        except _store_errors() as failed:  # a store write refused (a full disk): the ledger says what stands
+            prior = self._ledger_receipt(approval_id, envelope)
+            if prior is _UNREAD:
+                raise Refused('charge_outcome_unread',
+                              f'a store of this charge could not be written ({_reason(failed)}), and the authority '
+                              'ledger could not be read back to say whether the charge stands; read the charges in '
+                              'the authority ledger before you request the effect again') from None
+            if prior is None:
+                self._mark_refused(approval_id, 'charge_not_recorded')
+                raise Refused('charge_not_recorded', self._not_recorded(approval_id, failed)) from None
+            outcome = {'charge': prior}
+        receipt = outcome['charge']
+        self._remember_receipt(approval_id, receipt)
+        return receipt
+
+
+    def _not_recorded(self, approval_id, failed):
+        state = self._record_states([approval_id]).get(approval_id)
+        if state == 'consumed':
+            step = f'this approval is used up, so once there is room {_NEXT_REQUEST}'
+        elif state == 'approved':
+            step = f'the approval stays approved and is not carried out; once there is room, {_NEXT_REQUEST}'
+        else:
+            step = f'once there is room, {_NEXT_REQUEST}'
+        return (f'a store of this charge could not be written ({_reason(failed)}), so the charge was undone before '
+                f'it was committed; nothing was charged: the authority ledger holds no charge for this approval; '
+                f'{step}')
+
+
+_UNREAD = object()  # the ledger could not be read: whether a charge stands is not known
+
+
 class PluginHost:
     """What the running daemon holds of its operator plugins: the inventory, the panels, the O7 reader."""
 
     def __init__(self, config_dir, state_dir, breaker=None, *, plugin_dirs=(), verification_available=None,
                  gil_probe=None, clock=time.time, operator_deadline_s=OPERATOR_DEADLINE_S,
-                 operator_turn_wait_s=OPERATOR_TURN_WAIT_S):
+                 operator_turn_wait_s=OPERATOR_TURN_WAIT_S, device_token_path=None, owner_uid=None):
         require_launcher_platform()  # Windows: typed PlatformUnsupported; no plugin file is opened
         self._config, self._state = Path(config_dir) / PLUGINS_DIR, Path(state_dir)
         self._gil = gil_probe if gil_probe is not None else GilProbe()
@@ -231,6 +1127,10 @@ class PluginHost:
         self.degraded = {}  # plugin id -> operator() calls that passed their deadline
         self.health = CoreHealth()
         self.loader = self.core = self.gate = self.authority = self._trust = None
+        self._approver = self.effect_sink = self._approval_queue = self._approval_store = None
+        self._breaker = None
+        self._device_token_path = device_token_path
+        self._owner_uid = os.geteuid() if owner_uid is None else owner_uid
         self.records, self.registries = [], ()
         self.pending_approvals = collections.deque(maxlen=64)  # (approval id, digest) drawn, newest last
         self._operators = {}
@@ -289,10 +1189,15 @@ class PluginHost:
         return str(path)
 
     def _compose_core(self, install, breaker):
-        # The core draws every approval (4.2). No surface can show or decide one yet, so the
-        # authenticator names no principal and nothing can be approved: effects stay refused.
+        # The in-memory gate still names no principal. PluginEffectApprover.authenticate returns
+        # None for every credential, including an owner-socket peer and a device token, so a
+        # plugin's JSON cannot become operator_ui and nothing is marked approved here before a
+        # charge. The owner and the device answer through approval.answer and PluginEffectSink.carry.
+        self._breaker = breaker
+        self._approver = self._open_effect_approver() if breaker is not None else None
+        authenticator = self._approver.authenticate if self._approver is not None else (lambda _credential: None)
         self.gate = ApprovalGate(lambda approval_id, digest, _raw: self.pending_approvals.append((approval_id, digest)),
-                                 lambda _credential: None, lambda: int(self._clock()))
+                                 authenticator, lambda: int(self._clock()))
         anchor = install['authority_anchor']
         if anchor is not None:
             try:
@@ -306,6 +1211,50 @@ class PluginHost:
         self.core = CoreService(loader=self.loader, gate=self.gate, breaker=breaker, health=self.health,
                                 authority=self.authority, effect_permissions=EFFECT_PERMISSIONS,
                                 authority_required=AUTHORITY_REQUIRED)
+        if self._approver is not None and self.authority is not None:
+            try:
+                self._approver.recover_receipts()  # a receipt note lost with a full disk or a killed process
+            except Exception as exc:  # noqa: BLE001 - the host still starts; the next approval writes it
+                log.error('receipt notes could not be rebuilt from the ledger: %s', type(exc).__name__)
+
+    def _open_effect_approver(self):
+        """The approval queue and the plugin-effect sink, or None when they cannot be opened.
+
+        The deadline worker is not started: a pending request is not expired on a timer by this
+        host. Plugins still load when the store cannot be opened; nothing can then be approved.
+        """
+        store = None
+        try:
+            from recursion_core.approvals.queue import ApprovalQueue
+            from recursion_core.events.db import EventStore
+            directory = private_dir(self._state / STORE_DIR)
+            store = EventStore(directory / APPROVAL_EVENTS, clock=self._clock)
+            queue = ApprovalQueue(clock=self._clock)
+            queue.attach(store)
+            approver = PluginEffectApprover(self, queue, directory / EFFECT_NOTES)
+        except Exception as exc:  # noqa: BLE001 - a store that will not open leaves the plugins loaded
+            log.error('plugin effect approver is not composed: %s', type(exc).__name__)
+            if store is not None:
+                try:
+                    store.close()
+                except Exception as close_exc:  # noqa: BLE001 - the host still has its plugins
+                    log.error('plugin effect approval store would not release: %s', type(close_exc).__name__)
+            self._approval_queue = self._approval_store = self.effect_sink = None
+            return None
+        self._approval_queue, self._approval_store, self.effect_sink = queue, store, approver.sink
+        return approver
+
+    def request_plugin_effect(self, effect):
+        """Record one plugin effect on the approval queue, bound to the effect's own run."""
+        if self._approver is None:
+            raise PluginRefused('approval_surface_unavailable', 'no approver is composed')
+        return self._approver.request(effect)
+
+    def answer_plugin_effect(self, peer, approval_id, effect, *, authority, answer='approve'):
+        """Open and answer through ``approval.answer``. An approval is carried only after it is approved."""
+        if self._approver is None:
+            raise PluginRefused('approval_surface_unavailable', 'no approver is composed')
+        return self._approver.answer(peer, approval_id, effect, authority=authority, answer=answer)
 
     # -- one plugin -----------------------------------------------------------------------------
     def _load(self, source):
@@ -418,7 +1367,10 @@ class PluginHost:
             plugins.append(item)
         return {'plugins': plugins, 'verification': self.verification, 'core_poisoned': self.health.poisoned,
                 'authority_profile': self.authority_state, 'approvals_drawn': len(self.pending_approvals),
-                'approval_surface': 'none: no surface can approve or veto yet, so no effect is authorized',
+                'effect_notes': self._approver.notes_status() if self._approver is not None else None,
+                'approval_surface': ('owner socket or device token, through approval.answer'
+                                     if self._approver is not None else
+                                     'none: no surface can approve or veto yet, so no effect is authorized'),
                 'containment': 'none: plugins run in the daemon process and uid'}
 
     def route_records(self):
@@ -532,6 +1484,6 @@ class PluginHost:
         return 504, {'error': OPERATOR_TIMED_OUT}
 
     def close(self):
-        for item in (self.authority, self._trust):
+        for item in (self.authority, self._trust, self._approval_store):
             if item is not None:
                 item.close()

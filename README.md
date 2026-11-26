@@ -1,8 +1,8 @@
 # Recursion
 
 **Recursion v3** is a provider-neutral agent platform: a harness with its own client,
-execution kernel, context/compaction engine and multi-node fabric, plus adapters for
-supported upstream harnesses. The v3 specifications, research and decision log that used to
+execution kernel and context/compaction engine, plus adapters for supported upstream
+harnesses. A multi-node fabric is a target and is not in this release. The v3 specifications, research and decision log that used to
 live under `docs/` and `state/` moved to csl-research under CSL-536: see
 [`contracts/recursion/history/`](https://github.com/CSL-Laboratories/csl-research/tree/f9d8526acbaf02abb227b38d88ed95e170a1f6d4/contracts/recursion/history). The next product contract
 will be a `PRODUCT.md` in csl-research.

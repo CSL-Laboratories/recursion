@@ -46,7 +46,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
         # Read at daemon start in this build; a later reload may call settings.load again. Nothing at this
         # head uses the values before the lock, so they are read and recorded only by the daemon that holds
         # it: a start refused with AlreadyRunning leaves no record of a file no running daemon holds.
-        loaded = settings.load(os.environ)
+        loaded = settings.load(os.environ)  # the one load: each store the daemon opens takes its value from here
         log.info('settings file: %s', loaded.path or 'none')
         for line in settings.lines(loaded):
             (log.warning if line.startswith(settings.WARNED) else log.info)('settings: %s', line)
@@ -57,7 +57,8 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
             daemon.sweep()
             if not injected:
                 # After the startup sweep: recovered runs are re-observed before any surface can ask.
-                composed = compose_control(daemon, state, plugin_dirs=tuple(plugin_dirs))
+                composed = compose_control(daemon, state, plugin_dirs=tuple(plugin_dirs),
+                                           sqlite_wal_bug=loaded['stores.sqlite_wal_bug'])
                 client, door = composed.client, composed.door
                 plugins = (*plugins, *composed.plugins.registries)
                 composed.control.reconcile()

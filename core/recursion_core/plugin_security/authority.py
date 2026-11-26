@@ -60,7 +60,7 @@ from typing import Callable, ContextManager
 from .approval import SCOPE_FIELDS
 from .breaker import ConnectionBreaker
 from .canonical import MAX_INT, canonical, parse
-from .errors import Refused
+from .errors import Refused, refuse_sqlite_wal_bug, sqlite_wal_accepted
 from .signing import key_id, parse_public_key, verify
 
 __all__ = ["PROFILE_SCHEMA", "Authority", "create_ledger"]
@@ -95,9 +95,10 @@ def _model_version_ok(value: object) -> bool:
     return ConnectionBreaker.model_recordable(value)
 
 
-def create_ledger(path: str, anchor_public_key: str) -> None:
+def create_ledger(path: str, anchor_public_key: str, *, sqlite_wal_bug: str = "refuse") -> None:
     """Installer step: create the ledger bound to one anchor. Refuses if it exists."""
     parse_public_key(anchor_public_key)
+    refuse_sqlite_wal_bug(sqlite_wal_bug, creating=path)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(fd)
     db = sqlite3.connect(path, isolation_level=None)
@@ -112,11 +113,12 @@ def create_ledger(path: str, anchor_public_key: str) -> None:
                    (_LEDGER_MAGIC, key_id(anchor_public_key)))
     finally:
         db.close()
+    sqlite_wal_accepted(sqlite_wal_bug)  # only once the ledger is made
 
 
 class Authority:
     def __init__(self, anchor_public_key: str, ledger_path: str, clock: Callable[[], int],
-                 csl_key_ids: frozenset = frozenset()) -> None:
+                 csl_key_ids: frozenset = frozenset(), *, sqlite_wal_bug: str = "refuse") -> None:
         parse_public_key(anchor_public_key)
         self._anchor_id = key_id(anchor_public_key)
         if self._anchor_id in csl_key_ids:
@@ -125,6 +127,7 @@ class Authority:
         self._clock = clock
         if not os.path.isfile(ledger_path):
             raise Refused("ledger_missing")
+        refuse_sqlite_wal_bug(sqlite_wal_bug)
         self._db = None
         try:
             self._db = sqlite3.connect(ledger_path, isolation_level=None, check_same_thread=False,
@@ -149,6 +152,7 @@ class Authority:
         # (signature hex, canonical bytes) pair; LRU, bounded, own lock (free-threaded safe).
         self._verified: OrderedDict[tuple[str, bytes], None] = OrderedDict()
         self._verified_lock = threading.Lock()
+        sqlite_wal_accepted(sqlite_wal_bug)  # only once the open has succeeded
 
     def _verify(self, signature: object, raw: bytes) -> bool:
         """``verify`` against the anchor, remembering only successes for these exact bytes.

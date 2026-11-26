@@ -26,6 +26,9 @@ def _charge(auth: Authority, envelope, amount, key, scope=None, **overrides):
 
 
 def _child_charges(path: str, anchor: str, envelope: dict, prefix: str, count: int, out) -> None:
+    # This child is a fresh interpreter: it runs on a stubbed repaired SQLite version, as this module does
+    # (setUpModule).
+    sqlite3.sqlite_version = "3.51.3"
     auth = Authority(anchor, path, lambda: 1_000_000)
     ok = 0
     for i in range(count):
@@ -195,6 +198,18 @@ class AuthorityTests(unittest.TestCase):
         for p in procs:
             p.join(60)
         self.assertEqual(sum(out.get(timeout=10) for _ in procs), 10)
+
+
+def setUpModule():
+    # Every store refuses an SQLite with the WAL reset bug unless the person accepts the risk
+    # (daemon/tests/test_sqlite_wal_bug.py). This module tests other behaviour, so it runs on a stubbed
+    # repaired version, whatever SQLite this Python has.
+    import sqlite3
+    import unittest
+    from unittest import mock
+    stub = mock.patch.object(sqlite3, "sqlite_version", "3.51.3")
+    stub.start()
+    unittest.addModuleCleanup(stub.stop)
 
 
 if __name__ == "__main__":

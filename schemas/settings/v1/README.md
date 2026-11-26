@@ -8,6 +8,7 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
 | Setting | Type | Default | What it does |
 |---|---|---|---|
 | `plugin_host.gil_check` | boolean | `true` | Whether each plugin host makes its GIL check; on by default, and a person may turn it off. Read by no host yet. |
+| `stores.sqlite_wal_bug` | text: `refuse` or `accept_risk` | `refuse` | Whether the stores refuse to open on an SQLite with the WAL reset bug (refuse, the default) or open anyway at the person's own risk (accept_risk). Read by the daemon at start and given to each store it opens; with `accept_risk` each store logs a warning naming the SQLite version. |
 
 ## What holds for the file
 
@@ -19,7 +20,8 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
 - Nothing in the product writes it, and no model or plugin writes it: a person keeps what a model proposes.
 - A key the reader does not know is skipped and reported (`settings_unknown_key`); the others are read.
 - A value of the wrong type or outside its range keeps the default (`settings_value_out_of_range`); a
-  value is never clamped.
+  value is never clamped. A text row that lists its texts (`enum`) takes only those; any other text keeps the default with the
+  same note.
 - On a system without an owner check (Windows) no file is read (`settings_not_read_on_this_system`).
 - `python -m recursion_core.settings` shows each setting, its value in force, its default and its source,
   and every note; it takes no argument and writes nothing. The daemon logs the same lines at start.

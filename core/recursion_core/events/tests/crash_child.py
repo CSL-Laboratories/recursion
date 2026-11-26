@@ -144,4 +144,7 @@ def main(argv) -> int:
 
 
 if __name__ == '__main__':
+    # The tests that start this child run every store on a stubbed repaired SQLite version (a store refuses an
+    # SQLite with the WAL reset bug: daemon/tests/test_sqlite_wal_bug.py); this child does the same.
+    sqlite3.sqlite_version = '3.51.3'
     sys.exit(main(sys.argv))

@@ -104,7 +104,9 @@ class SocketAttackTest(ComposedBase):
 
     def test_stale_socket_after_a_sigkilled_daemon_is_cleared_and_the_token_rotates(self):
         script = (
-            'import os, sys, time\n'
+            # The child runs on a stubbed repaired SQLite version, as this module does (setUpModule).
+            'import os, sqlite3, sys, time\n'
+            'sqlite3.sqlite_version = "3.51.3"\n'
             'from pathlib import Path\n'
             'from recursion_core.daemon import Daemon, Registry\n'
             'from recursion_core.daemon import control_adapter as a, launcher\n'
@@ -813,6 +815,18 @@ class RuntimeDirTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(os.stat(door.path).st_mode), 0o600)
         adapter.DeviceDoor(directory, publish=False)
+
+
+def setUpModule():
+    # Every store refuses an SQLite with the WAL reset bug unless the person accepts the risk
+    # (daemon/tests/test_sqlite_wal_bug.py). This module tests other behaviour, so it runs on a stubbed
+    # repaired version, whatever SQLite this Python has.
+    import sqlite3
+    import unittest
+    from unittest import mock
+    stub = mock.patch.object(sqlite3, 'sqlite_version', '3.51.3')
+    stub.start()
+    unittest.addModuleCleanup(stub.stop)
 
 
 if __name__ == '__main__':

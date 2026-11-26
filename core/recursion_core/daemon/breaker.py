@@ -69,12 +69,13 @@ def store_probe_lease_s(routes, route_breaker):
                + [route_breaker.probe_lease_s(deadline) for deadline in deadlines])
 
 
-def open_breaker_store(state_dir, *, clock, probe_lease_seconds=None):
+def open_breaker_store(state_dir, *, clock, probe_lease_seconds=None, sqlite_wal_bug='refuse'):
     """Open the daemon's breaker store, creating it when there is none. Returns ``(store, created)``.
 
     A new store is built under a temporary name and renamed, so a daemon killed part-way never
     leaves a half-made file that a later start would have to refuse. ``probe_lease_seconds`` is
-    ``store_probe_lease_s`` of the loaded routes (the store's default when None).
+    ``store_probe_lease_s`` of the loaded routes (the store's default when None). ``sqlite_wal_bug`` is the
+    person's choice for an SQLite with the WAL reset bug, as the daemon read it once at start.
     """
     require_launcher_platform()  # Windows: typed PlatformUnsupported before any directory or file
     path = store_path(state_dir)
@@ -87,7 +88,7 @@ def open_breaker_store(state_dir, *, clock, probe_lease_seconds=None):
                 os.unlink(leftover)
             except FileNotFoundError:
                 pass
-        create_breaker_store(str(tmp))
+        create_breaker_store(str(tmp), sqlite_wal_bug=sqlite_wal_bug)
         os.replace(tmp, path)
         fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -98,7 +99,7 @@ def open_breaker_store(state_dir, *, clock, probe_lease_seconds=None):
     for item in (path, Path(f'{path}-wal'), Path(f'{path}-shm')):
         _require_own_file(item, required=item == path)
     lease_s =STORE_PROBE_LEASE_S if probe_lease_seconds is None else float(probe_lease_seconds)
-    return StoredBreaker(str(path), clock=clock, probe_lease_seconds=lease_s), created
+    return StoredBreaker(str(path), clock=clock, probe_lease_seconds=lease_s, sqlite_wal_bug=sqlite_wal_bug), created
 
 
 def _require_own_file(path, *, required):

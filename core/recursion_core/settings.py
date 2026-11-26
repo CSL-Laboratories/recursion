@@ -26,7 +26,8 @@ The rules this module keeps:
   the command end with ``EXIT_WARNED``; nothing is ever corrected. So is a quoted key that holds a dot
   (``"plugin_host.gil_check" = ...``): it is never a second spelling of a setting. A value of the wrong type
   or outside its floor and ceiling keeps that setting's default, never a clamped value
-  (``settings_value_out_of_range``). Each note names the key, the value found and what is allowed.
+  (``settings_value_out_of_range``), and so does a text a row does not allow (``Setting.allowed``). Each note
+  names the key, the value found and what is allowed.
 * SHOWN. ``python -m recursion_core.settings`` prints the file path and the values a daemon started
   from this environment would take, with their defaults, sources and any notes. It takes no argument
   and writes nothing. The daemon that holds the one-daemon lock records the path and its values in its
@@ -72,6 +73,7 @@ class Setting:
     says: str
     floor: int | float | None = None
     ceiling: int | float | None = None
+    allowed: tuple[str, ...] = ()  # a text row's only texts (empty: any text); any other keeps the default
 
 
 # Append-only. The type is bool, int, float or str. A row that loosens safety has the safe value as its default,
@@ -79,6 +81,9 @@ class Setting:
 SETTINGS: tuple[Setting, ...] = (
     Setting("plugin_host.gil_check", bool, True,
             "Whether each plugin host makes its GIL check; on by default, and a person may turn it off."),
+    Setting("stores.sqlite_wal_bug", str, "refuse",
+            "Whether the stores refuse to open on an SQLite with the WAL reset bug (refuse, the default) or open anyway at the person's own risk (accept_risk).",
+            allowed=("refuse", "accept_risk")),
 )
 DECLARED = MappingProxyType({row.name: row for row in SETTINGS})
 
@@ -148,6 +153,8 @@ def _shown(value: object) -> str:
 def _allowed(row: Setting) -> str:
     if row.type is bool:
         return "true or false"
+    if row.allowed:
+        return "one of " + " or ".join(_shown(text) for text in row.allowed)
     kind = {int: "a whole number", float: "a number", str: "a text"}[row.type]
     if row.floor is not None and row.ceiling is not None:
         return f"{kind} from {_shown(row.floor)} to {_shown(row.ceiling)}"
@@ -158,7 +165,7 @@ def _fits(row: Setting, value: object) -> bool:
     if row.type is bool:
         return isinstance(value, bool)
     if row.type is str:
-        return isinstance(value, str)
+        return isinstance(value, str) and (not row.allowed or value in row.allowed)
     if isinstance(value, bool) or not isinstance(value, (int, float) if row.type is float else int):
         return False
     if isinstance(value, float) and not math.isfinite(value):

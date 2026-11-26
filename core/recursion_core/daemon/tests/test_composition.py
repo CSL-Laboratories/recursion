@@ -1753,6 +1753,8 @@ class CompositionRootTest(unittest.TestCase):
 
     def run_main(self, **kwargs):
         from recursion_core.daemon import __main__ as entry
+        config = tempfile.TemporaryDirectory()  # an empty config folder: the runner's own settings file is not read
+        self.addCleanup(config.cleanup)
         with mock.patch.object(entry, 'require_free_threaded'), \
                 mock.patch.object(entry, 'check_operator_linger'), \
                 mock.patch.object(entry.signal, 'signal'), \
@@ -1762,7 +1764,7 @@ class CompositionRootTest(unittest.TestCase):
                 mock.patch.object(entry, 'LoopbackGUI') as gui, \
                 mock.patch.object(entry, 'compose_control') as compose, \
                 mock.patch.object(entry.threading, 'Event') as stopped, \
-                mock.patch.dict(entry.os.environ, {'RECURSION_ENGINE_USER': ''}):
+                mock.patch.dict(entry.os.environ, {'RECURSION_ENGINE_USER': '', 'XDG_CONFIG_HOME': config.name}):
             stopped.return_value.wait.side_effect = [False, True]
             order = mock.Mock()
             order.attach_mock(daemon.return_value.sweep, 'sweep')
@@ -1779,7 +1781,7 @@ class CompositionRootTest(unittest.TestCase):
         self.assertIsInstance(manager, launcher.EngineUnitManager)
         composed = compose.return_value
         gui.assert_called_once_with(composed.client, composed.door, plugins=(), port=0)
-        compose.assert_called_once_with(daemon.return_value, mock.ANY, plugin_dirs=())
+        compose.assert_called_once_with(daemon.return_value, mock.ANY, plugin_dirs=(), sqlite_wal_bug='refuse')
         # Sweep first, so recovered runs are observed before any surface can ask; never stop a run on exit.
         self.assertEqual(order, ['sweep', 'compose', 'reconcile', 'sweep', 'reconcile', 'close_control', 'close_daemon'])
         stopped.return_value.wait.assert_called_with(1.5)
@@ -1841,6 +1843,18 @@ class RealUserManagerTest(unittest.TestCase):
         self.assertEqual(kill.confirm(ctx.cgroup, 0.5), POPULATED)
         kill.request_stop(ctx.cgroup)
         self.assertEqual(kill.confirm(ctx.cgroup, 10.0), EMPTY)
+
+
+def setUpModule():
+    # Every store refuses an SQLite with the WAL reset bug unless the person accepts the risk
+    # (daemon/tests/test_sqlite_wal_bug.py). This module tests other behaviour, so it runs on a stubbed
+    # repaired version, whatever SQLite this Python has.
+    import sqlite3
+    import unittest
+    from unittest import mock
+    stub = mock.patch.object(sqlite3, 'sqlite_version', '3.51.3')
+    stub.start()
+    unittest.addModuleCleanup(stub.stop)
 
 
 if __name__ == '__main__':

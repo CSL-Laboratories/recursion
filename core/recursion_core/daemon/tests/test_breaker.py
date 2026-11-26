@@ -146,10 +146,11 @@ class FrozenContractTests(unittest.TestCase):
         def params(function):
             return [(p.name, p.kind.name) for p in inspect.signature(function).parameters.values()]
 
-        self.assertEqual(params(create_breaker_store), [('path', 'POSITIONAL_OR_KEYWORD')])
+        self.assertEqual(params(create_breaker_store), [('path', 'POSITIONAL_OR_KEYWORD'), ('sqlite_wal_bug', 'KEYWORD_ONLY')])
         self.assertEqual(params(StoredBreaker.__init__),
                          [('self', 'POSITIONAL_OR_KEYWORD'), ('store_path', 'POSITIONAL_OR_KEYWORD'),
-                          ('clock', 'KEYWORD_ONLY'), ('probe_lease_seconds', 'KEYWORD_ONLY')])
+                          ('clock', 'KEYWORD_ONLY'), ('probe_lease_seconds', 'KEYWORD_ONLY'),
+                          ('sqlite_wal_bug', 'KEYWORD_ONLY')])
         self.assertEqual([name for name, _ in params(StoredBreaker.bind_run)],
                          ['self', 'run_id', 'connection', 'plugin_id', 'provider', 'model_version'])
         self.assertEqual([name for name, _ in params(StoredBreaker.check)], ['self', 'run_id', 'connection', 'plugin_id'])
@@ -161,6 +162,18 @@ class FrozenContractTests(unittest.TestCase):
         self.assertNotIn('._db', source)
         self.assertNotIn('import sqlite3 as', source)
         self.assertNotIn('.execute(', source)
+
+
+def setUpModule():
+    # Every store refuses an SQLite with the WAL reset bug unless the person accepts the risk
+    # (daemon/tests/test_sqlite_wal_bug.py). This module tests other behaviour, so it runs on a stubbed
+    # repaired version, whatever SQLite this Python has.
+    import sqlite3
+    import unittest
+    from unittest import mock
+    stub = mock.patch.object(sqlite3, 'sqlite_version', '3.51.3')
+    stub.start()
+    unittest.addModuleCleanup(stub.stop)
 
 
 if __name__ == '__main__':

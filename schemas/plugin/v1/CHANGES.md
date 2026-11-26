@@ -17,13 +17,24 @@ On a signed version 1 load from a package folder, every listed file is then read
 code runs. A listed file, or a folder on its path, that is not the daemon user's alone is refused
 `package_file_untrusted`; a listed file whose SHA-256 is not the manifest's is refused
 `package_file_digest_mismatch`; any other name in the package folder or in a folder on a listed
-path, except `manifest.json` and `manifest.sig` at the top, is refused `package_file_unlisted`.
-Each refusal names the path. A missing file is still named first. What it breaks: a signed version
-1 package with a changed or an extra file (a `__pycache__` folder included), or with a file a group
-or other users can write, loaded before as signed and is refused now. No schema changed, and an
-unsigned package is held to nothing new. What the check does not cover: Python reads a listed file
-again when the plugin imports it, after the check, and a module of the same name that the daemon's
-process already holds is handed to the plugin in place of the listed file (`README.md`).
+path, except `manifest.json` and `manifest.sig` at the top, is refused `package_file_unlisted`. Each
+refusal names the path. A missing file is still named first. What it breaks: a signed version 1
+package with a changed or an extra file (a `__pycache__` folder included), or with a file a group or
+other users can write, loaded before as signed and is refused now. No schema changed, and an
+unsigned package is held to nothing new.
+
+Such a load is also refused `package_compiled_file_prefix` while the interpreter keeps its compiled
+files outside the package (`PYTHONPYCACHEPREFIX` or `-X pycache_prefix`, read from
+`sys.pycache_prefix`), because Python would import a compiled file from that prefix in place of a
+checked listed file. The refusal names the prefix and says to start the daemon without it. What it
+breaks: a daemon started with such a prefix loads no signed package from a folder until it is
+started without it.
+
+What the checks do not cover (`README.md`): a listed file changed after the check, which only a
+writer with the daemon user's own rights can do; a module of the same name that Python finds before
+the listed file (one the daemon's process already holds, one built into or frozen in the
+interpreter, or one earlier on the import path than the package folder); and a finder or import hook
+already installed in the daemon's process.
 
 ## `manifest.v1.json` is `1.0-draft.2` (2026-11-18)
 

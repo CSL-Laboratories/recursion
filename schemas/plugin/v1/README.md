@@ -52,25 +52,34 @@ manifest requests permissions, whether the manifest is signed or not. A plugin t
 permissions can still load. `order_after_revoked_key` is null or a developer key ID, the same shape
 as `developer_key_id`; any other value is refused.
 
-For a signed version 1 load, every listed path must name a file in the package. The package
-folder itself and every folder on a listed path must be a real folder: no symbolic link is
-followed. Before any plugin code runs, the loader then reads every listed file: it and every
-folder on its path must belong to the user the daemon runs as and must not be writable by a group
-or other users (`package_file_untrusted`), and its SHA-256 must be the one the manifest lists
+For a signed version 1 load, every listed path must name a file in the package. The package folder
+itself and every folder on a listed path must be a real folder: no symbolic link is followed. Before
+any plugin code runs, the loader then reads every listed file: it and every folder on its path must
+belong to the user the daemon runs as and must not be writable by a group or other users
+(`package_file_untrusted`), and its SHA-256 must be the one the manifest lists
 (`package_file_digest_mismatch`). Nothing else may stand in the package folder or in a folder on a
 listed path (`package_file_unlisted`): only the listed files and, at the top, `manifest.json` and
-`manifest.sig`. A `__pycache__` folder is not exempt, because Python would import its compiled
-files in place of the checked source; once it loads from a package folder, the loader turns off
-the interpreter's writing of compiled files. Each refusal names the path.
+`manifest.sig`. A `__pycache__` folder is not exempt, because Python would import its compiled files
+in place of the checked source; once it loads from a package folder, the loader turns off the
+interpreter's writing of compiled files. For the same reason the load is refused
+(`package_compiled_file_prefix`) while the interpreter keeps its compiled files outside the package,
+under a prefix set by `PYTHONPYCACHEPREFIX` or `-X pycache_prefix` (the loader reads
+`sys.pycache_prefix`): Python would import a compiled file from there in place of a checked listed
+file, and it checks nothing of who can write that folder. Each refusal names the path, or the
+prefix.
 
 So the signature covers the whole package at the moment of the check, and that is where it stops.
-Two cases run code the signature does not cover. First, the loader runs only `plugin.py` from the
-bytes it checked; Python reads every other file again when the plugin imports it, after the check,
-and a file changed in between (only a writer with the daemon user's own rights can) runs as it is
-then. Second, when the daemon's process already holds a module of the same name (imported earlier
-by another plugin or by the daemon itself), Python hands the plugin that module and never reads the
-listed file. An unsigned package is not held to its listing: only `plugin.py` is compared with the
-manifest's digest.
+Three cases still run code the signature does not cover. First, the loader runs only `plugin.py`
+from the bytes it checked; Python reads every other file again when the plugin imports it, after the
+check, and a file changed in between (only a writer with the daemon user's own rights can) runs as
+it is then. Second, Python hands the plugin a module of the same name that it finds before the
+listed file, and never reads the listed file: one the daemon's process already holds (imported
+earlier by another plugin or by the daemon itself), one built into or frozen in the interpreter, or
+one in a folder that comes before the package folder on the import path (where the plugin's own code
+puts its folder after the others). Third, a finder or import hook already installed in the daemon's
+process (by the daemon's own start, a site file of the interpreter, or a plugin loaded earlier) can
+hand the plugin any code for the name of a listed module. An unsigned package is not held to its
+listing: only `plugin.py` is compared with the manifest's digest.
 
 ## What is not decided
 

@@ -64,6 +64,11 @@ PACKAGE_FILE_UNLISTED_TEXT = ("%s is in the plugin's folder but the signed manif
                               "import it in place of a listed file, so the plugin was not loaded and none of its code "
                               "ran: remove it (a __pycache__ folder of compiled files too), or install the package "
                               "again from its source.")
+PACKAGE_COMPILED_FILE_PREFIX_TEXT = ("the interpreter keeps its compiled files outside the plugin's folder, under %s "
+                                     "(PYTHONPYCACHEPREFIX or -X pycache_prefix), and Python would import a compiled "
+                                     "file from there in place of a checked listed file, so the plugin was not loaded "
+                                     "and none of its code ran: start the daemon without that setting (unset "
+                                     "PYTHONPYCACHEPREFIX, drop -X pycache_prefix), then load the plugin again.")
 # The package's own names that a manifest cannot list: the signature's envelope, at the top of the folder only.
 # The entry (plugin.py) is listed in every version 1 manifest, so it needs no exemption. Nothing else is exempt:
 # not a dot-file (a listed path never starts with a dot) and not __pycache__, whose compiled files Python would
@@ -192,6 +197,16 @@ def _owned_by_operator(info: os.stat_result) -> bool:
     return info.st_uid == os.geteuid() and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
 
 
+def _compiled_file_prefix() -> str | None:
+    """The folder outside every package where this interpreter keeps its compiled files, or None.
+
+    Read where the interpreter itself keeps it (``sys.pycache_prefix``), so PYTHONPYCACHEPREFIX, ``-X
+    pycache_prefix`` and a value set in the process all count. For a listed module Python imports a compiled
+    file from there in place of the checked source, and it checks nothing of who can write that folder.
+    """
+    return getattr(sys, "pycache_prefix", None)
+
+
 def _named(rel: str) -> str:
     """A folder as a refusal names it: its path with a slash, or the package folder itself."""
     return rel + "/" if rel else "the plugin's folder"
@@ -282,6 +297,9 @@ def _verify_package(directory: Path, files: tuple) -> None:
     (``package_file_digest_mismatch``). Then every name in the package folder and in the folders on a listed
     path must be a listed file, a folder on a listed path, or at the top one of ``PACKAGE_ENVELOPE``
     (``package_file_unlisted``, which names the first such name in sorted order). Each refusal names the path.
+
+    The caller refuses the load as well while the interpreter keeps its compiled files outside the package
+    (``_compiled_file_prefix``), since Python would import one from there in place of a checked file.
 
     What this does not hold: the files are read again by Python when the plugin imports them itself, after
     this check. Only a writer with the daemon user's own rights can change them in between (the files and
@@ -450,6 +468,9 @@ class PluginLoader:
             # listed file and nothing unlisted, all before any plugin code runs.
             if package_dir is not None and manifest.names_every_file:
                 _verify_package(package_dir, manifest.files)
+                prefix = _compiled_file_prefix()
+                if prefix is not None:
+                    raise Refused("package_compiled_file_prefix", PACKAGE_COMPILED_FILE_PREFIX_TEXT % prefix)
                 package_verified = True
         if artifact is None:
             raise Refused("plugin_file_missing", ENTRY_FILE)
@@ -492,7 +513,8 @@ class PluginLoader:
         Entry bytes supply the entry file when no directory is given. package_dir itself must be
         a folder, not a symbolic link, and no link inside it is followed. For a signed version 1
         manifest every listed file must be there, unchanged and the operator's alone, and nothing
-        unlisted may stand in the folder (``_verify_package``). With a package folder the
+        unlisted may stand in the folder (``_verify_package``), and the interpreter may keep no compiled
+        files outside it (``_compiled_file_prefix``). With a package folder the
         interpreter writes no compiled file from then on (``sys.dont_write_bytecode``), so the
         plugin's own imports leave no ``__pycache__`` in its package.
         """

@@ -6,8 +6,12 @@ the interpreter has ``cryptography``; elsewhere the signature check is a stand-i
 and says nothing about Ed25519. Every case first shows that no plugin code ran before a refusal.
 """
 import hashlib
+import importlib.machinery
+import importlib.util
+import json
 import os
 from pathlib import Path
+import py_compile
 import shutil
 import subprocess
 import sys
@@ -28,6 +32,7 @@ from recursion_core.plugin_security.tests.test_manifest_v1 import v1
 DIGEST = loader_module.PACKAGE_FILE_DIGEST_MISMATCH_TEXT
 UNLISTED = loader_module.PACKAGE_FILE_UNLISTED_TEXT
 UNTRUSTED = loader_module.PACKAGE_FILE_UNTRUSTED_TEXT
+PREFIX = loader_module.PACKAGE_COMPILED_FILE_PREFIX_TEXT
 CORE = str(Path(recursion_core.__file__).resolve().parents[1])
 
 # Run in a child interpreter started with -B, so importing Recursion writes nothing; the child then lets the
@@ -46,6 +51,29 @@ loader = PluginLoader(TrustStore({"dev": developer}), {}, ReservedEffects(), Cor
 loaded = loader.load((package / "manifest.json").read_bytes(), signature, (package / "plugin.py").read_bytes(),
                      package_dir=package)
 print(loaded.trust, sys.dont_write_bytecode, ",".join(sorted(p.name for p in package.iterdir())))
+'''
+
+# Run in a child interpreter that keeps its compiled files under a prefix outside the package (given by the
+# environment or on the command line), through the daemon's own plugin host. With "cut" the loader's reading of
+# the prefix is taken out, to show what Python does without the refusal.
+PREFIX_CHILD = '''
+import json, sys
+from pathlib import Path
+from unittest import mock
+from recursion_core.daemon import plugins
+from recursion_core.plugin_security import loader
+from recursion_core.plugin_security.tests.support import FakeGilProbe
+config, state, stand_in, cut = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3] == "1", sys.argv[4] == "1"
+if stand_in:
+    mock.patch.object(plugins, "backend_available", return_value=True).start()
+    mock.patch("recursion_core.plugin_security.manifest.verify", return_value=True).start()
+if cut:
+    mock.patch.object(loader, "_compiled_file_prefix", return_value=None, create=True).start()
+host = plugins.PluginHost(config, state, gil_probe=FakeGilProbe())
+record, = host.records
+print(json.dumps([sys.pycache_prefix, record.get("state"), record.get("trust"), record.get("code"),
+                  record.get("detail")]))
+host.close()
 '''
 
 
@@ -132,6 +160,13 @@ class SignedPackageContentTests(HostCase):
         self.assertEqual(sorted(p.name for p in self.package.iterdir()),
                          sorted(['lib', 'manifest.json', 'manifest.sig', 'plugin.py', self.helper_file]))
         self.assertEqual(self.load().trust, 'signed')
+
+    def test_the_envelope_names_are_exempt_at_the_top_only(self):
+        for name in ('manifest.json', 'manifest.sig'):
+            with self.subTest(name=name):
+                self.write('lib/' + name, b'{}')
+                self.assertEqual(self.refused().detail, UNLISTED % ('lib/' + name))
+                (self.package / 'lib' / name).unlink()
 
     # -- a listed file changed ----------------------------------------------------------------------------------
     def test_a_listed_module_changed_after_signing_is_refused_naming_it(self):
@@ -250,6 +285,94 @@ class SignedPackageContentTests(HostCase):
         trust, writes, names = child.stdout.split()
         self.assertEqual((trust, writes), ('signed', 'True'))
         self.assertNotIn('__pycache__', names.split(','))
+        self.assertEqual(self.marker.read_text(), 'helper\n')
+
+    # -- no compiled file from outside the package -------------------------------------------------------------
+    def plant_compiled_file(self, prefix):
+        """Whoever can write the prefix folder puts a compiled helper there, in the form Python takes unchecked."""
+        source = self.tmp / 'outside.py'
+        source.write_bytes(('VALUE = "outside"\nwith open(%r, "a") as out:\n    out.write("outside\\n")\n'
+                            % str(self.marker)).encode())
+        with mock.patch.object(sys, 'pycache_prefix', prefix):
+            target = importlib.util.cache_from_source(str(self.package / self.helper_file))
+        self.assertTrue(target.startswith(prefix + os.sep), target)
+        py_compile.compile(str(source), target, doraise=True,
+                           invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+        return target
+
+    def prefix_child(self, prefix, how, cut=False):
+        env = {name: value for name, value in os.environ.items() if name != 'PYTHONPYCACHEPREFIX'}
+        env['PYTHONPATH'] = CORE
+        options = ['-X', 'pycache_prefix=' + prefix] if how == 'option' else []
+        if how == 'environment':
+            env['PYTHONPYCACHEPREFIX'] = prefix
+        child = subprocess.run(
+            [sys.executable, '-B', *options, '-c', PREFIX_CHILD, str(self.config), str(self.state),
+             '0' if self.key is not None else '1', '1' if cut else '0'],
+            env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(child.returncode, 0, child.stderr[-2000:])
+        return json.loads(child.stdout.splitlines()[-1])
+
+    def test_a_compiled_file_prefix_outside_the_package_refuses_the_load_through_the_daemon(self):
+        for how in ('environment', 'option'):
+            with self.subTest(how=how):
+                prefix = str(self.tmp / ('prefix-' + how))
+                self.plant_compiled_file(prefix)
+                # Without the refusal Python runs the planted file in place of the checked helper, as signed.
+                state, trust = self.prefix_child(prefix, how, cut=True)[1:3]
+                self.assertEqual((state, trust, self.marker.read_text()), ('loaded', 'signed', 'outside\n'))
+                self.marker.unlink()
+                seen, state, _, code, detail = self.prefix_child(prefix, how)
+                self.assertEqual((seen, state, code, detail),
+                                 (prefix, 'refused', 'package_compiled_file_prefix', PREFIX % prefix))
+                self.assertFalse(self.marker.exists(), 'plugin code ran before the daemon refused')
+
+    def test_a_compiled_file_prefix_set_in_the_process_is_refused_and_the_doctor_says_so(self):
+        prefix = str(self.tmp / 'prefix')
+        with mock.patch.object(sys, 'pycache_prefix', prefix):
+            with self.assertRaises(Refused) as ctx:
+                self.load()
+            findings = self.loader().doctor(self.raw, self.signature, self.entry, package_dir=self.package)
+            self.assertFalse(self.marker.exists(), 'plugin code ran before the loader refused')
+            unsigned = self.load(trusted=False)  # an unsigned load is held to nothing new
+        self.assertEqual(str(ctx.exception), 'package_compiled_file_prefix: ' + PREFIX % prefix)
+        self.assertEqual((findings[-1]['code'], findings[-1]['severity'], findings[-1]['detail']),
+                         ('package_compiled_file_prefix', 'refuse', PREFIX % prefix))
+        self.assertEqual((unsigned.trust, unsigned.package_verified), ('unsigned', False))
+
+    def test_a_compiled_file_beside_a_listed_module_or_in_a_listed_folder_is_refused(self):
+        source = self.tmp / 'compiled.py'
+        source.write_bytes(b'VALUE = "compiled"\n')
+        cases = (self.module + '.pyc', 'lib/__pycache__/__init__.%s.pyc' % sys.implementation.cache_tag,
+                 self.module + importlib.machinery.EXTENSION_SUFFIXES[0])
+        for rel in cases:
+            with self.subTest(rel=rel):
+                target = self.package / rel
+                target.parent.mkdir(mode=0o700, exist_ok=True)
+                py_compile.compile(str(source), str(target), doraise=True,
+                                   invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+                os.chmod(target, 0o600)
+                shown = 'lib/__pycache__/' if '__pycache__' in rel else rel
+                self.assertEqual(self.refused().detail, UNLISTED % shown)
+                if '__pycache__' in rel:
+                    shutil.rmtree(target.parent)
+                else:
+                    target.unlink()
+
+    def test_a_finder_that_saw_a_removed_shadow_package_still_imports_the_listed_module(self):
+        # Python's finder for a folder keeps the names it saw there, never their bytes, and reads the disk on import.
+        shadow = self.package / self.module
+        shadow.mkdir(mode=0o700)
+        (shadow / '__init__.py').write_bytes(('with open(%r, "a") as out:\n    out.write("shadow\\n")\n'
+                                              % str(self.marker)).encode())
+        self.addCleanup(sys.path_importer_cache.pop, str(self.package), None)
+        seen = os.stat(self.package)
+        spec = importlib.machinery.PathFinder.find_spec(self.module, [str(self.package)])
+        self.assertEqual(spec.origin, str(shadow / '__init__.py'))
+        shutil.rmtree(shadow)
+        os.utime(self.package, ns=(seen.st_atime_ns, seen.st_mtime_ns))  # the finder sees no change in the folder
+        loaded = self.load()
+        self.assertEqual((loaded.trust, loaded.module.VALUE), ('signed', 'signed'))
         self.assertEqual(self.marker.read_text(), 'helper\n')
 
     # -- what is not held to the listing ------------------------------------------------------------------------

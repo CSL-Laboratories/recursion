@@ -347,9 +347,9 @@ class CopyPolicyTests(unittest.TestCase):
         rule = "Bash(python -X utf8 -B tools/test_ci_gate.py)"
         stale = stale_tool_test_rules([rule], self.root)
         message = stale_rules_message(stale)
-        if stale:
-            self.assertIn(json.dumps(rule), message)
-            self.assertIn("so it cannot be told whether git tracks tools/test_ci_gate.py", message)
+        self.assertTrue(stale, "git could not say what it tracks, yet the policy check named no rule")
+        self.assertIn(json.dumps(rule), message)
+        self.assertIn("so it cannot be told whether git tracks tools/test_ci_gate.py", message)
         return stale, message
 
     def assert_no_checkout_advice(self, message):
@@ -369,9 +369,17 @@ class CopyPolicyTests(unittest.TestCase):
         switch = {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                   "GIT_CONFIG_NOSYSTEM": "1"}
         with mock.patch.dict(os.environ, switch):
+            # Ask git itself first, with the same listing call: only a git that still lists
+            # the files with the switch set has not refused, and only then may this test skip.
+            listed = subprocess.run([shutil.which("git"), "-C", str(self.root), "ls-files", "-z",
+                                     "--", "tools"], env=dict(os.environ, LC_ALL="C"),
+                                    capture_output=True, timeout=GIT_TIMEOUT, check=False)
+            if listed.returncode == 0:
+                self.skipTest("this git still lists the files with GIT_TEST_ASSUME_DIFFERENT_OWNER "
+                              "set, so it does not honour the switch and the ownership case "
+                              "cannot be shown here")
             stale, message = self.words_for_one_rule()
-        if not stale:
-            self.skipTest("this git does not honour GIT_TEST_ASSUME_DIFFERENT_OWNER")
+        self.assertTrue(stale, "git refused this checkout, yet the policy check named no rule")
         self.assertIn("git refuses this checkout: another user owns it "
                       "(git says: fatal: detected dubious ownership", message)
         self.assertIn("run this test as the user who owns the checkout", message)

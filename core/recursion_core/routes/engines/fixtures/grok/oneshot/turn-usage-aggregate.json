@@ -1,0 +1,18 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand from headless/reducer/acp.rs:147-169 and extensions/notification.rs:1188-1190 at xai-org/grok-build 2bdd1d6a: a usage line is printed for each model response (ResponseCompleted, which carries messageId, stopReason and signature when the backend reports them) and for the whole turn summed over every model call (TurnUsage, which carries none of them). Two responses of 5 and 7 input tokens, then their sum, 12, then end. The sum line gets no draft, so the calls add up to 12, not 24, and the turn's 12 comes from end. Counts are made up; review 1 of #387 (Codex, R1) gave this sequence.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "usage", "messageId": "resp_1", "stopReason": "tool_use", "usage": {"input_tokens": 5, "output_tokens": 2, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "reasoning_tokens": 0}},
+    {"type": "usage", "messageId": "resp_2", "stopReason": "end_turn", "usage": {"input_tokens": 7, "output_tokens": 2, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "reasoning_tokens": 0}},
+    {"type": "usage", "usage": {"input_tokens": 12, "output_tokens": 4, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "reasoning_tokens": 0}},
+    {"type": "text", "data": "done"},
+    {"type": "end", "stopReason": "end_turn", "sessionId": "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b", "requestId": "req_16", "usage": {"input_tokens": 12, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 4, "reasoning_tokens": 0, "total_tokens": 16}, "num_turns": 2}
+  ],
+  "exit_code": 0,
+  "expect": {
+    "code": null,
+    "drafts": ["engine.output", "usage", "engine.output", "usage", "engine.output", "engine.output", "engine.output", "usage", "result"],
+    "text": "done"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand from headless.rs:1441-1516 at xai-org/grok-build 2bdd1d6a: after end the CLI may run a memory flush, a model call whose session updates go through the same emitter, so lifecycle, text and usage lines can follow end (reducer acp.rs: MemoryFlushStarted, MemoryFlushCompleted). The flush's text is not the turn's answer; its usage is real usage on the connection.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "text", "data": "Answer: 42"},
+    {"type": "end", "stopReason": "end_turn", "sessionId": "aa11bb22-cc33-4d44-8e55-ff6677889900", "requestId": "req_14", "usage": {"input_tokens": 50, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 5, "reasoning_tokens": 0, "total_tokens": 55}, "num_turns": 1, "modelUsage": {"grok-4.6": {"inputTokens": 50, "outputTokens": 5, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0, "modelCalls": 1, "costUSD": 0.0001}}, "total_cost_usd": 0.0001, "total_cost_usd_ticks": 1000000},
+    {"type": "memory_flush_started"},
+    {"type": "text", "data": "Saved: the answer is 42."},
+    {"type": "usage", "messageId": "resp_flush_1", "stopReason": "end_turn", "usage": {"input_tokens": 60, "output_tokens": 8, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "reasoning_tokens": 0}},
+    {"type": "memory_flush_completed", "result": "flushed", "path": "memory/notes.md"}
+  ],
+  "exit_code": 0,
+  "expect": {
+    "code": null,
+    "drafts": ["engine.output", "engine.output", "usage", "engine.output", "engine.output", "engine.output", "usage", "engine.output", "result"],
+    "text": "Answer: 42"
+  }
+}

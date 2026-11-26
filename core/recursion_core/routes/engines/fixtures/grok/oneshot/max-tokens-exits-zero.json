@@ -1,0 +1,15 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand. headless.rs:1397-1411 at xai-org/grok-build 2bdd1d6a writes end and returns Ok, so the process exits 0, for every stop reason but the max-turns one (vault record 20261109-csl815-grok-route-outcome-recording-01 F5): exit 0 with stopReason max_tokens is not a success.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "text", "data": "Here is the first half of the"},
+    {"type": "end", "stopReason": "max_tokens", "sessionId": "5d2c7a10-9b3e-4f61-8c24-71a0e6b9d3f2", "requestId": "req_9", "usage": {"input_tokens": 120, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 4096, "reasoning_tokens": 0, "total_tokens": 4216}, "num_turns": 1, "modelUsage": {"grok-4.6": {"inputTokens": 120, "outputTokens": 4096, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0, "modelCalls": 1}}, "cost_is_partial": true}
+  ],
+  "exit_code": 0,
+  "expect": {
+    "code": "engine_error",
+    "drafts": ["engine.output", "engine.output", "usage", "result"],
+    "text": "Here is the first half of the"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand. A 503 or 529 is not ACP -32003: error.rs:143-145 at xai-org/grok-build 2bdd1d6a sends it as an internal error carrying http_status (vault record 20261109-csl815-grok-route-outcome-recording-01 F1, rule R5), and headless.rs prints such an error's text in an error line, with the spend fields frozen so far (headless.rs:1423-1433; headless guide lines 205-210). The message text and the counts are made up.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "text", "data": "Starting on it"},
+    {"type": "usage", "messageId": "resp_1", "stopReason": "tool_use", "usage": {"input_tokens": 300, "output_tokens": 20, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "reasoning_tokens": 0}},
+    {"type": "error", "message": "Internal error: upstream service unavailable (http_status 503)", "usage": {"input_tokens": 300, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 20, "reasoning_tokens": 0, "total_tokens": 320}, "num_turns": 1}
+  ],
+  "exit_code": 1,
+  "expect": {
+    "code": "engine_error",
+    "drafts": ["engine.output", "engine.output", "usage", "engine.output", "usage", "result"],
+    "text": "Starting on it"
+  }
+}

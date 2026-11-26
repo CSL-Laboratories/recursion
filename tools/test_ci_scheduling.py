@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import hashlib
 import importlib.util
 import io
 import itertools
@@ -19,6 +20,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1113,6 +1115,216 @@ class CrossLaneAdmissionTests(unittest.TestCase):
         self.assertIn('with state_path.open("x", encoding="utf-8") as handle:', publisher)
         _crosslane_publisher_thin_call(writer["publish"])
         self.assertNotRegex(_crosslane_text("claude-conflict-writer.yml"), r"MAX_ATTEMPTS = (?!3\b)")
+
+
+# --- the gate runs inside a slice of the runner user's own systemd user manager ---
+USER_MANAGER_STEP = "Start the user service manager"
+GATE_SCOPE = "systemd-run --user --scope --quiet --slice=gate.slice -- python -X utf8 -B tools/ci_gate.py --force"
+# Master's text of the two jobs that must not change with this one (the job_block body of each).
+WINDOWS_BLOCK = (
+    "    name: windows\n"
+    "    needs: [preflight, settle, linux]\n"
+    "    if: >\n"
+    "      always() && !cancelled() &&\n"
+    "      needs.preflight.result == 'success' &&\n"
+    "      needs.linux.result == 'success' &&\n"
+    "      needs.preflight.outputs.paid == 'true' &&\n"
+    "      needs.preflight.outputs.run_full == 'true' &&\n"
+    "      ((github.event_name == 'pull_request' && github.event.action == 'synchronize' && needs.settle.result == 'success') ||\n"
+    "       (!(github.event_name == 'pull_request' && github.event.action == 'synchronize') && needs.settle.result == 'skipped')) &&\n"
+    "      (github.event_name == 'push' ||\n"
+    "       github.event_name == 'workflow_dispatch' ||\n"
+    "       (github.event_name == 'pull_request' && github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci:full')))\n"
+    "    runs-on: windows-2025\n"
+    "    timeout-minutes: 20\n"
+    "    steps:\n"
+    "      - name: Enable Git long paths\n"
+    "        run: git config --global core.longpaths true\n"
+    "\n"
+    "      - uses: actions/checkout@v4\n"
+    "        with:\n"
+    "          fetch-depth: 0\n"
+    "\n"
+    "      - name: Set up Python\n"
+    "        uses: actions/setup-python@v5\n"
+    "        with:\n"
+    "          python-version: \"3.12\"\n"
+    "\n"
+    "      - name: Install dependencies\n"
+    "        working-directory: ${{ runner.temp }}\n"
+    "        env:\n"
+    "          REQUIREMENTS_CI: ${{ github.workspace }}/requirements-ci.txt\n"
+    "        shell: bash\n"
+    "        run: 'python -P -m pip install --only-binary=:all: -r \"$REQUIREMENTS_CI\"'\n"
+    "\n"
+    "      - name: Provider-free gate\n"
+    "        run: python -X utf8 -B tools/ci_gate.py --force\n"
+    "\n"
+)
+MACOS_BLOCK = (
+    "    name: macos\n"
+    "    needs: [preflight, settle, linux]\n"
+    "    if: >\n"
+    "      always() && !cancelled() &&\n"
+    "      needs.preflight.result == 'success' &&\n"
+    "      needs.linux.result == 'success' &&\n"
+    "      needs.preflight.outputs.paid == 'true' &&\n"
+    "      needs.preflight.outputs.run_full == 'true' &&\n"
+    "      ((github.event_name == 'pull_request' && github.event.action == 'synchronize' && needs.settle.result == 'success') ||\n"
+    "       (!(github.event_name == 'pull_request' && github.event.action == 'synchronize') && needs.settle.result == 'skipped')) &&\n"
+    "      (github.event_name == 'workflow_dispatch' ||\n"
+    "       (github.event_name == 'pull_request' && github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci:full')))\n"
+    "    runs-on: macos-latest\n"
+    "    timeout-minutes: 15\n"
+    "    steps:\n"
+    "      - uses: actions/checkout@v4\n"
+    "        with:\n"
+    "          fetch-depth: 0\n"
+    "\n"
+    "      - name: Set up Python\n"
+    "        uses: actions/setup-python@v5\n"
+    "        with:\n"
+    "          python-version: \"3.12\"\n"
+    "\n"
+    "      - name: Install dependencies\n"
+    "        working-directory: ${{ runner.temp }}\n"
+    "        env:\n"
+    "          REQUIREMENTS_CI: ${{ github.workspace }}/requirements-ci.txt\n"
+    "        shell: bash\n"
+    "        run: 'python -P -m pip install --only-binary=:all: -r \"$REQUIREMENTS_CI\"'\n"
+    "\n"
+    "      - name: Provider-free gate\n"
+    "        run: python -X utf8 -B tools/ci_gate.py --force\n"
+)
+# The other jobs, by the SHA-256 of master's job_block body.
+OTHER_JOB_SHA256 = {
+    "preflight": "672d7f6900206685ef383cb93c37159c3e0ddfa9c9b707c28e48c22cd5a829a4",
+    "settle": "45486165c67270ef345a87e870e622eceee405cdabcc8ca5f1a039228174ab9d",
+    "linux": "555ffeb0bc45f86483daebcbe52715afde3f79b9664b4059706719e9b06023d6",
+}
+# Stand-ins for the setup step: none starts, stops or changes anything real.
+_STAND_INS = {
+    # sudo records its words and answers as told; it never runs what it was given.
+    "sudo": 'printf "sudo %s\\n" "$*" >> "$STAND_IN_LOG"; exit "${FAKE_SUDO_RC:-0}"\n',
+    # timeout drops its bound and runs the rest (macOS has no timeout of its own).
+    "timeout": 'printf "timeout %s\\n" "$1" >> "$STAND_IN_LOG"; shift; exec "$@"\n',
+    "systemctl": 'printf "systemctl %s XDG=%s\\n" "$*" "${XDG_RUNTIME_DIR:-}" >> "$STAND_IN_LOG"; exit "${FAKE_MANAGER_RC:-0}"\n',
+    "systemd-run": 'printf "systemd-run %s XDG=%s\\n" "$*" "${XDG_RUNTIME_DIR:-}" >> "$STAND_IN_LOG"; exit "${FAKE_SCOPE_RC:-0}"\n',
+    "sleep": 'printf "sleep %s\\n" "$*" >> "$STAND_IN_LOG"\n',
+}
+
+
+def _job_step_names(block: str) -> list[str]:
+    return re.findall(r"(?m)^      - name: (.*)$", block)
+
+
+class UserManagerTests(unittest.TestCase):
+    """The live tests of process handling run only in a slice of the runner user's own manager."""
+
+    def setUp(self) -> None:
+        self.tests = job_block("linux-tests")
+
+    def _setup_run(self) -> str:
+        return step_run(step_block(self.tests, USER_MANAGER_STEP))
+
+    def test_a_step_before_the_gate_starts_the_user_manager_and_waits_for_it(self) -> None:
+        names = _job_step_names(self.tests)
+        self.assertIn(USER_MANAGER_STEP, names)
+        self.assertLess(names.index(USER_MANAGER_STEP), names.index("Provider-free gate"))
+        self.assertEqual(names.index(USER_MANAGER_STEP) + 1, names.index("Provider-free gate"))
+        script = self._setup_run()
+        for needle in ('sudo -n timeout 30 loginctl enable-linger "$user"',
+                       'sudo -n timeout 30 systemctl start "user@$uid.service"',
+                       'XDG_RUNTIME_DIR="$runtime" timeout 5 systemctl --user show-environment',
+                       'XDG_RUNTIME_DIR="$runtime" timeout 5 systemd-run --user --scope --quiet --slice=gate.slice -- true',
+                       'echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"'):
+            self.assertIn(needle, script)
+        # Every call that can wait carries its own bound; the job's own backstop stays 15 minutes.
+        for line in script.splitlines():
+            if re.search(r"\b(systemctl|loginctl|systemd-run)\b", line) and not line.lstrip().startswith("echo"):
+                self.assertIn("timeout ", line, line)
+        self.assertIn("tries=30\n", script)
+        self.assertIn('for try in $(seq "$tries"); do', script)
+        # The runtime folder reaches later steps through the job's environment file, never the gate's env.
+        self.assertEqual(step_env(step_block(self.tests, "Provider-free gate")),
+                         {"CI_BASE_SHA": "${{ github.event.pull_request.base.sha || github.event.before }}"})
+        self.assertNotIn("${{", step_block(self.tests, USER_MANAGER_STEP))
+
+    def test_the_gate_runs_inside_a_scope_of_the_user_manager(self) -> None:
+        gate = step_run(step_block(self.tests, "Provider-free gate"))
+        self.assertEqual(gate, GATE_SCOPE)
+        self.assertIn("tools/ci_gate.py --force", gate)
+        # The scope and the manager belong to this job alone.
+        for word in ("systemd-run", "enable-linger", "show-environment", "gate.slice"):
+            self.assertEqual(TEXT.count(word), self.tests.count(word), word)
+
+    def test_a_manager_that_does_not_come_up_stops_the_job_with_words(self) -> None:
+        script = self._setup_run()
+        self.assertNotIn("ci_gate", script)
+        self.assertNotIn("continue-on-error", step_block(self.tests, USER_MANAGER_STEP))
+        self.assertNotIn("if:", step_block(self.tests, USER_MANAGER_STEP))
+        errors = [line for line in script.splitlines() if "::error::" in line]
+        self.assertEqual(len(errors), 1)
+        for words in ("user@$uid.service", "systemctl --user show-environment", "would skip", "Rerun"):
+            self.assertIn(words, errors[0])
+
+    @unittest.skipIf(os.name == "nt", "the setup step runs on Linux; its stand-ins are POSIX scripts")
+    def test_setup_step_under_stand_ins(self) -> None:
+        script = self._setup_run()
+        uid = str(os.getuid())
+        cases = {
+            "up": ({}, 0),
+            "sudo refused": ({"FAKE_SUDO_RC": "1"}, 1),
+            "manager never answers": ({"FAKE_MANAGER_RC": "1"}, 1),
+            "scope refused": ({"FAKE_SCOPE_RC": "1"}, 1),
+        }
+        for label, (extra, want) in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                bindir = Path(tmp) / "bin"
+                bindir.mkdir()
+                for name, body in _STAND_INS.items():
+                    path = bindir / name
+                    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+                    path.chmod(0o755)
+                log, env_file, step = Path(tmp) / "log", Path(tmp) / "github_env", Path(tmp) / "step.sh"
+                log.write_text("", encoding="utf-8")
+                env_file.write_text("", encoding="utf-8")
+                step.write_text(script, encoding="utf-8")
+                proc = subprocess.run(
+                    [find_bash(), "--noprofile", "--norc", "-eo", "pipefail", str(step)],
+                    env={**os.environ, **extra, "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}",
+                         "STAND_IN_LOG": str(log), "GITHUB_ENV": str(env_file)},
+                    capture_output=True, text=True, timeout=60, check=False,
+                )
+                calls = log.read_text(encoding="utf-8").splitlines()
+                written = env_file.read_text(encoding="utf-8").splitlines()
+                errors = [line for line in proc.stdout.splitlines() if line.startswith("::error::")]
+                if want == 0:
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(errors, [])
+                    self.assertIn(f"XDG_RUNTIME_DIR=/run/user/{uid}", written)
+                    self.assertTrue(set(line.split("=", 1)[0] for line in written)
+                                    <= {"XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"}, written)
+                    self.assertIn(f"systemctl --user show-environment XDG=/run/user/{uid}", calls)
+                    self.assertIn(f"systemd-run --user --scope --quiet --slice=gate.slice -- true XDG=/run/user/{uid}",
+                                  calls)
+                else:
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertEqual(len(errors), 1, proc.stdout)
+                    self.assertEqual(written, [])
+                if label == "sudo refused":
+                    self.assertFalse(any(line.startswith("systemctl --user") for line in calls), calls)
+                    self.assertFalse(any(line.startswith("sleep") for line in calls), calls)
+                if label in ("manager never answers", "scope refused"):
+                    # The wait is bounded by its count of tries, one pause less than the tries.
+                    self.assertEqual(sum(line.startswith("sleep") for line in calls), 29, calls)
+
+    def test_no_other_job_changed(self) -> None:
+        # Master's own text: green at the base, a guard for every change to this job.
+        self.assertEqual(job_block("windows"), WINDOWS_BLOCK)
+        self.assertEqual(job_block("macos"), MACOS_BLOCK)
+        for job, digest in OTHER_JOB_SHA256.items():
+            self.assertEqual(hashlib.sha256(job_block(job).encode("utf-8")).hexdigest(), digest, job)
 
 if __name__ == "__main__":
     unittest.main()

@@ -176,8 +176,8 @@ class PrintedWayOutRunsTests(_AnswerCase):
             status, said, _out = self.main(argv)
             self.assertEqual(1, status)
             printed = shlex.split(_between(said, "or run: ", " (it asks"))
-            self.assertEqual(["recursion", "plugin", "unpin", PLUGIN, "--config", str(work / "other-profile")],
-                             printed)
+            self.assertEqual(["recursion", "plugin", "unpin", PLUGIN, "--config", str(work / "other-profile"),
+                              "--state", str(self.state.absolute())], printed)
             status, said, _out = self.main(printed[1:], "yes\n")
             self.assertEqual(0, status, said)
             self.assertEqual({}, self.live_json()["pins"])
@@ -195,7 +195,7 @@ class PrintedWayOutRunsTests(_AnswerCase):
             del argv[at:at + 2]
             status, said, _out = self.main(argv)
             self.assertEqual(1, status)
-            self.assertEqual(["recursion", "plugin", "unpin", PLUGIN],
+            self.assertEqual(["recursion", "plugin", "unpin", PLUGIN, "--state", str(self.state.absolute())],
                              shlex.split(_between(said, "or run: ", " (it asks")))
 
 

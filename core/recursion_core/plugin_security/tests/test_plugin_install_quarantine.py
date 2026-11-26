@@ -387,7 +387,8 @@ class WayOutTests(_QuarantineCase):
                          tuple(listed[0][key] for key in ("plugin_id", "version", "held_at", "asks", "damaged")))
         self.assertIn(f"{self.held_at()} does not read", listed[0]["next"])
         self.assertIn(f"Run: {self.drop_words}", listed[0]["next"])
-        status, said, out = self.main(["plugin", "quarantine", "list", "--config", str(self.config)])
+        status, said, out = self.main(["plugin", "quarantine", "list", "--config", str(self.config), "--state",
+                                       str(self.state)])
         self.assertEqual((0, ""), (status, said))
         self.assertEqual(listed, json.loads(out)["held"])
         result = self.call("quarantine_drop", PLUGIN)

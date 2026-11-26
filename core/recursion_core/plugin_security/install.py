@@ -102,6 +102,11 @@ release again and installs it only after the user's typed yes, with a new grant 
 ``quarantine_drop`` moves the held files into a kept place and names it. Nothing is accepted by a flag or a
 default.
 
+Every command this module prints for a person (``_command``) names the places the running command used: the
+profile with ``--config`` and the state folder with ``--state``, each as an absolute path quoted for the shell,
+unless it is the default place by the command line's one rule. A command run with no state folder prints no
+``--state``. Where no default place can be resolved (no home and no XDG variable), both places are named.
+
 A read or write the system refuses (a full or read-only disk, no permission) raises the typed refusal
 ``filesystem_refused``, which keeps the system's message; no caller gets a bare ``OSError``.
 """
@@ -400,26 +405,60 @@ def _confirmed(confirm, question: str) -> bool:
     return type(answer) is str and answer.strip() == "yes"
 
 
-def _command(config, *words: str) -> str:
-    """The command ``recursion plugin <words>`` for the profile ``config``: with ``--config`` and its absolute
-    path, unless ``config`` is the default profile."""
-    from ._entrypoints import _config_dir  # the one rule for the default profile
+@dataclass(frozen=True)
+class _Places:
+    """The profile and the state folder one command runs with, as its entry was given them, and whether each
+    is the default place. Every command printed for a person is built from these and nothing else."""
 
+    config: Path
+    state: Path | None
+    config_default: bool
+    state_default: bool
+
+
+def _places(config, state) -> _Places:
+    """The places of the running command, resolved once at its entry by the command line's one rule for each
+    default place. A state of None (a library call without one) is no place: no ``--state`` is printed."""
+    from ._entrypoints import _config_dir, _state_dir  # the one rule for each default place
+
+    config_path = Path(config)
+    state_path = None if state is None else Path(state)
+    return _Places(config_path, state_path, _is_default(config_path, _config_dir),
+                   state_path is not None and _is_default(state_path, _state_dir))
+
+
+def _is_default(path: Path, rule) -> bool:
+    """True when ``path`` is the place ``rule(None)`` names. With no home and no XDG variable no default can be
+    resolved: the place is then named in every printed command, and nothing raises."""
+    try:
+        default = rule(None)
+    except RuntimeError:
+        return False
+    return path.absolute() == default.absolute()
+
+
+def _command(places: _Places, *words: str) -> str:
+    """The command ``recursion plugin <words>`` in the places of the running command: ``--config`` with the
+    profile's absolute path unless it is the default profile, and ``--state`` with the state folder's absolute
+    path unless it is the default state folder or the command ran with none. The one builder of every command
+    this module prints for a person."""
     line = " ".join(["recursion", "plugin", *words])
-    if Path(config).absolute() == _config_dir(None).absolute():
-        return line
-    return f"{line} --config {_shown(config)}"
+    if not places.config_default:
+        line = f"{line} --config {_shown(places.config)}"
+    if places.state is not None and not places.state_default:
+        line = f"{line} --state {_shown(places.state)}"
+    return line
 
 
 def _next_pin(snapshot: Snapshot, manifest, trust_name: str, signer, reason: str, signature_text, confirm,
-              config=None, grants=None):
+              places: _Places, grants=None):
     """The pin this release leaves, or None. A pinned plugin's release that is not signed by a trusted key
     refuses; one signed by another trusted key moves the pin only after the user's typed yes."""
     held = snapshot.pins.get(manifest.plugin_id)
     if held is None:
         return {"signer_key_id": signer, "version": manifest.version} if trust_name == "signed" else None
     if trust_name != "signed":
-        raise _update_refused(manifest, held["signer_key_id"], reason, signature_text, config,
+        raise _update_refused(manifest, held["signer_key_id"], reason, signature_text, places,
                               _trusted_ids(snapshot))
     if signer != held["signer_key_id"]:
         question = (f"The plugin {manifest.plugin_id} is pinned to the key {held['signer_key_id']}; this release "
@@ -445,7 +484,8 @@ def _grant_after(snapshot: Snapshot, grants, plugin_id: str, signer: str) -> str
     return "it holds no grant"
 
 
-def _update_refused(manifest, key: str, reason: str, signature_text, config=None, trusted=None) -> InstallRefused:
+def _update_refused(manifest, key: str, reason: str, signature_text, places: _Places,
+                    trusted=None) -> InstallRefused:
     """``update_unsigned_over_signed``: what failed, and the two ways forward."""
     plugin_id = manifest.plugin_id
     if signature_text is None:
@@ -462,7 +502,7 @@ def _update_refused(manifest, key: str, reason: str, signature_text, config=None
     return InstallRefused("update_unsigned_over_signed", detail=(
         f"The plugin {plugin_id} is pinned to the key {key}, and its release {manifest.version} {what}. Nothing "
         f"was written: the installed release, its grant and its generation are as they were. "
-        f"{forward}, or run: {_command(config, 'unpin', plugin_id)} (it asks a typed yes, then drops the pin "
+        f"{forward}, or run: {_command(places, 'unpin', plugin_id)} (it asks a typed yes, then drops the pin "
         f"and every grant of {plugin_id}, which stays installed as a local unsigned plugin)."), show_detail=True)
 
 
@@ -532,6 +572,7 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, report_kept=Non
     signature_text = chosen.signature_text
     _finish_publish(config)
     snapshot = _load_snapshot(config)
+    places = _places(config, state)
     trust_name, reason, grants, findings, signer = _admit(snapshot, manifest, signature_text, chosen.artifact,
                                                            chosen.label, state)
     refused = [item for item in findings if item.get("severity") == "refuse"]
@@ -541,9 +582,9 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, report_kept=Non
     if manifest.plugin_id in snapshot.pins and trust_name == "signed" and running is not None:
         asks = _asks_for_more(parse_manifest(running.manifest), manifest)
         if asks:
-            return _hold(config, chosen, manifest, asks)
+            return _hold(places, chosen, manifest, asks)
     pins = dict(snapshot.pins)
-    pin = _next_pin(snapshot, manifest, trust_name, signer, reason, signature_text, confirm, config, grants)
+    pin = _next_pin(snapshot, manifest, trust_name, signer, reason, signature_text, confirm, places, grants)
     if pin is not None:
         pins[manifest.plugin_id] = pin
     plugins = dict(snapshot.plugins)
@@ -579,8 +620,8 @@ def quarantine_list(config: os.PathLike | str, *, state: os.PathLike | str | Non
     """Each held release: its plugin, version, place and what more it asks than the running release. A held
     release that does not read is a row marked ``damaged``, with no asks and the command that drops it."""
     _require_platform()
-    del state
     config_path = Path(config)
+    places = _places(config_path, state)
     fd = _lock(config_path, wait=wait)
     try:
         _finish_publish(config_path)
@@ -595,12 +636,13 @@ def quarantine_list(config: os.PathLike | str, *, state: os.PathLike | str | Non
                     continue
                 for version in sorted(os.listdir(folder)):
                     try:
-                        manifest = _held_manifest(folder / version, plugin_id, _read_held(folder / version))
+                        manifest = _held_manifest(folder / version, plugin_id, _read_held(folder / version, places),
+                                                  places)
                     except InstallRefused:
                         if _VERSION_DIR.fullmatch(version) is not None:
                             rows.append({"plugin_id": plugin_id, "version": version,
                                          "held_at": str(folder / version), "asks": [], "damaged": True,
-                                         "next": _damaged(folder / version, plugin_id)})
+                                         "next": _damaged(folder / version, plugin_id, places)})
                         continue
                     running = snapshot.plugins.get(plugin_id)
                     rows.append({"plugin_id": plugin_id, "version": version, "held_at": str(folder / version),
@@ -621,23 +663,24 @@ def quarantine_accept(config: os.PathLike | str, plugin_id: str, *, state: os.Pa
     """
     _require_platform()
     config_path = Path(config)
+    places = _places(config_path, state)
     if not _plugin_id_ok(plugin_id):
-        raise NothingChanged(_nothing_held(config_path, None))
+        raise NothingChanged(_nothing_held(places, None))
     fd = _lock(config_path, wait=wait)
     try:
         _finish_publish(config_path)
         folder = _held_folder(config_path, plugin_id, create=False)
         names = sorted(os.listdir(folder)) if folder is not None else []
         if not names:
-            raise NothingChanged(_nothing_held(config_path, plugin_id))
+            raise NothingChanged(_nothing_held(places, plugin_id))
         if len(names) != 1 or _VERSION_DIR.fullmatch(names[0]) is None:
             raise InstallRefused("plugin_directory_untrusted", detail=(
                 f"The folder {folder} holds more than one release, or an entry this command did not write. Run: "
-                f"{_command(config_path, 'quarantine', 'drop', plugin_id)}; then install the release again."),
+                f"{_command(places, 'quarantine', 'drop', plugin_id)}; then install the release again."),
                 show_detail=True)
         held = folder / names[0]
-        files = _read_held(held)
-        manifest = _held_manifest(held, plugin_id, files)
+        files = _read_held(held, places)
+        manifest = _held_manifest(held, plugin_id, files, places)
         label = files[_HELD_LABEL].decode("ascii").strip()
         signature = files.get("manifest.sig")
         signature_text = None if signature is None else signature.decode("ascii", "replace").strip()
@@ -649,7 +692,7 @@ def quarantine_accept(config: os.PathLike | str, plugin_id: str, *, state: os.Pa
             raise InstallRefused(refused[0]["code"], [item["code"] for item in refused])
         if plugin_id in snapshot.pins and trust_name != "signed":
             raise _update_refused(manifest, snapshot.pins[plugin_id]["signer_key_id"], reason, signature_text,
-                                  config_path, _trusted_ids(snapshot))
+                                  places, _trusted_ids(snapshot))
         granted = tuple(perm for perm in manifest.permissions if perm != "order")
         running = snapshot.plugins.get(plugin_id)
         asks = _asks_for_more(None if running is None else parse_manifest(running.manifest), manifest)
@@ -662,7 +705,7 @@ def quarantine_accept(config: os.PathLike | str, plugin_id: str, *, state: os.Pa
         grants = dict(grants)
         grants[plugin_id] = Grant(plugin_id, manifest.artifact_sha256, signer, granted)
         pins = dict(snapshot.pins)
-        pin = _next_pin(snapshot, manifest, trust_name, signer, reason, signature_text, confirm, config_path, grants)
+        pin = _next_pin(snapshot, manifest, trust_name, signer, reason, signature_text, confirm, places, grants)
         if pin is not None:
             pins[plugin_id] = pin
         developer_key_ids = {key: value for key, value in snapshot.developer_key_ids.items() if key != plugin_id}
@@ -674,7 +717,7 @@ def quarantine_accept(config: os.PathLike | str, plugin_id: str, *, state: os.Pa
                            labels, plugins, developer_key_ids, pins=pins, pins_held=snapshot.pins_held)
         notes = []
         generation = _commit(config_path, updated, notes, report_kept)
-        notes.extend(_drop_held_copy(held, files))
+        notes.extend(_drop_held_copy(held, files, places))
         return _with_notes({"command": "quarantine accept", "plugin_id": plugin_id, "version": manifest.version,
                             "generation": generation, "trust": trust_name, "granted": list(granted),
                             "order": "not granted", "plugins": _rows(updated)}, notes)
@@ -687,26 +730,26 @@ def quarantine_drop(config: os.PathLike | str, plugin_id: str, *, state: os.Path
                     wait: bool = True) -> dict:
     """Move the held release of ``plugin_id`` into a kept place and name it. Nothing is deleted."""
     _require_platform()
-    del state
     config_path = Path(config)
+    places = _places(config_path, state)
     if not _plugin_id_ok(plugin_id):
-        raise NothingChanged(_nothing_held(config_path, None))
+        raise NothingChanged(_nothing_held(places, None))
     fd = _lock(config_path, wait=wait)
     try:
         folder = _held_folder(config_path, plugin_id, create=False)
         names = sorted(os.listdir(folder)) if folder is not None else []
         if not names:
-            raise NothingChanged(_nothing_held(config_path, plugin_id))
+            raise NothingChanged(_nothing_held(places, plugin_id))
         return _with_notes({"command": "quarantine drop", "plugin_id": plugin_id},
                            _set_aside(config_path, plugin_id, folder, names))
     finally:
         os.close(fd)
 
 
-def _nothing_held(config: Path, plugin_id: str | None) -> str:
+def _nothing_held(places: _Places, plugin_id: str | None) -> str:
     which = "of that id" if plugin_id is None else f"of the plugin {plugin_id}"
     return (f"no release {which} is held in quarantine; nothing was written. To see what is held run: "
-            f"{_command(config, 'quarantine', 'list')}")
+            f"{_command(places, 'quarantine', 'list')}")
 
 
 def _asks_for_more(running, release) -> list:
@@ -725,12 +768,13 @@ def _asks_for_more(running, release) -> list:
             for what in more]
 
 
-def _hold(config: Path, chosen, manifest, asks: list) -> dict:
+def _hold(places: _Places, chosen, manifest, asks: list) -> dict:
     """Keep the checked files of a release that asks for more under ``plugin-quarantine/<id>/<version>/``.
 
     Nothing is installed and no generation is written. A release held before for this plugin is moved into a
     kept place and named; the same release, byte for byte, is left as it is.
     """
+    config = places.config
     plugin_id, version = manifest.plugin_id, manifest.version
     if _VERSION_DIR.fullmatch(version) is None:
         raise InstallRefused("release_version")
@@ -743,7 +787,7 @@ def _hold(config: Path, chosen, manifest, asks: list) -> dict:
     names = sorted(os.listdir(folder))
     notes = []
     try:
-        same = names == [version] and _read_held(held) == files
+        same = names == [version] and _read_held(held, places) == files
     except InstallRefused:
         same = False
     if not same:
@@ -759,9 +803,9 @@ def _hold(config: Path, chosen, manifest, asks: list) -> dict:
         _sync_dir(folder)
     step = (f"The release {version} of the plugin {plugin_id} was not installed: it is held at {held}, and the "
             f"running release stays live with its grant. To install it run: "
-            f"{_command(config, 'quarantine', 'accept', plugin_id)} (it asks a typed yes); to drop it run: "
-            f"{_command(config, 'quarantine', 'drop', plugin_id)}; to see what is held run: "
-            f"{_command(config, 'quarantine', 'list')}")
+            f"{_command(places, 'quarantine', 'accept', plugin_id)} (it asks a typed yes); to drop it run: "
+            f"{_command(places, 'quarantine', 'drop', plugin_id)}; to see what is held run: "
+            f"{_command(places, 'quarantine', 'list')}")
     return _with_notes({"command": "install", "result": "quarantined", "plugin_id": plugin_id, "version": version,
                         "trust": "signed", "held_at": str(held), "asks": list(asks), "next": step}, notes)
 
@@ -785,36 +829,37 @@ def _held_folder(config: Path, plugin_id: str, *, create: bool) -> Path | None:
     return folder
 
 
-def _read_held(held: Path) -> dict:
+def _read_held(held: Path, places: _Places) -> dict:
     """The files of a held release, read with the checks of a generation. Anything else there refuses."""
     _require_owned_dir(held)
     names = set(os.listdir(held))
     if not names <= set(_HELD_LIMITS) or not {"manifest.json", "plugin.py", _HELD_LABEL} <= names:
         raise InstallRefused("plugin_directory_untrusted", detail=(
             f"The folder {held} is not a release this command held. Run: "
-            f"{_command(held.parents[2], 'quarantine', 'drop', held.parent.name)}; then install the release again."),
+            f"{_command(places, 'quarantine', 'drop', held.parent.name)}; then install the release again."),
             show_detail=True)
     return {name: _read_file(held / name, _HELD_LIMITS[name]) for name in sorted(names)}
 
 
-def _held_manifest(held: Path, plugin_id: str, files: dict):
+def _held_manifest(held: Path, plugin_id: str, files: dict, places: _Places):
     """The held release's manifest, when it is the one its place names and its label is one a release has."""
     try:
         manifest = parse_manifest(files["manifest.json"])
         label = files[_HELD_LABEL].decode("ascii").strip()
     except (Refused, UnicodeDecodeError):
-        raise InstallRefused("generation_unreadable", detail=_damaged(held, plugin_id), show_detail=True) from None
+        raise InstallRefused("generation_unreadable", detail=_damaged(held, plugin_id, places),
+                             show_detail=True) from None
     if (manifest.plugin_id != plugin_id or manifest.version != held.name or label not in _LABELS
             or hashlib.sha256(files["plugin.py"]).hexdigest() != manifest.artifact_sha256):
-        raise InstallRefused("generation_unreadable", detail=_damaged(held, plugin_id), show_detail=True)
+        raise InstallRefused("generation_unreadable", detail=_damaged(held, plugin_id, places), show_detail=True)
     return manifest
 
 
-def _damaged(held: Path, plugin_id: str) -> str:
+def _damaged(held: Path, plugin_id: str, places: _Places) -> str:
     """The way out for a held release whose files do not read as the release its place names."""
     return (f"The release held at {held} does not read as the release {held.name} of the plugin {plugin_id} "
             f"that this command held, so it cannot be accepted. Run: "
-            f"{_command(held.parents[2], 'quarantine', 'drop', plugin_id)}")
+            f"{_command(places, 'quarantine', 'drop', plugin_id)}")
 
 
 def _set_aside(config: Path, plugin_id: str, folder: Path, names: list) -> list:
@@ -851,10 +896,10 @@ def _set_aside(config: Path, plugin_id: str, folder: Path, names: list) -> list:
     return lines
 
 
-def _drop_held_copy(held: Path, files: dict) -> list:
+def _drop_held_copy(held: Path, files: dict, places: _Places) -> list:
     """After the new generation holds the release: remove its held copy when it is still the one read."""
     try:
-        same = _read_held(held) == files
+        same = _read_held(held, places) == files
     except InstallRefused:
         same = False
     if not same:

@@ -87,6 +87,10 @@ _REGISTRY_LABEL_PHRASES = (
     "non-verified; a label, not a gate",
     "verified; a label, not a gate",
     "unlisted; a label, not a gate",
+    # A refused row whose label the core could not read says so and why (daemon/plugins.py).
+    "not read (the plugin directory was refused, so nothing in it was opened); a label, not a gate",
+    "not read (manifest.json was refused); a label, not a gate",
+    "not read (install.json or its directory was refused); a label, not a gate",
 )
 
 
@@ -288,8 +292,8 @@ class Application:
             for r in rows)
         return ('<section aria-labelledby="routes-h"><h2 id="routes-h">Routes</h2><table><caption>'
                 "Routes from the control API plus required routes it did not report. Bars: %s. "
-                "A plugin row's registry label is text the core draws: verified, non-verified or "
-                "unlisted; a label, not a gate.</caption>"
+                "A plugin row's registry label is text the core draws: verified, non-verified, "
+                "unlisted, or not read with the reason; a label, not a gate.</caption>"
                 '<thead><tr><th scope="col">Route</th><th scope="col">Class</th><th scope="col">Covers</th>'
                 '<th scope="col">Sign-in</th><th scope="col">Maturity</th><th scope="col">Failed bars</th>'
                 '<th scope="col">Blocker</th><th scope="col">Registry label</th></tr></thead>'

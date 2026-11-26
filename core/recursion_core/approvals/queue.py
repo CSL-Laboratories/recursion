@@ -20,14 +20,21 @@ and the object the method handlers and the engine drivers call:
   denied or expired (expired means denied). It works for a request made before a restart too. The expiry is
   written by the deadline worker of a started queue (or an answer resolves it); on a queue that is attached
   but not started a pending request stays pending, so a caller that must not wait past a moment passes
-  ``timeout`` (seconds, at most ``threading.TIMEOUT_MAX``; anything else is refused ``timeout``).
+  ``timeout`` (seconds, at most ``threading.TIMEOUT_MAX``; anything else is refused ``timeout``). Every write
+  that settles a request wakes its waiters once it commits, whoever made it on the same store in this process:
+  this queue (an answer, the deadline worker, recovery), another queue attached to that store, or the plugin
+  gate given that store (its decision, its veto, an expiry it writes). A writer in another process is not heard.
 * ``sweep()`` writes ``expired`` and ``approval.answered`` for every pending request whose deadline has come.
   The worker started by ``start`` calls it at each deadline. A failure of the worker withdraws ``ready``
   and the worker tries again; a row that cannot be read is set aside, never retried for ever.
-* ``recover()`` at start: an engine's request still pending belonged to a driver that died with the daemon,
+* ``recover()`` at a start with no deadline worker of this queue alive (the first start, or one after a
+  stop): an engine's request still pending belonged to a driver that died with the daemon,
   so it ends as expired, never approved; an engine's request approved but not carried out loses its
   binding, so nothing can carry it out through the dead driver; deadlines that passed while the daemon was
-  down are written. While a start runs no surface is offered anything: the start offers what no surface
+  down are written. While a worker of this queue is alive its drivers are alive too, so recovery does
+  nothing there: a second start while the queue runs ends no request and retires no binding, and its answer
+  says so (``already_running``). ``start`` answers ``{"code", "says"}``: ``started``, ``already_running``,
+  ``store_absent`` or ``stopped``, each with its sentence in ``START_SAYS``. While a start runs no surface is offered anything: the start offers what no surface
   took to every surface subscribed then, once its worker runs, and nothing at all if it fails. A start that
   raises before it lets the surfaces through (a failure, or an interruption anywhere from the moment it holds
   the surfaces back) lets them through all the same, so each new request is offered to every surface at once.
@@ -68,7 +75,11 @@ and the object the method handlers and the engine drivers call:
 * ``open_in`` / ``answer_in`` run inside the dispatcher's transaction for approval.open and approval.answer;
   ``list_page`` serves approval.list (summaries only).
 * ``consume(...)`` carries an approved effect out once, against the private binding; every refusal is a
-  typed ``ApprovalRefused``.
+  typed ``ApprovalRefused``. It consumes through ``store.consume_in``, the one place the plugin gate's ``take``
+  goes through too: an approved record whose deadline has come is written ``expired`` and refused
+  ``approval_expired`` (that expiry is the one thing a refusal changes, and it was already due), and one whose
+  effect was vetoed or denied on the store is refused ``approval_vetoed``, both read inside the transaction that
+  would mark it consumed.
 
 Two answers at once: with EVENTS' store (one transaction at a time) the second waits, reads the resolved
 record and is answered ``conflict``/``already_resolved``. A store that lets two transactions run at once
@@ -90,6 +101,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import weakref
 from typing import Callable
 
 from recursion_core.approvals import model
@@ -104,7 +116,7 @@ try:  # EVENTS' store: a COMMIT that raised may or may not have been made durabl
 except ImportError:  # pragma: no cover - a tree without EVENTS' store
     _OUTCOME_UNKNOWN = ()
 
-__all__ = ["DEADLINE_SECONDS", "ApprovalQueue", "timestamp_of"]
+__all__ = ["DEADLINE_SECONDS", "START_SAYS", "ApprovalQueue", "timestamp_of"]
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +125,18 @@ log = logging.getLogger(__name__)
 DEADLINE_SECONDS = {"engine_tool": 15 * 60, "plugin_effect": APPROVAL_DEADLINE_SECONDS}
 RETRY_SECONDS = 1.0  # the deadline worker's pause after a failure before it tries again
 _CONSUME_ATTEMPTS = 12  # a consumption refused by a concurrent writer is read again this many times (about 0.4 s)
+
+# What a start answers: what happened, and the one thing a person can do next.
+START_SAYS = {
+    "started": "The approval queue started: what a stopped daemon left was recovered, and its deadline worker runs.",
+    "already_running": "The approval queue was already running, so nothing it holds was ended: no request was "
+                       "expired and no approval lost its binding. Its deadline worker was started again. Stop the "
+                       "queue first if you meant to recover what a stopped daemon left.",
+    "store_absent": "The approval queue did not start, because no event store is composed, and it refuses every "
+                    "request. Compose an event store, then start it again.",
+    "stopped": "The approval queue was stopped while it started, so it is left stopped. Start it again if you "
+               "want it running.",
+}
 
 
 def _tell(fn, *args) -> bool:
@@ -124,6 +148,21 @@ def _tell(fn, *args) -> bool:
         log.error("an approval subscriber failed: %s", type(exc).__name__)
         return False
     return True
+
+
+# Every queue attached to an event store in this process, so that a write which settles an approval through
+# another writer on the same store (the plugin gate, or a second queue) wakes this queue's waiters of it.
+_ATTACHED: weakref.WeakSet = weakref.WeakSet()
+_ATTACHED_LOCK = threading.Lock()
+
+
+def _wake_waiters_of(store, approval_ids) -> None:
+    """After a commit that settled these approvals on ``store`` (none of them is pending any more): wake the
+    waiters that each queue attached to that store holds for them. Called with no store transaction open."""
+    with _ATTACHED_LOCK:
+        queues = [queue for queue in _ATTACHED if queue._store is store]
+    for queue in queues:
+        queue._wake_waiters(approval_ids)
 
 
 def timestamp_of(seconds: float) -> str:
@@ -167,6 +206,8 @@ class ApprovalQueue:
         if declare_tables:
             store.register_tables(rows.LANE, rows.VERSION, rows.DDL)
         self._store = store
+        with _ATTACHED_LOCK:
+            _ATTACHED.add(self)  # a write another writer on this store settles wakes this queue's waiters
 
     @property
     def store(self):
@@ -185,9 +226,16 @@ class ApprovalQueue:
                 raise RuntimeError("the approval queue cannot be started inside its own start or stop")
             self._lifecycle_owner = threading.get_ident()
             try:
-                self._start(context, stops)
+                code = self._start(context, stops)
             finally:
                 self._lifecycle_owner = None
+        return {"code": code, "says": START_SAYS[code]}
+
+    def _worker_alive(self) -> bool:
+        """Whether a deadline worker this queue published still runs: then its drivers run too."""
+        with self._lock:
+            worker = self._worker
+            return self._generation is not None and worker is not None and worker.is_alive()
 
     def _stops_here(self) -> int:
         """How many stops this thread has made on this queue."""
@@ -196,10 +244,11 @@ class ApprovalQueue:
     def _start(self, context, stops: int) -> None:
         if self._store is None:
             if context.store is None:
-                return  # no event store is composed: nothing to recover or run, and the queue stays not ready
+                return "store_absent"  # no event store is composed: nothing to recover or run; not ready
             self.attach(context.store)
         elif self._store is not context.store:
             raise RuntimeError("the approval queue is attached to another store")
+        running = self._worker_alive()  # a start while the queue runs: recovery ends nothing (see ``recover``)
         generation = object()
         try:
             with self._lock:
@@ -216,7 +265,7 @@ class ApprovalQueue:
                     # signal handler). It stands: no worker is published or launched, the surfaces are let
                     # through, and the queue is left stopped.
                     self._late = None
-                    return
+                    return "stopped"
                 # Ready before the worker runs, in one step with its generation: from here only this worker
                 # withdraws ready (on a failure) and restores it (after a sweep), so start never overwrites a
                 # failure the worker has already reported, and a worker whose generation has ended changes
@@ -253,8 +302,10 @@ class ApprovalQueue:
         # surface took, once, here; from here a surface that subscribes is offered it when it subscribes. The queue
         # has started: an interruption while this offers leaves it started, and what was not offered stays unshown.
         # After a stop on this thread since the publication, nothing is offered: the queue is stopped.
-        if self._stops_here() == stops:
-            self._offer_backlog()
+        if self._stops_here() != stops:
+            return "stopped"
+        self._offer_backlog()
+        return "already_running" if running else "started"
 
     def stop(self, context=None) -> None:
         """Signal every worker and return only once each has joined: the current one, one a later start replaced
@@ -465,14 +516,24 @@ class ApprovalQueue:
             return rows.load(tx, approval_id)
 
     def _resolved(self, record: dict, binding) -> None:
-        """After the commit that resolved a request: wake its waiters, then tell the subscribers."""
+        """After the commit that resolved a request: wake its waiters (and those another queue on the same store
+        holds), then tell the subscribers."""
         with self._lock:
             done = self._done.pop(record["approval_id"], None)
             listeners = [fn for _, fn in self._answered]
         if done is not None:
             done.set()
+        _wake_waiters_of(self._store, (record["approval_id"],))
         for fn in listeners:
             _tell(fn, copy.deepcopy(record), copy.deepcopy(binding))
+
+    def _wake_waiters(self, approval_ids) -> None:
+        """Wake this queue's waiters of approvals that a writer on its store settled (committed, not pending)."""
+        with self._lock:
+            done = [self._done.pop(approval_id, None) for approval_id in approval_ids]
+        for event in done:
+            if event is not None:
+                event.set()
 
     # -- the deadline --------------------------------------------------------------------------------------
 
@@ -571,9 +632,13 @@ class ApprovalQueue:
     def recover(self) -> dict:
         """At start: end engine requests whose driver died, retire the bindings of approved ones not yet
         carried out, write due expiries, offer again the requests never shown (during a start that offering
-        reaches no surface: the start makes it once its worker runs)."""
+        reaches no surface: the start makes it once its worker runs). While a deadline worker of this queue is
+        alive (a second start while it runs, or a call made while it runs) the drivers are alive as well, so it
+        does nothing and reports ``running``: no request is ended and no binding retired."""
         closed, retired = [], []
         now = self.now()
+        if self._worker_alive():
+            return {"closed": closed, "retired": retired, "expired": [], "told": [], "at": now, "running": True}
         with self._store.transaction() as tx:
             engine = rows.unresolved_engine(tx)
         for approval_id in engine:
@@ -602,7 +667,7 @@ class ApprovalQueue:
         expired = self.sweep()
         offered = self._offer_unshown()
         return {"closed": closed, "retired": retired, "expired": [r["approval_id"] for r in expired],
-                "told": offered, "at": now}
+                "told": offered, "at": now, "running": False}
 
     # -- the methods ---------------------------------------------------------------------------------------
 
@@ -652,7 +717,9 @@ class ApprovalQueue:
         return answer
 
     def consume(self, approval_id: str, revision: int, digest: str, binding) -> dict:
-        """Carry an approved effect out once; ``ApprovalRefused`` (a typed code) and nothing changed otherwise.
+        """Carry an approved effect out once; ``ApprovalRefused`` (a typed code) otherwise, and nothing changed
+        except an expiry that was already due (``store.consume_in``: an approved record at or past its deadline is
+        written ``expired`` and refused ``approval_expired``; one whose effect was vetoed is ``approval_vetoed``).
 
         A store that runs two transactions at once refuses the second one's write; the consumption is then
         tried again from a fresh read (a short, bounded backoff), which finds it consumed and refuses
@@ -665,9 +732,12 @@ class ApprovalQueue:
                     if held is None:
                         raise ApprovalRefused("approval_unknown")
                     kept = rows.binding_of(tx, approval_id)
-                    consumed = model.consume(held, kept, revision, digest, binding)
-                    rows.save(tx, consumed)
-                return consumed
+                    refusal, record = rows.consume_in(tx, held, kept, revision, digest, binding,
+                                                      milliseconds(self.now()))
             except sqlite3.OperationalError:
                 time.sleep(min(0.001 * 2 ** attempt, 0.05))
+                continue
+            if refusal is not None:
+                raise ApprovalRefused(refusal)  # after the commit, so an expiry that was due is kept
+            return record
         raise ApprovalRefused("store_busy")

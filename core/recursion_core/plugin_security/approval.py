@@ -31,7 +31,10 @@ table, written and committed before it is drawn, and a gate made again on the sa
 the daemon running or not, is written ``expired`` when it is next read and is refused
 ``approval_expired``. An approved one is taken once: the take writes it ``consumed`` in
 the same transaction, and a second take, after a restart too, is ``approval_replayed``.
-An approval covers exactly the effect it was drawn for: another effect presented with it
+The take consumes through the approval queue's own ``store.consume_in``, the one place every
+consumer of the store goes through: the deadline and the veto are read there, inside the
+transaction that marks the record consumed, so the queue's ``consume`` refuses what the take
+refuses. An approval covers exactly the effect it was drawn for: another effect presented with it
 is ``approval_digest_mismatch``. An approved one found past its deadline, by a take or
 any other read, is written ``expired`` in the same transaction and stays so for good,
 whatever the clock says later; approval.v1 keeps no answer on an expired record, so the
@@ -45,6 +48,9 @@ approved; a store that cannot be written is refused ``store_unavailable``, and n
 was done; a store that has failed (it refuses every use until it is opened again) is refused
 ``store_failed``. The operator's answer is kept as the principal ``OPERATOR_PRINCIPAL``
 (approval.v1 names an owner or a device as the one who answered, and nothing else).
+
+A decision, a veto or an expiry the gate writes wakes, once it commits, the waiters an approval
+queue attached to the same store in this process holds for that approval.
 
 The daemon does not yet give its gate the store: until that join, the product's
 approvals still live only in memory, do not last across a restart and reach no person.
@@ -84,7 +90,6 @@ from __future__ import annotations
 
 import hashlib
 import heapq
-import json
 import logging
 import re
 import secrets
@@ -172,6 +177,12 @@ def _durable():
     return rows, model, timestamp_of, milliseconds, _OUTCOME_UNKNOWN
 
 
+def _waker():
+    """The approval queue's own way to wake the waiters of approvals settled on a store (see ``_durable``)."""
+    from recursion_core.approvals.queue import _wake_waiters_of
+    return _wake_waiters_of
+
+
 def check_effect(effect: object) -> bytes:
     """Return the effect's canonical bytes, or refuse a malformed effect."""
     try:
@@ -248,6 +259,7 @@ class ApprovalGate:
         # plugin requests. Without a store, in memory only: a restart forgets every veto. With
         # one, unused: the store is asked inside each transaction, so every gate on it sees a veto.
         self._vetoed: set[str] = set()
+        self._settling = threading.local()  # the approvals this thread's open transaction settled, if any
         if store is not None:
             rows = _durable()[0]
             if declare_tables:
@@ -420,9 +432,12 @@ class ApprovalGate:
         unknown is raised as it is, as the approval queue does; a store that has failed (the event store's own
         code ``store_failed``: it refuses every use until it is opened again) is ``store_failed``."""
         _, model, _, _, unknown = _durable()
+        settled: list = []
+        outer = getattr(self._settling, "ids", None)
+        self._settling.ids = settled
         try:
             with self._store.transaction() as tx:
-                return work(tx)
+                result = work(tx)
         except Refused:
             raise
         except model.ApprovalRefused as refused:
@@ -433,20 +448,23 @@ class ApprovalGate:
             if isinstance(exc, RuntimeError) and str(exc) == "store_failed":
                 raise Refused("store_failed") from exc
             raise Refused("store_unavailable", type(exc).__name__) from exc
+        finally:
+            self._settling.ids = outer
+        if settled:
+            _waker()(self._store, settled)  # committed: the approval queue's waiters of these approvals wake
+        return result
+
+    def _settled_here(self, approval_id: str) -> None:
+        """Note, inside a transaction of ``_in_store``, an approval this write settles (not pending any more)."""
+        ids = getattr(self._settling, "ids", None)
+        if ids is not None:
+            ids.append(approval_id)
 
     def _vetoed_in(self, tx, digest: str) -> bool:
         """Whether the store holds a refused plugin approval for this digest: vetoed through any gate on the
-        store, or denied through the approval queue. Read inside the caller's transaction."""
-        found = tx.execute("SELECT record FROM approvals_records WHERE source = 'plugin_effect' "
-                           "AND state IN ('vetoed', 'denied') AND record LIKE ?", ('%"digest":"' + digest + '"%',))
-        for (text,) in found:
-            try:
-                held = json.loads(text)
-            except (ValueError, TypeError):
-                continue
-            if type(held) is dict and held.get("digest") == digest:
-                return True
-        return False
+        store, or denied through the approval queue. Read inside the caller's transaction, by the one query of
+        the approval store (``store.vetoed``)."""
+        return _durable()[0].vetoed(tx, digest)
 
     def _reloaded(self, tx, held: dict, now: int) -> dict:
         """A record as it stands now: a pending one whose deadline has come, or an approved one found past
@@ -466,6 +484,7 @@ class ApprovalGate:
         if changed is None:
             return held
         rows.save(tx, changed, answered=True)
+        self._settled_here(changed["approval_id"])
         return changed
 
     def _covers(self, held: dict, digest: str, raw: bytes) -> bool:
@@ -537,6 +556,7 @@ class ApprovalGate:
                             answer="approve" if approve else "deny", answered_by=dict(OPERATOR_PRINCIPAL),
                             answered_at=timestamp_of(now))
                 rows.save(tx, held, answered=True)
+                self._settled_here(approval_id)
                 return None, held["state"]
 
             refusal, state = self._in_store(work)
@@ -545,7 +565,7 @@ class ApprovalGate:
         return state
 
     def _take_kept(self, approval_id: str, raw: bytes, digest: str) -> str:
-        rows, model, _, _, _ = _durable()
+        rows = _durable()[0]
         with self._lock:
             now = self._clock()
 
@@ -561,10 +581,9 @@ class ApprovalGate:
                     return ("approval_expired",)
                 if held["state"] != "approved":
                     return ("approval_not_granted", held["state"])
-                if self._vetoed_in(tx, held["digest"]):
-                    return ("approval_vetoed",)
-                rows.save(tx, model.consume(held, None, held["revision"], held["digest"], None))
-                return None
+                # The deadline and the veto are read where every consumer of the store consumes a record.
+                refusal, _ = rows.consume_in(tx, held, None, held["revision"], held["digest"], None, now * 1000)
+                return None if refusal is None else (refusal,)
 
             refusal = self._in_store(work)
         if refusal is not None:

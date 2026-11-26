@@ -17,6 +17,9 @@ the Liaison's ruling of Nov 14, 4:03 PM):
 Events, in the same transaction as the change they report: ``approval.requested`` (the record as it was
 requested, immutable) and ``approval.answered`` (approved, denied, expired; vetoed comes with the plugin
 path).
+
+``consume_in`` is the one place a record is consumed, whoever consumes it (the approval queue's ``consume`` and
+the plugin gate's ``take``): the deadline and the veto are read there, in the transaction that marks it consumed.
 """
 
 from __future__ import annotations
@@ -24,15 +27,16 @@ from __future__ import annotations
 import json
 import logging
 
+from recursion_core.approvals import model
 from recursion_core.approvals.effects import text_of
 from recursion_core.approvals.model import ApprovalRefused, restored
 from recursion_core.approvals.record import milliseconds, shape_problem, summary_of
 
 log = logging.getLogger(__name__)
 
-__all__ = ["DDL", "LANE", "VERSION", "answered_event", "binding_of", "due", "insert", "list_summaries", "load",
-           "log_of", "mark_shown", "next_deadline", "pending", "requested_event", "retire_binding", "save",
-           "set_aside", "unresolved_engine", "unshown"]
+__all__ = ["DDL", "LANE", "VERSION", "answered_event", "binding_of", "consume_in", "due", "insert", "list_summaries",
+           "load", "log_of", "mark_shown", "next_deadline", "past_deadline", "pending", "requested_event",
+           "retire_binding", "save", "set_aside", "unresolved_engine", "unshown", "vetoed"]
 
 LANE = "approvals"
 VERSION = 1
@@ -122,6 +126,52 @@ def save(tx, record: dict, *, answered: bool = False) -> None:
                (record["state"], milliseconds(record["expires_at"]), text_of(record), record["approval_id"]))
     if answered:
         tx.append(answered_event(record))
+
+
+def vetoed(tx, digest: str) -> bool:
+    """Whether the store holds a refused plugin approval for this digest: vetoed through a gate on the store, or
+    denied through the approval queue. A veto is final for that intent. Read inside the caller's transaction."""
+    found = tx.execute("SELECT record FROM approvals_records WHERE source = 'plugin_effect' "
+                       "AND state IN ('vetoed', 'denied') AND record LIKE ?", ('%"digest":"' + digest + '"%',))
+    for (text,) in found:
+        try:
+            held = json.loads(text)
+        except (ValueError, TypeError):
+            continue
+        if type(held) is dict and held.get("digest") == digest:
+            return True
+    return False
+
+
+def past_deadline(record: dict, now_ms: int) -> bool:
+    """Whether an approved record's deadline has come: at its ``expires_at`` or after it nothing carries it out."""
+    return record["state"] == "approved" and now_ms >= milliseconds(record["expires_at"])
+
+
+def consume_in(tx, record: dict, kept, revision, digest, binding, now_ms: int) -> tuple:
+    """Consume a record inside the caller's transaction: THE one place it is done, by whichever consumer (the
+    approval queue's ``consume``, the plugin gate's ``take``), so two consumers of one record never disagree and
+    a later one cannot leave a rule out.
+
+    An approved record whose deadline has come (``now_ms`` at or after its ``expires_at``) is written ``expired``
+    here, with ``approval.answered`` (approval.v1 keeps no answer on an expired record; the event written when it
+    was approved still says who approved it), and refused ``approval_expired``. An approved record whose effect
+    was refused on this store (vetoed through a gate, or denied through the queue) is refused ``approval_vetoed``
+    and nothing is written. Both are read here, in the transaction that would mark it consumed, so a deadline or
+    a veto that commits before it is never missed. Then ``model.consume`` holds its own rules (state, revision,
+    digest, binding), raising its typed refusal, and the record is written ``consumed``.
+
+    Returns ``(None, the consumed record)``, or ``(code, the record as it now stands)``: the caller raises the
+    refusal only once its transaction has ended, so an expiry that was due is kept."""
+    if past_deadline(record, now_ms):
+        ended = dict(record, state="expired", answered_by=None, answer=None, answered_at=None)
+        save(tx, ended, answered=True)
+        return "approval_expired", ended
+    if record["state"] == "approved" and vetoed(tx, record["digest"]):
+        return "approval_vetoed", record
+    consumed = model.consume(record, kept, revision, digest, binding)
+    save(tx, consumed)
+    return None, consumed
 
 
 def mark_shown(tx, approval_id: str) -> None:

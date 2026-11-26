@@ -283,6 +283,107 @@ class FailedAuthLimit:
             return len(times) >= self._max
 
 
+@contextlib.contextmanager
+def owner_file_lock(lock_path: str, uid: int, timeout_s: float):
+    """The writers' lock of an owner-only file: an exclusive ``flock`` on ``lock_path`` (made 0600 when missing),
+    for a whole read-modify-write. A writer that cannot have it within ``timeout_s`` is refused
+    (``CredentialStoreError``) and changes nothing. The credential store and the remote relay's record of
+    revocations (``remote.revocation_store``) both write through it."""
+
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise CredentialStoreError(f"the store's lock cannot be opened ({type(exc).__name__})") from None
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError as exc:
+            raise CredentialStoreError(f"the store's lock cannot be read ({type(exc).__name__})") from None
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or stat.S_IMODE(st.st_mode) & 0o077:
+            raise CredentialStoreError("the store's lock is not an owner-only file of this user")
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise CredentialStoreError("the store is held by another writer") from None
+                time.sleep(0.005)
+            except OSError as exc:
+                raise CredentialStoreError(f"the store's lock cannot be taken ({type(exc).__name__})") from None
+        yield
+    finally:
+        # The lock is let go explicitly, then its descriptor closed. Neither failing changes the answer: what
+        # the caller did under the lock is done (a mint that is written returns its token), and a close that
+        # fails cannot leave the lock held for the rest of the process (round 7 of #377, DeepSeek 2: the
+        # OSError escaped mint and revoke untyped, and every later writer here was refused).
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        try:
+            os.close(fd)
+        except OSError as exc:
+            log.warning("the store's lock could not be released cleanly (%s)", type(exc).__name__)
+
+
+def sweep_temps(path: str) -> None:
+    """Remove the temporary files a killed writer of ``path`` left (the read of #377 by DeepSeek V4.1 Flash,
+    F13). Called under the writers' lock, when no write is under way, so every one is an orphan."""
+
+    directory = os.path.dirname(path)
+    orphan = re.compile(rf"\.{re.escape(os.path.basename(path))}\.[0-9a-f]{{16}}\.tmp")
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if orphan.fullmatch(name):
+            try:
+                os.unlink(os.path.join(directory, name))
+            except OSError:
+                pass
+
+
+def replace_file(path: str, data: bytes) -> None:
+    """Write ``data`` to a new owner-only file beside ``path``, sync it, rename it over ``path``, sync the
+    directory: all or nothing.
+
+    The rename is the commit point. A failure before it raises ``CredentialStoreError`` and changes nothing
+    on disk. A failure after it (syncing the directory) raises ``CredentialStoreUncertain``: the file now
+    holds the new data, and only its durability is uncertain until the next write succeeds.
+    """
+
+    directory = os.path.dirname(path)
+    temp = os.path.join(directory, f".{os.path.basename(path)}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(temp, flags, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+        except BaseException:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise CredentialStoreError(f"the store cannot be written ({type(exc).__name__})") from None
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        raise CredentialStoreUncertain(
+            f"the store was replaced but its directory could not be synced ({type(exc).__name__})") from None
+
+
 class CredentialStore:
     """Daemon-minted tokens for the control API, kept hashed in one owner-only file. See the module text."""
 
@@ -423,64 +524,17 @@ class CredentialStore:
         except CredentialStoreError:
             self._seen = None   # read again at the next check
 
-    @contextlib.contextmanager
     def _file_lock(self):
-        """The writers' lock: an exclusive ``flock`` on ``.<name>.lock``, for a whole read-modify-write (the
+        """The writers' lock (``owner_file_lock``) on ``.<name>.lock``, for a whole read-modify-write (the
         read of #377 by DeepSeek V4.1 Flash, F4: two stores on one file dropped each other's grants). A writer
         that cannot have it within ``lock_timeout_s`` is refused, and changes nothing."""
 
-        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
-        try:
-            fd = os.open(self._lock_path, flags, 0o600)
-        except OSError as exc:
-            raise CredentialStoreError(f"the store's lock cannot be opened ({type(exc).__name__})") from None
-        try:
-            try:
-                st = os.fstat(fd)
-            except OSError as exc:
-                raise CredentialStoreError(f"the store's lock cannot be read ({type(exc).__name__})") from None
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != self._uid or stat.S_IMODE(st.st_mode) & 0o077:
-                raise CredentialStoreError("the store's lock is not an owner-only file of this user")
-            deadline = time.monotonic() + self._lock_timeout_s
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise CredentialStoreError("the store is held by another writer") from None
-                    time.sleep(0.005)
-                except OSError as exc:
-                    raise CredentialStoreError(f"the store's lock cannot be taken ({type(exc).__name__})") from None
-            yield
-        finally:
-            # The lock is let go explicitly, then its descriptor closed. Neither failing changes the answer: what
-            # the caller did under the lock is done (a mint that is written returns its token), and a close that
-            # fails cannot leave the lock held for the rest of the process (round 7 of #377, DeepSeek 2: the
-            # OSError escaped mint and revoke untyped, and every later writer here was refused).
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            try:
-                os.close(fd)
-            except OSError as exc:
-                log.warning("the store's lock could not be released cleanly (%s)", type(exc).__name__)
+        return owner_file_lock(self._lock_path, self._uid, self._lock_timeout_s)
 
     def _sweep_temps(self) -> None:
-        """Remove the temporary files a killed writer left (the read of #377 by DeepSeek V4.1 Flash, F13). Called
-        under the writers' lock, when no write is under way, so every one is an orphan."""
+        """Remove the temporary files a killed writer left (``sweep_temps``). Called under the writers' lock."""
 
-        directory = os.path.dirname(self._path)
-        orphan = re.compile(rf"\.{re.escape(os.path.basename(self._path))}\.[0-9a-f]{{16}}\.tmp")
-        try:
-            names = os.listdir(directory)
-        except OSError:
-            return
-        for name in names:
-            if orphan.fullmatch(name):
-                try:
-                    os.unlink(os.path.join(directory, name))
-                except OSError:
-                    pass
+        sweep_temps(self._path)
 
     @staticmethod
     def _check_record(record: object) -> None:
@@ -521,36 +575,9 @@ class CredentialStore:
         is uncertain until the next write succeeds.
         """
 
-        directory = os.path.dirname(self._path)
-        temp = os.path.join(directory, f".{os.path.basename(self._path)}.{secrets.token_hex(8)}.tmp")
         data = json.dumps({"version": STORE_VERSION, "credentials": list(grants)}, sort_keys=True,
                           separators=(",", ":")).encode("ascii")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        try:
-            fd = os.open(temp, flags, 0o600)
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(data)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temp, self._path)
-            except BaseException:
-                try:
-                    os.unlink(temp)
-                except OSError:
-                    pass
-                raise
-        except OSError as exc:
-            raise CredentialStoreError(f"the store cannot be written ({type(exc).__name__})") from None
-        try:
-            dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError as exc:
-            raise CredentialStoreUncertain(
-                f"the store was replaced but its directory could not be synced ({type(exc).__name__})") from None
+        replace_file(self._path, data)
 
     # -- grants -------------------------------------------------------------------------------------
     @staticmethod

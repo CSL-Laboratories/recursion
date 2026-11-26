@@ -292,9 +292,16 @@ class TuiApp:
         # Set by a Loop: the seconds left of the close's one bound, and that bound (CLOSE_BOUND_S)
         self.close_left: Callable[[], float] | None = None
         self.close_bound_s: float | None = None
+        # Set by a Loop: when the close's one bound runs out, or None while no close has asked for it (never sets it).
+        # begin() reads it under the app's lock, so a Stop past the bound is decided there, in one step.
+        self.close_deadline: Callable[[], float | None] | None = None
         self._wait_said = False  # a key while the close waits has had the notice said again (once)
         self.wait_cut = False  # Ctrl-C ended the wait: a Stop already out and hung is not waited for any longer
         self.end_line = ""  # the close line once written; the full-screen mode prints it again after the screen
+        # Set with the close line: True when it names a Stop, a request not sent or a request still in its call, so
+        # that full screen prints it again after the screen; False for the line with nothing to tell. A value, never
+        # a search of the words, so a change of wording cannot silence it.
+        self.end_line_tells = False
         self.errors: list[str] = []
         self.last_error: Event | None = None  # kept here too, so a bounded log cannot drop it
         self.mode, self.line, self.stop_target = "keys", "", None
@@ -503,6 +510,7 @@ class TuiApp:
             if m not in _READS and m not in s.SESSION_METHODS:
                 parts.append(f"the request {m} {_fmt(pa)}".rstrip() + " was in its call; whether it reached the "
                              "daemon is not known; look with run list")
+        self.end_line_tells = bool(parts)
         if not parts:
             return "closed: no request sent; runs keep going and can be reattached"
         if answered and not (unconfirmed or begun or queued or not_sent):
@@ -567,11 +575,17 @@ class TuiApp:
             return "after the close line: " + "; ".join(parts) + tail
 
     def begin(self, asked: int | None, method: str, params: dict, *, ending: bool = False) -> bool:
-        """Called by a Loop's lane before it sends a request: True to send it. A confirmed Stop is always sent, also
-        after the TUI closed or the Loop ended (``ending``); any other request is not sent then, and is named on
-        the close line."""
+        """Called by a Loop's lane before it sends a request: True to send it. A confirmed Stop is sent, also after
+        the TUI closed or the Loop ended (``ending``), while the close's one bound lasts: whether the bound has run
+        out is read here, the deadline and the clock both under the app's lock, in the one step that takes the Stop
+        out of the queue. A Stop past the bound is NOT taken out of the queue and NOT sent, so the close line's "is
+        not sent: the bound has run out" and the after-close line's "was not sent: the bound ran out", both written
+        under the same lock, are true by construction. Any other request is not sent after the close or the end of
+        the Loop, and is named on the close line."""
 
         with self._lock:
+            if method == "run.stop" and self._past_the_bound():
+                return False  # it stays queued: the close line says, or will say, that it is not sent
             entry = self._queued.pop(asked, None) if asked is not None else None
             if method == "run.stop":
                 if self.closed and asked in self._queued_at_close:
@@ -588,6 +602,13 @@ class TuiApp:
             if asked is not None:
                 self._in_call[asked] = (method, dict(params))
             return True
+
+    def _past_the_bound(self) -> bool:
+        """The close's one bound has run out (called under the app's lock, by begin()): the deadline a Loop set, then
+        the clock, both read now. With no Loop, or no close yet, there is no bound to run out."""
+
+        deadline = self.close_deadline() if self.close_deadline is not None else None
+        return deadline is not None and time.monotonic() >= deadline
 
     def stop_moved(self, asked: int | None, step: str) -> None:
         """The confirmed Stop numbered ``asked`` reached ``step`` (a Loop's lane and the transport say so the moment
@@ -1774,6 +1795,7 @@ class Loop:
         self._deadline: float | None = None
         self._deadline_lock = threading.Lock()
         app.close_left = self._left
+        app.close_deadline = self._deadline_now
         self._lanes = {"stop": queue.SimpleQueue(), "other": queue.SimpleQueue()}
         self._threads: list[threading.Thread] = []
         self._runner: threading.Thread | None = None  # the thread of run(), once start() made it
@@ -1821,6 +1843,12 @@ class Loop:
     def _left(self) -> float:
         return max(0.0, self._close_deadline() - time.monotonic())
 
+    def _deadline_now(self) -> float | None:
+        """When the close's one bound runs out, or None while no close has asked for it; it never sets it."""
+
+        with self._deadline_lock:
+            return self._deadline
+
     def _dispatch(self, method: str, params: dict, done) -> None:
         self._lanes["stop" if method == "run.stop" else "other"].put((method, params, done))
 
@@ -1832,7 +1860,9 @@ class Loop:
             method, params, done = item
             # A request not begun when the TUI closes, or the Loop ends, is not sent, except a confirmed Stop: that
             # one is sent while the close's bound lasts. One begun before may end after it. A Stop still queued when
-            # the bound has run out is not begun: the close line has said so (it stays queued in the app).
+            # the bound has run out is not begun: the close line has said so (it stays queued in the app). The
+            # decision is begin()'s, under the app's lock; this unlocked check is a fast path only: the deadline never
+            # moves once set and the clock only goes forward, so a Stop it skips is one begin() would refuse too.
             if method == "run.stop" and self._deadline is not None and time.monotonic() >= self._deadline:
                 continue
             asked = getattr(done, "asked", None)

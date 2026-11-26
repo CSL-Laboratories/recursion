@@ -305,8 +305,9 @@ class ChangeMarker:
     Losing a mark is allowed: a scan of the registry finds what a mark missed, and that lane scans at
     startup and periodically whatever this says. It carries run ids and nothing else.
 
-    THE PRODUCER'S COST, exactly. The daemon registry calls ``mark(run_id)`` when ``add``,
-    ``request_stop``, ``state`` or ``control_put`` returns normally, and that return path can run while
+    THE PRODUCER'S COST, exactly, once a registry calls ``mark``. Proposed: the registry will call
+    ``mark(run_id)`` when ``add``, ``request_stop``, ``state`` or ``control_put`` returns normally.
+    That call is not made on this tree. The return path can run while
     the daemon's lock is held, before a Stop is sent. So ``mark`` never waits: ONE NON-BLOCKING attempt
     on this marker's lock. With the lock: one insertion into a set that holds at most ``CAP`` ids (past
     the cap the ``dropped`` flag is set instead), and the lock is released. Without the lock: the
@@ -325,9 +326,10 @@ class ChangeMarker:
     ``poll_interval_s``
         How long the consumer sleeps between takes (0.1 by default). It is not a promise of freshness.
 
-    THE SOURCE the consumer reads is the daemon registry itself, through two read-only methods on the
+    THE SOURCE the consumer would read is the daemon registry itself, through two read-only methods on the
     registry's own connection, under its own lock and behind the same guard that refuses a read while a
-    publish's directory sync is unfinished:
+    publish's directory sync is unfinished. Proposed: ``snapshot`` and ``run_ids`` are not methods of the
+    registry on this tree.
 
     ``Registry.snapshot(run_id) -> (row or None, control_text or None)``
         One run, both tables, in one hold of the lock, by two point lookups. A run with only a control

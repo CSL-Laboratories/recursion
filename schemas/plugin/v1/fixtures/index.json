@@ -458,7 +458,7 @@
     {
       "file": "good/host.v1/h01-hello.json",
       "schema": "host.v1.json#/$defs/hello",
-      "shows": "The first message each side sends: the channel's version and nothing else."
+      "shows": "The first message each side sends: the channel's version, with no explicit GIL policy."
     },
     {
       "file": "good/host.v1/h02-load-one-plugin.json",
@@ -494,6 +494,30 @@
       "file": "good/host.v1/h08-a-name-a-later-release-may-add.json",
       "schema": "host.v1.json#/$defs/call",
       "shows": "A name not on this release's list still has the form of a call: the receiver refuses it call_unknown, so a later name is never a schema break."
+    },
+    {
+      "file": "good/host.v1/h09-daemon-hello-gil-check.json",
+      "schema": "host.v1.json#/$defs/hello",
+      "shows": "Only a daemon hello can carry a GIL policy."
+    },
+    {
+      "file": "good/host.v1/h10-host-gil-enabled.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "shows": "The host refuses a call after it reads an enabled GIL."
+    },
+    {
+      "file": "good/host.v1/h11-host-start-refused.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "shows": "A host that cannot start with a clean environment says so once, with no call to answer, and ends."
+    },
+    {
+      "file": "bad/host.v1/b11-an-unknown-gil-check.json",
+      "schema": "host.v1.json#/$defs/hello",
+      "rule": "The daemon hello's optional GIL policy is either on or off.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/gil_check"
+      }
     },
     {
       "file": "bad/host.v1/b01-a-core-message-naming-its-caller.json",

@@ -1482,5 +1482,58 @@ class PlainFieldNameTests(unittest.TestCase):
         self.assertFalse(daemon._ended)
 
 
+
+class ArrivingRefusalTests(unittest.TestCase):
+    """A refusal that arrives is read as a refusal whatever its code; a refusal of ours keeps a listed code."""
+
+    LATER = {"type": "refusal", "id": 4, "code": "a_code_of_a_later_release", "detail": "newer words"}
+
+    def test_a_refusal_read_from_a_peer_keeps_a_code_this_release_does_not_list(self):
+        for receiver in ("daemon", "host"):
+            with self.subTest(receiver=receiver):
+                exc = hc._read_refusal(hc.check_message(dict(self.LATER), receiver=receiver))
+                self.assertIsInstance(exc, hc.ChannelRefusal)
+                self.assertEqual((exc.code, exc.detail, exc.known), ("a_code_of_a_later_release", "newer words", False))
+                self.assertNotIn(exc.code, hc.REFUSAL_CODES)
+
+    def test_a_refusal_read_with_a_listed_code_is_known(self):
+        exc = hc._read_refusal(hc.check_message(dict(self.LATER, code="call_failed"), receiver="host"))
+        self.assertEqual((exc.code, exc.known), ("call_failed", True))
+
+    def test_a_refusal_of_ours_is_made_only_with_a_listed_code(self):
+        with self.assertRaises(ValueError):
+            hc.ChannelRefusal("a_code_of_a_later_release")
+        self.assertTrue(hc.ChannelRefusal("call_failed").known)
+
+    def test_a_read_refusal_whose_code_is_not_listed_is_never_written_as_ours(self):
+        exc = hc._read_refusal(hc.check_message(dict(self.LATER), receiver="host"))
+        with self.assertRaises(ValueError) as caught:
+            hc.refusal(None, exc)
+        self.assertIn("a_code_of_a_later_release", str(caught.exception))
+        known = hc._read_refusal(hc.check_message(dict(self.LATER, code="call_failed"), receiver="host"))
+        self.assertEqual(hc.refusal(None, known)["code"], "call_failed")
+
+
+class InsideTests(unittest.TestCase):
+    """``_inside`` is true only for the thread inside the end's section, and never waits."""
+
+    def test_inside_only_for_the_thread_in_the_section(self):
+        end = hc.HostEnd({})
+        self.assertFalse(end._inside())
+        other = {}
+        with end._lock:
+            end._depth = 1
+            try:
+                self.assertTrue(end._inside())
+                worker = threading.Thread(target=lambda: other.setdefault("inside", end._inside()))
+                worker.start()
+                worker.join(10)
+                self.assertFalse(worker.is_alive())
+            finally:
+                end._depth = 0
+            self.assertFalse(end._inside())
+        self.assertEqual(other, {"inside": False})
+
+
 if __name__ == "__main__":
     unittest.main()

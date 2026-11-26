@@ -7,13 +7,13 @@ below are the schema's, and a test holds them equal to it. Frames are those of
 ``control_transport/framing.py``, reused as they are: ``encode``/``decode`` here only wrap its
 ``encode_frame``/``decode_body``.
 
-What this module settles, and nothing more (the host program, its wall and the broker's handles are
-later work):
+What this module settles (the host program uses this channel; the wall and broker handles are later work):
 
 * ``check_message(message, receiver=...)``: a message is one object of a known type with exactly
-  its fields, sent by a side that may send it. Every field name is plain text (``str`` itself, as
-  ``decode`` makes it): a field name of any other kind, a subclass of ``str`` too, is refused
-  ``message_invalid`` before anything of the message is read. A type the receiver does not know is refused
+  its required and permitted optional fields, sent by a side that may send it. Every field name is
+  plain text (``str`` itself, as ``decode`` makes it): a field name of any other kind, a subclass of
+  ``str`` too, is refused ``message_invalid`` before anything of the message is read. A type the
+  receiver does not know is refused
   ``message_unknown``; a reserved type ``message_reserved``; the channel stays up in both cases
   (the refusal is an answer, never a close).
 * ``answer_call(message, handlers)``: the receiving side of a ``call``. A reserved name is refused
@@ -47,7 +47,12 @@ later work):
   trace or profile function, a signal handler, a finalizer) can still run while the lock is held; a
   request such code makes on the same end from that same thread is refused at once with
   ``ChannelReentered`` (code ``end_reentered``) and never waits: nothing is taken or sent, and the
-  request the end was busy with goes on and gets its answer.
+  request the end was busy with goes on and gets its answer. A program above an end keeps the same rule
+  for its own requests by asking the end first (``_inside``): the host program's relay of a core request
+  refuses such a request with ``ChannelReentered`` before it sends anything.
+* A refusal that ARRIVES is read as a refusal whatever its code (``_read_refusal``): its code is kept as
+  it came and ``known`` says whether this release lists it; a refusal of ours is made only with a
+  listed code, and ``refusal`` never writes a read one whose code is not listed.
 * ``receive`` keeps the message it is handed, without a copy: the caller hands the message over and
   does not change it afterwards. ``decode`` makes a new object for every frame it reads.
 * Frame size: a ``load`` frame (daemon to host only) may be as large as the daemon's largest package
@@ -82,7 +87,7 @@ __all__ = [
 CHANNEL = "csl-plugin-host/1"
 RESERVED_TEXT = "reserved; not available in this release"
 
-# type -> (the sides that may send it, its exact fields). host.v1.json x-message-types.
+# type -> (the sides that may send it, its required fields). host.v1.json x-message-types.
 MESSAGE_TYPES: dict[str, tuple[frozenset, frozenset]] = {
     "hello": (frozenset({"daemon", "host"}), frozenset({"type", "channel"})),
     "load": (frozenset({"daemon"}), frozenset({"type", "plugin_id", "manifest_b64", "files"})),
@@ -92,6 +97,9 @@ MESSAGE_TYPES: dict[str, tuple[frozenset, frozenset]] = {
     "refusal": (frozenset({"daemon", "host"}), frozenset({"type", "id", "code", "detail"})),
     "bye": (frozenset({"daemon", "host"}), frozenset({"type", "reason"})),
 }
+# (message type, sender) -> fields that sender may add. host.v1.json x-message-types.optional_from.
+OPTIONAL_MESSAGE_FIELDS = {("hello", "daemon"): frozenset({"gil_check"})}
+
 # The ONE append-only list of call names, each with the arguments it takes, in order. host.v1.json
 # x-call-names. A later surface kind is a new name here, never a new message type.
 CALL_NAMES: dict[str, tuple[str, ...]] = {
@@ -118,7 +126,7 @@ INVENTORY: dict[str, tuple[str, str | None]] = {
 }
 REFUSAL_CODES = ("message_invalid", "message_unknown", "message_reserved", "message_wrong_side", "caller_forged",
                  "call_unknown", "call_reserved", "call_args_invalid", "call_not_offered", "call_failed",
-                 "load_too_large")
+                 "host_gil_enabled", "host_start_refused", "load_too_large")
 
 SIDES = ("daemon", "host")
 MAX_ID = 2 ** 53 - 1
@@ -167,8 +175,11 @@ class ChannelRefusal(Exception):
     A refusal of ours is made only with a code on that list: any other code is a ``ValueError`` here, so
     no end sends a word the schema does not define. A refusal that ARRIVES with a code not on the list is
     still read as a refusal (``check_message`` holds only the code's form): a newer peer may know a newer
-    code, and the list is append-only.
+    code, and the list is append-only: ``_read_refusal`` makes that refusal, keeps its code and sets ``known``
+    to whether this release lists it. ``known`` is True for every refusal made here.
     """
+
+    known = True
 
     def __init__(self, code: str, detail: str = "") -> None:
         if type(code) is not str or code not in REFUSAL_CODES:
@@ -178,19 +189,33 @@ class ChannelRefusal(Exception):
         self.code, self.detail = code, detail
 
 
+def _read_refusal(message: dict) -> ChannelRefusal:
+    """The refusal an ARRIVING ``refusal`` message holds, already checked by ``check_message``, as a
+    ``ChannelRefusal``: its code kept as it came (only its form was checked), without the list check, and
+    ``known`` set to whether this release lists the code. Only for a message that arrived: a refusal of ours
+    is made with ``ChannelRefusal`` and its listed code."""
+    code, detail = message["code"], message["detail"]
+    exc = ChannelRefusal.__new__(ChannelRefusal)
+    Exception.__init__(exc, f"{code}: {detail}" if detail else code)
+    exc.code, exc.detail, exc.known = code, detail, code in REFUSAL_CODES
+    return exc
+
+
 class ChannelReentered(RuntimeError):
     """A request on an end from the thread that is inside that end already, refused at once (module header).
 
     ``code`` is ``end_reentered``. It is never a message on the channel and is not one of ``REFUSAL_CODES``:
     nothing is taken and nothing is sent, so the peer never learns of it; the request the end was busy with
-    goes on and gets its answer. It is raised by ``call``, ``load`` and ``receive`` alike.
+    goes on and gets its answer. It is raised by ``call``, ``load`` and ``receive`` alike, and by a program
+    above an end for a request of its own made from inside another on the same thread (the host program's
+    relay of a core request), with the words of that case.
     """
 
     code = "end_reentered"
 
-    def __init__(self) -> None:
-        super().__init__(f"{self.code}: {_REENTERED}")
-        self.detail = _REENTERED
+    def __init__(self, detail: str = _REENTERED) -> None:
+        super().__init__(f"{self.code}: {detail}")
+        self.detail = detail
 
 
 def frame_limit(sender: str) -> int:
@@ -259,6 +284,8 @@ def _check_fields(kind: str, message: dict) -> None:
     if kind == "hello":
         if message["channel"] != CHANNEL:
             raise bad("channel")
+        if "gil_check" in message and message["gil_check"] not in ("on", "off"):
+            raise bad("gil_check")
     elif kind == "load":
         plugin_id = message["plugin_id"]
         if type(plugin_id) is not str or not _PLUGIN_ID.fullmatch(plugin_id) or plugin_id == HOST:
@@ -305,7 +332,7 @@ def check_message(message: object, *, receiver: str) -> dict:
     Order: an object whose field names are all plain text (``str`` itself) with a type; a reserved type (``message_reserved``); a type nobody defined
     (``message_unknown``); at the daemon, a call whose name is reserved (``call_reserved``, before any
     other check of that name); a type this receiver's peer never sends (``message_wrong_side``); then
-    exactly its fields, a core message that names a caller (``caller_forged``) first among them,
+    its required and permitted optional fields, a core message that names a caller (``caller_forged``) first among them,
     and their forms (``message_invalid``). The caller may answer every refusal with ``refusal``
     and keep the channel up.
     """
@@ -331,8 +358,12 @@ def check_message(message: object, *, receiver: str) -> dict:
         raise ChannelRefusal("message_wrong_side", f"{kind} is never sent by the {sender}")
     if kind == "core" and set(message) & _CALLER_FIELDS:
         raise ChannelRefusal("caller_forged", "the caller is set from the channel, never from a message")
-    if set(message) != fields:
-        raise ChannelRefusal("message_invalid", f"{kind}: fields must be {', '.join(sorted(fields))}")
+    optional = OPTIONAL_MESSAGE_FIELDS.get((kind, sender), frozenset())
+    if not fields <= message.keys() <= (fields | optional):
+        detail = f"{kind}: fields must be {', '.join(sorted(fields))}"
+        if optional:
+            detail += f" (optional: {', '.join(sorted(optional))})"
+        raise ChannelRefusal("message_invalid", detail)
     _check_fields(kind, message)
     return message
 
@@ -343,7 +374,14 @@ def _id_of(message: object) -> int | None:
 
 
 def refusal(message: object, exc: ChannelRefusal) -> dict:
-    """The ``refusal`` message answering ``message``: its id when it had a readable one, else null."""
+    """The ``refusal`` message answering ``message``: its id when it had a readable one, else null.
+
+    Only with a listed code: a refusal read from a peer whose code this release does not list
+    (``known`` False) is ``ValueError`` here, so no end sends on a word the schema does not define."""
+    if not exc.known:
+        raise ValueError(f"{exc.code!r} is not a refusal code of {CHANNEL}: a refusal read from the peer with "
+                         "a code this release does not list is not sent on; a refusal is made only with one of "
+                         "REFUSAL_CODES (host.v1.json x-refusal-codes)")
     return {"type": "refusal", "id": _id_of(message), "code": exc.code, "detail": exc.detail[:1000]}
 
 
@@ -424,6 +462,18 @@ class _Order:
     def __init__(self, receiver: str) -> None:
         self._receiver, self._lock, self._depth = receiver, threading.RLock(), 0
         self._hello, self._ended = False, False
+
+    def _inside(self) -> bool:
+        """True when the calling thread is inside this end's section now, so that a request of its own on
+        this end would be refused ``ChannelReentered``. A program above the end asks first and refuses such a
+        request before it sends anything. Never waits: when another thread holds the lock, this one is not
+        inside."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            return bool(self._depth)
+        finally:
+            self._lock.release()
 
     def _take(self, message: object, settle: Callable[[dict], bool] | None = None) -> dict | None:
         """``message`` checked and taken in the channel's order, or ``ChannelRefusal``.

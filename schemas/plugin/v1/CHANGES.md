@@ -4,7 +4,23 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
-## `host.v1.json` is `1.0-draft.3` (2026-11-24)
+## `host.v1.json` is `1.0-draft.4` (2026-11-25)
+
+Two changes made side by side, each first written as `1.0-draft.3`, are one draft here: the
+`gil_check` field of the daemon's `hello` with the codes `host_gil_enabled` and `host_start_refused`,
+and the root's seven message forms with the channel's order and the wider `call_failed` and
+`load_too_large`. Each is described below as it was written.
+
+The daemon's first `hello` may carry `gil_check` (`on` or `off`). The host defaults to `on`
+and its own `hello` carries only the channel version. With checking on, a host that reads its GIL
+as enabled after a load or call refuses that work and every later load or call with
+`host_gil_enabled`. A host that cannot start with a clean environment sends one `host_start_refused`
+refusal (detail `restart_failed` or `environment_not_clean`) after its `hello` and ends. Existing hello
+messages still validate.
+
+Plugin code shares the host's process, so it can read and write the channel's two descriptors itself:
+every frame on the channel is the plugin's voice, and the daemon must check each request against that
+plugin's grant and take no result on trust.
 
 The root of the file now applies its seven message forms (`oneOf` over `$defs`): before, an outside
 validator pointed at the file accepted any value at all. The texts say what is true at this head: the

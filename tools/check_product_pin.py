@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -41,8 +42,28 @@ def _unsafe_text(text: str) -> bool:
 
 
 def _printable(text: object) -> str:
-    """Escape whatever print() could not encode (a lone surrogate) and any NUL."""
-    return str(text).encode("utf-8", "backslashreplace").decode("utf-8").replace("\0", "\\x00")
+    """One diagnostic line: lone surrogates, NULs and other controls are escaped.
+
+    A key or a path must not be able to forge a second line or a raw terminal control.
+    """
+    raw = str(text).encode("utf-8", "backslashreplace").decode("utf-8")
+    parts: list[str] = []
+    for char in raw:
+        if char == "\0":
+            parts.append("\\x00")
+        elif char != " " and unicodedata.category(char)[:1] in {"C", "Z"}:
+            parts.append(f"\\u{ord(char):04x}")
+        else:
+            parts.append(char)
+    return "".join(parts)
+
+
+def _git_env() -> dict[str, str]:
+    """Child git must not lazy-fetch a missing blob from a promisor remote."""
+    env = os.environ.copy()
+    env["GIT_NO_LAZY_FETCH"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
 
 
 def errors(pin: object) -> list[str]:
@@ -91,30 +112,71 @@ def errors(pin: object) -> list[str]:
     return out
 
 
+def _object_label(kind: str) -> str:
+    """A short object type. A hostile or huge type must not fill the diagnostic."""
+    text = kind.strip() or "unknown object"
+    return text[:40]
+
+
 def vault_errors(pin: dict, vault: Path) -> list[str]:
-    """Compare the pinned blob in a local csl-research clone with the pinned SHA-256."""
+    """Compare the pinned blob in a local csl-research clone with the pinned SHA-256.
+
+    Callers that already ran errors() pass a well-shaped pin. A value that is not
+    an object, or a pinned pin missing commit, path, or sha256, is refused here
+    instead of raising.
+    """
+    if not isinstance(pin, dict):
+        return ["pin must be a JSON object"]
     if pin.get("status") != "pinned":
         return []
+    missing = [key for key in ("commit", "path", "sha256") if not isinstance(pin.get(key), str)]
+    if missing:
+        return [f"missing keys: {', '.join(missing)}"]
     spec = f"{pin['commit']}:{pin['path']}"
     try:
-        blob = subprocess.run(
-            ["git", "-C", str(vault), "show", spec],
+        # The commit field must name a commit. cat-file peels a tag, so a tag
+        # object's id would otherwise look like a blob at commit:path.
+        # cat-file, not show: show renders a tree listing, and that listing is not the
+        # pinned blob. GIT_NO_LAZY_FETCH keeps a partial clone from calling the promisor.
+        commit_kind = subprocess.run(
+            ["git", "-c", "credential.helper=", "-C", str(vault), "cat-file", "-t", pin["commit"]],
             check=True,
             capture_output=True,
             timeout=GIT_TIMEOUT_SECONDS,
+            env=_git_env(),
+        ).stdout.decode("ascii", "replace").strip()
+        if commit_kind != "commit":
+            return [_printable(f"{pin['commit']} is a {_object_label(commit_kind)}, not a commit")]
+        kind = subprocess.run(
+            ["git", "-c", "credential.helper=", "-C", str(vault), "cat-file", "-t", spec],
+            check=True,
+            capture_output=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            env=_git_env(),
+        ).stdout.decode("ascii", "replace").strip()
+        if kind != "blob":
+            return [_printable(f"{spec} is a {_object_label(kind)}, not a pinned blob")]
+        blob = subprocess.run(
+            ["git", "-c", "credential.helper=", "-C", str(vault), "cat-file", "blob", spec],
+            check=True,
+            capture_output=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            env=_git_env(),
         ).stdout
     except subprocess.TimeoutExpired:
-        return [f"cannot read {spec!a} from {str(vault)!a}: git timed out after {GIT_TIMEOUT_SECONDS} seconds"]
+        return [_printable(
+            f"cannot read {spec!a} from {str(vault)!a}: git timed out after {GIT_TIMEOUT_SECONDS} seconds"
+        )]
     except ValueError as exc:
         # A NUL byte or a lone surrogate in the path or the vault cannot be passed to git.
-        return [f"cannot read {spec!a} from {str(vault)!a}: {_printable(exc)}"]
+        return [_printable(f"cannot read {spec!a} from {str(vault)!a}: {exc}")]
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = exc.stderr.decode("utf-8", "replace").strip() if hasattr(exc, "stderr") else exc
         # Windows hands a lone surrogate to git instead of raising ValueError, so escape here too.
         return [_printable(f"cannot read {spec} from {vault}: {detail}")]
     digest = hashlib.sha256(blob).hexdigest()
     if digest != pin["sha256"]:
-        return [f"sha256 mismatch for {spec}: pinned {pin['sha256']}, vault has {digest}"]
+        return [_printable(f"sha256 mismatch for {spec}: pinned {pin['sha256']}, vault has {digest}")]
     return []
 
 

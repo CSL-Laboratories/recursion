@@ -1,0 +1,73 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "framing/10-ignored-messages",
+  "protocol": "2025-06-18",
+  "summary": "Responses from the client (this server sends no requests) and unknown notifications get no answer; a cancellation naming nothing in flight is ignored.",
+  "source": "MCP 2025-06-18 basic/index (Messages) and basic/transports (stdio); JSON-RPC 2.0 sections 4-5",
+  "api": [],
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "result": {}
+      },
+      "expect": []
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 6,
+        "error": {
+          "code": 1,
+          "message": "x"
+        }
+      },
+      "expect": []
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {
+          "progressToken": 1,
+          "progress": 1
+        }
+      },
+      "expect": []
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {
+          "requestId": 99,
+          "reason": "fixture"
+        }
+      },
+      "expect": []
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "method": "notifications/roots/list_changed"
+      },
+      "expect": []
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 7,
+          "result": {}
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

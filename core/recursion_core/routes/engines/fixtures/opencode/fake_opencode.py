@@ -23,9 +23,23 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 
+def _model_ok(model: str) -> bool:
+    """The model rule ``opencode.model_ok`` applies. This file imports nothing from Recursion."""
+
+    if len(model) > 256 or model.startswith("-") or "/" not in model:
+        return False
+    provider, rest = model.split("/", 1)
+    if not provider or not rest:
+        return False
+    for ch in model:
+        code = ord(ch)
+        if code <= 31 or code == 127 or 0xD800 <= code <= 0xDFFF or ch.isspace():
+            return False
+    return True
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 5 or argv[:4] != ["run", "--format", "json", "--model"] or argv[4].startswith("-") \
-            or "/" not in argv[4][1:]:
+    if len(argv) != 5 or argv[:4] != ["run", "--format", "json", "--model"] or not _model_ok(argv[4]):
         sys.stderr.write("fake opencode: unexpected argv\n")
         return 2
     if os.environ.get("OPENCODE_DISABLE_AUTOUPDATE") != "1":

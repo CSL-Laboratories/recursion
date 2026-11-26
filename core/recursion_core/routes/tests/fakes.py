@@ -4,11 +4,24 @@ from __future__ import annotations
 
 import json
 import threading
+from unittest import mock
 
 from recursion_core.routes import contract as c
 from recursion_core.routes.launch import ReadTimeout
 
 HANG = object()  # read_line waits out its whole timeout
+
+
+def runs_adapter(test):
+    """Mark a test, or a whole class, that drives an engine adapter through a fake launcher.
+
+    For the test's duration the shared adapter boundary's host check (``routes.base.platform_supported``)
+    answers that this host may launch, so the protocol, environment and service assertions run on every
+    host, Windows included, against fake processes only. The refusal itself (R3-7, D9) is asserted, with the
+    real host check, by ``test_r3_finding_7``, whose tests never carry this marker.
+    """
+
+    return mock.patch("recursion_core.routes.base.platform_supported", new=lambda: True)(test)
 
 
 class FakeClock:

@@ -245,6 +245,8 @@ class Adv2HungPluginTests(GuiCase):
         gate = threading.Event()
         self.addCleanup(gate.set)
         lock = threading.Lock()
+        changed = threading.Condition(lock)
+        decisions = []
         active = [0]
         peak = [0]
 
@@ -253,7 +255,8 @@ class Adv2HungPluginTests(GuiCase):
                 with lock:
                     active[0] += 1
                     peak[0] = max(peak[0], active[0])
-                gate.wait(10)
+                    changed.notify_all()
+                gate.wait(30)
                 with lock:
                     active[0] -= 1
                 return 200, {'status_code': 'ok', 'result': {}}
@@ -271,12 +274,18 @@ class Adv2HungPluginTests(GuiCase):
                     seen[0] += 1
                     if seen[0] >= total:
                         arrived.set()
-                arrived.wait(2.0)
-                return orig(req, method, path)
+                    changed.notify_all()
+                if not arrived.wait(10):
+                    return False
+                answer = orig(req, method, path)
+                with changed:
+                    decisions.append(answer)
+                    changed.notify_all()
+                return answer
 
             gui.server.headers_read = sync_headers
             threads = []
-            for _ in range(total):
+            for number in range(total):
                 def hit():
                     try:
                         s = socket.create_connection(('127.0.0.1', port), timeout=5)
@@ -288,13 +297,23 @@ class Adv2HungPluginTests(GuiCase):
                 t = threading.Thread(target=hit, daemon=True)
                 t.start()
                 threads.append(t)
-                time.sleep(0.01)
-            self.wait_for(lambda: seen[0] >= total, seconds=3)
-            time.sleep(0.2)
-            observed_peak = peak[0]
-            gate.set()
-            for t in threads:
-                t.join(5)
+                with changed:
+                    self.assertTrue(changed.wait_for(lambda: seen[0] > number, 10),
+                                    'the request never reached the header barrier')
+            try:
+                with changed:
+                    self.assertTrue(changed.wait_for(lambda: len(decisions) == total, 10),
+                                    'not every request reached an admission decision')
+                    self.assertEqual(sum(decisions), daemon_gui.MAX_REQUEST_THREADS)
+                    self.assertTrue(changed.wait_for(lambda: active[0] == sum(decisions), 10),
+                                    'an admitted request never reached the blocked operator')
+                    observed_peak = peak[0]
+            finally:
+                arrived.set()
+                gate.set()
+                for t in threads:
+                    t.join(5)
+            self.assertTrue(all(not t.is_alive() for t in threads))
         self.assertLessEqual(observed_peak, daemon_gui.MAX_REQUEST_THREADS)
 
     def test_a_read_thread_that_cannot_be_started_does_not_leave_the_plugin_host_busy(self):
@@ -419,12 +438,15 @@ class Adv2EvictedStopTests(GuiCase):
         gate, lock = threading.Event(), threading.Lock()
         self.addCleanup(gate.set)
         active, peak, taken = [0], [0], [0]
+        changed = threading.Condition(lock)
+        decisions = []
 
         def call(method, params=None):
             with lock:
                 active[0] += 1
                 taken[0] += 1
                 peak[0] = max(peak[0], active[0])
+                changed.notify_all()
             gate.wait(20)
             with lock:
                 active[0] -= 1
@@ -444,7 +466,11 @@ class Adv2EvictedStopTests(GuiCase):
                 with lock:
                     arrived[0] += 1
                 go.wait(30)
-                return real(request, method, path)
+                answer = real(request, method, path)
+                with changed:
+                    decisions.append(answer)
+                    changed.notify_all()
+                return answer
 
             gui.server.headers_read = all_together
             for number in range(connections):
@@ -454,11 +480,17 @@ class Adv2EvictedStopTests(GuiCase):
                 # one at a time: every Stop is in the daemon's hands before a later connection evicts it
                 self.assertTrue(self.wait_for(lambda: arrived[0] > number), 'a Stop never reached headers_read')
             go.set()
-            self.assertTrue(self.wait_for(lambda: taken[0] >= allowance),
-                            'fewer Stops were carried out than Stop has room for: evicted ones were dropped')
-            time.sleep(0.3)  # a Stop taken past the allowance would be inside the control API by now
-            observed = peak[0]
-            gate.set()
+            try:
+                with changed:
+                    self.assertTrue(changed.wait_for(lambda: len(decisions) == connections, 10),
+                                    'not every Stop reached an admission decision')
+                    self.assertEqual(sum(decisions), allowance)
+                    self.assertTrue(changed.wait_for(lambda: taken[0] >= sum(decisions), 10),
+                                    'an admitted Stop never entered the control API')
+                    self.assertGreaterEqual(taken[0], allowance)
+                    observed = peak[0]
+            finally:
+                gate.set()
         self.assertEqual(observed, allowance)
 
     def test_a_stop_cut_short_by_the_eviction_names_no_run(self):

@@ -62,13 +62,50 @@ class ProcessGroupManager:
         stat = _proc_stat(record['pid'])
         return bool(stat) and stat[1] == record['start'] and stat[0] not in ('Z', 'X')
 
+    def _group_alive(self, record):
+        """True while any live member of the recorded process group remains.
+
+        The leader's exit does not end the group: a grandchild keeps the leader's
+        pgid. A reused leader pid is a different process and is not signalled.
+        """
+        if self._alive(record):
+            return True
+        stat = _proc_stat(record['pid'])
+        if stat is not None and stat[1] != record['start']:
+            return False
+        leader = int(record['pid'])
+        try:
+            names = os.listdir('/proc')
+        except OSError:
+            return True
+        for name in names:
+            if not name.isdigit():
+                continue
+            try:
+                text = Path(f'/proc/{name}/stat').read_text()
+            except OSError:
+                continue
+            try:
+                fields = text[text.rindex(')') + 2:].split()
+                state, pgrp, start = fields[0], int(fields[2]), fields[19]
+            except (ValueError, IndexError):
+                continue
+            if pgrp != leader or state in ('Z', 'X'):
+                continue
+            if int(name) == leader and start != record['start']:
+                continue
+            return True
+        return False
+
     def stop(self, unit):
         if self.stop_hook:
             self.stop_hook('before_signal', unit)
         record = self._record(unit)
         if record is None:
             raise OSError(f'no record for {unit}')
-        if self._alive(record):
+        # The leader may already have exited. The group is still there while a
+        # descendant lives, and that descendant has to be signalled too.
+        if self._group_alive(record):
             try:
                 os.killpg(record['pid'], signal.SIGTERM)
             except ProcessLookupError:
@@ -76,9 +113,9 @@ class ProcessGroupManager:
             if self.stop_hook:
                 self.stop_hook('signal_sent', unit)
             deadline = time.monotonic() + self.grace
-            while self._alive(record) and time.monotonic() < deadline:
+            while self._group_alive(record) and time.monotonic() < deadline:
                 time.sleep(0.01)
-            if self._alive(record):
+            if self._group_alive(record):
                 try:
                     os.killpg(record['pid'], signal.SIGKILL)
                 except ProcessLookupError:
@@ -87,7 +124,7 @@ class ProcessGroupManager:
                 # positively gone (dead or zombie), so a caller that checks right after
                 # stop() never sees a run that is merely still dying (Devin r4506539119).
                 deadline = time.monotonic() + KILL_WAIT
-                while self._alive(record) and time.monotonic() < deadline:
+                while self._group_alive(record) and time.monotonic() < deadline:
                     time.sleep(0.005)
         if self.stop_hook:
             self.stop_hook('after_signal', unit)
@@ -101,11 +138,15 @@ class ProcessGroupManager:
         return 'running' if self._alive(record) else 'empty'
 
     def processes_gone(self, unit):
-        """Attest from the recorded pid, not from a scripted observe() result."""
+        """Attest the recorded process group, not a scripted observe() result.
+
+        The leader's pid being gone is not enough: a descendant in that group is
+        still the run.
+        """
         record = self._record(unit)
         if record is None:
             return False
-        return not self._alive(record)
+        return not self._group_alive(record)
 
     def owned_units(self):
         return {p.name for p in self.directory.iterdir() if p.name.endswith(UNIT_SUFFIX)}

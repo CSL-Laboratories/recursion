@@ -15,10 +15,9 @@ and make each one quick to answer. Everything else, do yourself.
 
 **Scope.** These rules govern agents acting through a developer's account or
 session: interactive sessions, scheduled loops and Grok Bots. Repository workflows
-(the `claude.yml` fixer, the Codex gate, stuck-thread-watch, conflict-scan,
-linear-pr-sync and other repository workflows) and Devin automations keep the roles
-in AGENTS.md "Review roles" and "Automations". Their documented markers, receipts
-and audit comments are unchanged.
+(linear-pr-sync and the CI workflows) and the Devin reviewer keep the roles
+in AGENTS.md "Review roles" and "Automations". No workflow answers or writes to a
+pull request.
 
 ## Proceed on your own when ALL of these hold
 
@@ -29,8 +28,7 @@ and audit comments are unchanged.
   what the issue already specifies.
 - It is reversible, and code changes are covered by a test.
 - It needs no new spend, credentials, permissions, settings or protected-path edits.
-- Nobody else holds a claim on the branch or files, and no other writer's run
-  (such as the fixer's `claude-<PR>` lock) is in flight.
+- Nobody else holds a claim on the branch or files.
 - It starts no paid CI (see below). Pushing to a draft PR or a branch with no PR,
   and read-only Actions/API queries, are fine.
 
@@ -46,13 +44,8 @@ and audit comments are unchanged.
   where that decision is recorded (see Decisions).
 - It would start paid CI without a human asking for that run, or its CI cost is
   unclear.
-- An automation signal says a human must act: the fixer is paused
-  (`claude-fixer-paused`, its 8-commit loop cap, or a pause label or marker the
-  repo documents); a fix receipt cannot be verified (short SHA, commit
-  not reachable from the PR head, fingerprint mismatch, no push); a branch with
-  fixer receipts was rebased or force-pushed; or `ci:full` label ownership is
-  uncertain. Never remove a pause yourself, never dispatch the fixer to get
-  around its budget, and never report an unverified fix as fixed.
+- A fix cannot be verified on the PR head (short SHA, commit not reachable from
+  the PR head, no push). Never report an unverified fix as fixed.
 
 If anything on this list holds, escalate; the proceed list never overrides it.
 When unsure, escalate, in the short form below.

@@ -36,7 +36,8 @@ def load_mod():
 
 
 mod = load_mod()
-CODEX = "chatgpt-codex-connector[bot]"
+# A stand-in bot reviewer: none is configured by default since CSL-238 removed the Codex gate.
+BOT = "example-reviewer[bot]"
 
 
 def cfg(**kwargs: Any) -> mod.Config:
@@ -53,7 +54,7 @@ def cfg(**kwargs: Any) -> mod.Config:
 def pull(**kwargs: Any) -> mod.PullSnapshot:
     values = dict(
         number=191,
-        title="CSL-87: Codex mediator stuck-thread workflow",
+        title="CSL-87: stuck-thread workflow",
         body="Fixes CSL-87\n\n## Summary\n\nReplace the out-of-repo watch.\n",
         url="https://github.com/CSL-Laboratories/recursion/pull/191",
         author="NotSkittlz",
@@ -116,35 +117,35 @@ class ParseTests(unittest.TestCase):
 
     def test_review_on_head_requires_matching_sha(self) -> None:
         reviews = [
-            {"user": {"login": CODEX}, "commit_id": "old", "state": "COMMENTED"},
-            {"user": {"login": CODEX}, "commit_id": "abc123def456", "state": "COMMENTED"},
+            {"user": {"login": BOT}, "commit_id": "old", "state": "COMMENTED"},
+            {"user": {"login": BOT}, "commit_id": "abc123def456", "state": "COMMENTED"},
         ]
-        self.assertTrue(mod.review_on_head(reviews, "abc123def456", CODEX))
-        # The bare alias is an ordinary user login, not the Codex App.
+        self.assertTrue(mod.review_on_head(reviews, "abc123def456", BOT))
+        # The bare alias is an ordinary user login, not the App.
         self.assertFalse(
             mod.review_on_head(
-                [{"user": {"login": "chatgpt-codex-connector"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
+                [{"user": {"login": "example-reviewer"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
                 "abc123def456",
-                CODEX,
+                BOT,
             )
         )
         # A [bot] login whose REST type is not Bot does not count either.
         self.assertFalse(
             mod.review_on_head(
-                [{"user": {"login": CODEX, "type": "User"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
+                [{"user": {"login": BOT, "type": "User"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
                 "abc123def456",
-                CODEX,
+                BOT,
             )
         )
         self.assertTrue(
             mod.review_on_head(
-                [{"user": {"login": CODEX, "type": "Bot"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
+                [{"user": {"login": BOT, "type": "Bot"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
                 "abc123def456",
-                CODEX,
+                BOT,
             )
         )
-        self.assertFalse(mod.review_on_head(reviews, "other", CODEX))
-        self.assertFalse(mod.review_on_head([], "abc123def456", CODEX))
+        self.assertFalse(mod.review_on_head(reviews, "other", BOT))
+        self.assertFalse(mod.review_on_head([], "abc123def456", BOT))
 
 
 class BodyTests(unittest.TestCase):
@@ -152,10 +153,10 @@ class BodyTests(unittest.TestCase):
         body = mod.comment_body(
             pull(
                 reviews=(
-                    {"user": {"login": CODEX}, "commit_id": "abc123def456", "state": "COMMENTED"},
+                    {"user": {"login": BOT}, "commit_id": "abc123def456", "state": "COMMENTED"},
                 )
             ),
-            cfg(),
+            cfg(reviewer_login=BOT),
         )
         self.assertIn("<!-- pr-sync:recursion#191 -->", body)
         self.assertIn("https://github.com/CSL-Laboratories/recursion/pull/191", body)
@@ -163,7 +164,8 @@ class BodyTests(unittest.TestCase):
         self.assertIn("**Status:** open", body)
         self.assertIn("`clean`", body)
         self.assertIn("abc123def456", body)
-        self.assertIn("**Codex review on head:** yes", body)
+        self.assertIn("**Review on head (`example-reviewer[bot]`):** yes", body)
+        self.assertNotIn("Codex", body)
         self.assertIn("Replace the out-of-repo watch.", body)
         self.assertIn("`.github/workflows/linear-pr-sync.yml`", body)
         self.assertIn("Linear-first (CSL-88)", body)
@@ -630,7 +632,7 @@ class HttpGuardTests(unittest.TestCase):
         ] * 100
         page2 = [
             {
-                "user": {"login": CODEX, "type": "Bot"},
+                "user": {"login": BOT, "type": "Bot"},
                 "commit_id": "deadbeef",
                 "state": "COMMENTED",
             }
@@ -647,11 +649,38 @@ class HttpGuardTests(unittest.TestCase):
                 return page1
             raise AssertionError(url)
 
+        client = mod.GitHubClient(cfg(reviewer_login=BOT))
+        with mock.patch.object(client, "_request", side_effect=fake_request):
+            snap = client.load_pull(191)
+        assert snap is not None
+        self.assertTrue(mod.review_on_head(list(snap.reviews), "deadbeef", BOT))
+
+    def test_no_configured_reviewer_reads_no_reviews_and_shows_no_review_line(self) -> None:
+        # CSL-238: no bot reviewer by default, so no review pages are read and no line is shown.
+        self.assertEqual(mod.REVIEWER_DEFAULT, "")
+        self.assertEqual(cfg().reviewer_login, "")
+        seen: list[str] = []
+        pr = {"number": 191, "title": "CSL-87: x", "html_url": "https://github.com/CSL-Laboratories/recursion/pull/191",
+              "user": {"login": "a"}, "state": "open", "draft": False, "merged": False, "mergeable": True,
+              "mergeable_state": "clean", "head": {"sha": "deadbeef", "repo": {"full_name": "CSL-Laboratories/recursion"}}}
+
+        def fake_request(url: str, *, method: str = "GET", **_kwargs: Any) -> Any:
+            seen.append(url)
+            if url.endswith("/pulls/191"):
+                return pr
+            if "/files" in url:
+                return []
+            raise AssertionError(url)
+
         client = mod.GitHubClient(cfg())
         with mock.patch.object(client, "_request", side_effect=fake_request):
             snap = client.load_pull(191)
         assert snap is not None
-        self.assertTrue(mod.review_on_head(list(snap.reviews), "deadbeef", CODEX))
+        self.assertEqual(snap.reviews, ())
+        self.assertFalse(any("/reviews" in url for url in seen))
+        body = mod.comment_body(snap, cfg())
+        self.assertNotIn("Review on head", body)
+        self.assertIn("- **Head SHA:** `deadbeef`\n\n### Purpose", body)
 
     def test_from_env(self) -> None:
         env = {
@@ -666,10 +695,109 @@ class HttpGuardTests(unittest.TestCase):
         self.assertEqual(got.pr_number, 191)
         self.assertEqual(got.default_branch, "master")
 
+    def test_from_env_without_reviewer_login_configures_no_reviewer(self) -> None:
+        # CSL-238: production builds its Config here; with REVIEWER_LOGIN unset (as the
+        # workflow leaves it) there is no reviewer, so no review line and no review reads.
+        env = {"GITHUB_REPOSITORY": "CSL-Laboratories/recursion", "GH_TOKEN": "t", "LINEAR_API_KEY": "k",
+               "PR_NUMBER": "191"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("REVIEWER_LOGIN", None)
+            got = mod.Config.from_env()
+        self.assertEqual(got.reviewer_login, "")
+        workflow = (ROOT / ".github" / "workflows" / "linear-pr-sync.yml").read_text(encoding="utf-8")
+        self.assertNotIn("REVIEWER_LOGIN", workflow)
+
 
 class WorkflowAndDocsTests(unittest.TestCase):
     def test_agents_and_claude_are_identical(self) -> None:
         self.assertEqual(AGENTS.read_text(encoding="utf-8"), CLAUDE.read_text(encoding="utf-8"))
+
+    def test_agents_guidance_formerly_pinned_by_the_codex_gate_tests(self) -> None:
+        # Moved from tools/test_codex_gate.py when CSL-238 removed the Codex gate: these
+        # pins guard AGENTS.md text that has nothing to do with the gate.
+        agents = AGENTS.read_text(encoding="utf-8")
+        flat = " ".join(agents.split())
+        for needle in ("No specific tool is required", "gh pr edit <n> --add-reviewer samir-shah-ahmed,CDanTheMan",
+                       "options, tradeoffs,", "target metrics", "Open Deep Research", "Claude Deep Research",
+                       "ChatGPT Deep Research", "submissions/<record_id>/", "tools/check_submission.py",
+                       "issue_urls", "unknown + reason", "CSL-536", "CSL-Laboratories/csl-research",
+                       "ACK TAKEOVER", "`state/INBOX.md` is optional", "Grok Bot, preparing research for <owner>",
+                       "post the cited brief", "@NotSkittlz"):
+            self.assertIn(needle, agents)
+        for needle in ("no mandatory research pipeline", "any deep-research source the team has",
+                       "Never commit research content to this repo", "New non-public docs", "Existing files stay",
+                       "public knowledge-base", "agent instruction files", "do not fall back to this repo",
+                       "no separate admission is needed", "complete only when", "the PR link is on the issue",
+                       "A Linear comment alone is not the record", "follows each repo's own rule",
+                       "the other product repository forbids automatic takeover",
+                       "recursion allows takeover after lease plus grace",
+                       "The Linear issue comment is the canonical escalation", "skip requesting them",
+                       "GitHub rejects review requests to the author", "other founders",
+                       "no eligible code owner can be requested", "independent review, not code-owner review",
+                       "never marks the issue decided", "never clears a hold", "never authorizes implementation",
+                       "explicitly authorized research team", "The developer decides",
+                       "a coding agent @mentions its developer", "does not decide"):
+            self.assertIn(needle, flat)
+        for needle in ("Parallel Task API deep research", "addition to Search/Extract", "web research (Parallel)",
+                       "research-attestations/", "Agent (Grok Bot <name>, for <person>):", "may research and write the brief"):
+            self.assertNotIn(needle, agents)
+        for needle in ("in the issue or evidence", "this guide grants no write route",
+                       "This repository takes contracts, specs, fixtures and runbooks only",
+                       "other code owners", "then decide or @mention"):
+            self.assertNotIn(needle, flat)
+        # The gate's own rules are gone with it.
+        for needle in ("CODEX-GATE", "@codex review", "CODEX_TRIGGER_PAT", "## Code Review Rules", "codex-gate.yml"):
+            self.assertNotIn(needle, agents)
+
+    def test_document_pins_formerly_held_by_the_stuck_thread_watch_test(self) -> None:
+        # Moved from tools/test_stuck_thread_watch.py (master ff3f8071,
+        # WorkflowAndDocsTests.test_docs_point_at_the_workflow) when CSL-238 retired the
+        # watch: these pins guard the branch rule, the issue-reference rule, the roll-up
+        # rule and the pull request template, which have nothing to do with the watch.
+        for text in (AGENTS.read_text(encoding="utf-8"), CLAUDE.read_text(encoding="utf-8")):
+            self.assertIn("needs-decision", text)
+            self.assertIn("Stuck PR threads: recursion#", text)
+            self.assertRegex(text, r"do not\s+file one issue per thread")
+            self.assertIn("<!-- stuck-pr-threads:recursion#<PR> -->", text)
+            self.assertIn("csl-<N>-<slug>", text)
+            self.assertIn("Fixes CSL-N", text)
+            self.assertNotIn("Commit to `loop/work/<task-id>`", text)
+            self.assertNotIn("Branch naming is deferred to", text)
+        contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        self.assertIn("csl-<N>-<slug>", contributing)
+        self.assertIn("Fixes CSL-N", contributing)
+        self.assertNotIn("keep this convention", contributing)
+        self.assertNotIn("Branch naming is deferred to", contributing)
+        template = (ROOT / ".github" / "pull_request_template.md").read_text(encoding="utf-8")
+        self.assertIn("Stuck PR threads: recursion#<PR>", template)
+        self.assertIn("## Branch", template)
+        self.assertIn("## Test plan", template)
+        self.assertIn("Touches other repos?", template)
+        # CSL-238: the template's review line is Devin's, answered by hand.
+        self.assertIn("- [ ] Devin Review threads on the current head read and answered by hand", template)
+        self.assertNotIn("Codex", template)
+
+    def test_contributing_links_into_agents_md_reach_a_heading(self) -> None:
+        # Replaces the master pin of AGENTS.md#when-claude-cant-fix-a-review-thread: that
+        # section of CONTRIBUTING.md is gone with the writer, and no link may point at a
+        # heading that does not exist.
+        contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        agents = AGENTS.read_text(encoding="utf-8")
+        slugs = {
+            "".join(c for c in line[3:].strip().lower() if c.isalnum() or c in " -").replace(" ", "-")
+            for line in agents.splitlines()
+            if line.startswith("## ")
+        }
+        parts = contributing.split("AGENTS.md#")[1:]
+        self.assertTrue(parts)
+        for part in parts:
+            anchor = ""
+            for c in part:
+                if not (c.isalnum() or c == "-"):
+                    break
+                anchor += c
+            self.assertIn(anchor, slugs)
+        self.assertNotIn("When Claude can't fix", contributing)
 
     def test_docs_require_grok_bots_to_read_pr_sync_comments(self) -> None:
         text = AGENTS.read_text(encoding="utf-8")

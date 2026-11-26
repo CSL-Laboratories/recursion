@@ -314,6 +314,12 @@ class TestInventoryTests(unittest.TestCase):
             self.assertTrue((ROOT / path).is_file(), path)
             self.assertNotIn(path, run)
 
+    def test_test_exclude_is_empty(self) -> None:
+        # CSL-238: the exclude list is empty. An entry for a test that still exists would drop it
+        # from the gate while every other test stays green, so a new exclusion must change this
+        # assertion in a reviewed commit.
+        self.assertEqual(ci_gate.TEST_EXCLUDE, set())
+
     def test_x1_inventory_floor_is_discovered_and_run(self) -> None:
         run = ci_gate.assert_tests_accounted()
         self.assertIn("scripts/tests/v3/x1/inventory.test.py", run)

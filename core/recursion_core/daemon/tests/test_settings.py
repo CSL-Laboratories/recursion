@@ -14,6 +14,7 @@ import inspect
 import io
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -110,8 +111,9 @@ class TheFileAndItsDefaults(_Folder):
         self.assertIs(loaded["plugin_host.gil_check"], False)
         self.assertEqual(settings.SOURCE_FILE, loaded.values["plugin_host.gil_check"].source)
         self.assertEqual([], self.codes(loaded))
-        self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)"],
-                         settings.lines(loaded))
+        shown = settings.lines(loaded)  # one line per declared row, in the registry's order, and no note
+        self.assertEqual([row.name for row in settings.SETTINGS], [line.split(" = ", 1)[0] for line in shown])
+        self.assertIn("plugin_host.gil_check = false (default true; source: settings file)", shown)
 
     def test_a_dotted_key_is_the_same_setting(self) -> None:
         self.put("version = 1\nplugin_host.gil_check = false\n")
@@ -347,7 +349,7 @@ class OwnerOnlyAndWrongFiles(_Folder):
                 self.put(text)
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNKNOWN_KEY)  # one note, for a whole table too
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[len(settings.SETTINGS):])
 
     def test_the_command_ends_non_zero_when_a_key_or_table_was_skipped(self) -> None:
         for case, (text, _) in UNKNOWN.items():
@@ -370,7 +372,7 @@ class OwnerOnlyAndWrongFiles(_Folder):
             with self.subTest(case=self.put_broken(case)):
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNREADABLE)
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[len(settings.SETTINGS):])
 
     def test_the_command_ends_non_zero_for_a_file_that_cannot_be_read_as_a_whole(self) -> None:
         for case in BROKEN:
@@ -897,10 +899,25 @@ class WhatAPluginIsHanded(_Folder):
         self.assertTrue(_held_of_settings(handed))
 
 
+def _no_key_twice(pairs: list) -> dict:
+    """json.loads keeps the last of two equal keys and says nothing; the published schema may not repeat one."""
+    found = {}
+    for key, part in pairs:
+        if key in found:
+            raise AssertionError(f"the schema writes the key {key!r} twice in one object; "
+                                 "give each key one entry there")
+        found[key] = part
+    return found
+
+
+def _published_schema() -> dict:
+    return json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"), object_pairs_hook=_no_key_twice)
+
+
 @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
 class PublishedShape(_Folder):
     def test_the_schema_declares_exactly_the_table(self) -> None:
-        schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
+        schema = _published_schema()
         self.assertEqual({"const": settings.FILE_VERSION}, schema["properties"]["version"])
         kinds = {bool: "boolean", int: "integer", float: "number", str: "string"}
         found = {}
@@ -920,7 +937,7 @@ class PublishedShape(_Folder):
         self.assertEqual(expect, found)
 
     def test_the_schema_describes_the_readers_version_type(self) -> None:
-        schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
+        schema = _published_schema()
         self.assertIn("The settings file reader accepts version only as a TOML integer "
                       "(a whole number such as 1) and rejects a float such as 1.0.",
                       schema["description"])
@@ -949,7 +966,7 @@ class PublishedShape(_Folder):
         self.put(good[0].read_text(encoding="utf-8"))
         loaded = settings.load(self.environ)
         self.assertEqual([], self.codes(loaded))
-        self.assertEqual({settings.SOURCE_FILE}, {v.source for v in loaded.values.values()})
+        self.assertEqual([], [v.name for v in loaded.values.values() if v.source != settings.SOURCE_FILE])  # unset rows
         self.put(bad[0].read_text(encoding="utf-8"))
         self.assert_default(settings.load(self.environ), settings.OUT_OF_RANGE)
 
@@ -1038,6 +1055,415 @@ class ATableAndAKeyReadUnderTheFullDottedName(_Folder):
                 self.assert_default(loaded, settings.UNKNOWN_KEY)
                 self.assertNotIn(FULL_NAME, loaded.values)
                 self.assertEqual("'engines' is not a setting this version knows; it is skipped", loaded.notes[0].detail)
+
+
+# The rows of the registry are the expected rows. Every case below is made, when the test runs, from
+# ``settings.SETTINGS`` and from nothing written here, so a new row is covered with no edit of this file. The exact
+# words of a status line are pinned once, for rows the test itself registers (GOLDEN_ROWS), never for the product's.
+KINDS = {bool: "boolean", int: "integer", float: "number", str: "string"}
+# Per type: values of another type, as a person writes them in the file and as the note shows them.
+WRONG_TYPE = {
+    bool: (('"no"', "'no'"), ("1", "1"), ("[]", "a list")),
+    int: (('"3"', "'3'"), ("true", "true"), ("2.5", "2.5"), ("[]", "a list")),
+    float: (('"0.5"', "'0.5'"), ("true", "true"), ("[]", "a list")),
+    str: (("1", "1"), ("true", "true"), ("[]", "a list")),
+}
+NAME_PART = re.compile(r"[a-z][a-z0-9_]*\Z")
+
+
+def _toml(value: object) -> str:
+    """``value`` as a person writes it in the TOML file."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value)  # a TOML basic string takes the escapes JSON writes
+    return repr(value)
+
+
+def _allowed_words(row: settings.Setting) -> str:
+    """What a note tells the person they can write instead, made from the row's own declaration."""
+    if row.type is bool:
+        return "true or false"
+    kind = {int: "a whole number", float: "a number", str: "a text"}[row.type]
+    if row.floor is not None and row.ceiling is not None:
+        return f"{kind} from {settings._shown(row.floor)} to {settings._shown(row.ceiling)}"
+    return kind
+
+
+def _another_value(row: settings.Setting) -> object:
+    """A value of the row's own type, inside its floor and ceiling, that is not its default where one exists."""
+    if row.type is bool:
+        return not row.default
+    if row.type is str:
+        return row.default + "x"
+    step = 1 if row.type is int else 0.25
+    for value in (row.default + step, row.default - step, row.floor, row.ceiling):
+        if value is not None and value != row.default and (row.floor is None or value >= row.floor) \
+                and (row.ceiling is None or value <= row.ceiling):
+            return row.type(value)
+    return row.default
+
+
+def _past(row: settings.Setting, edge: int | float, way: int) -> int | float:
+    """The nearest value of the row's type just outside ``edge``: below a floor (way -1), above a ceiling (+1)."""
+    if row.type is int:
+        return edge + way
+    return math.nextafter(float(edge), way * math.inf)
+
+
+def _row_faults(row: settings.Setting, names: list) -> list[str]:
+    """What ``row`` lacks, in words that name the row, what it lacks and what to give it; empty for a whole row.
+    ``names`` are the names of every row of the registry it belongs to."""
+    faults = []
+    name = row.name if isinstance(row.name, str) and row.name else None
+    who = f"the row {name!r}" if name else f"a row with no name ({row!r})"
+    if name is None:
+        faults.append(f"{who} has no name; give it a dotted name such as table.key")
+    elif not all(NAME_PART.match(part) for part in name.split(".")) or name.split(".")[0] == "version":
+        faults.append(f"{who} has a name a person cannot write as a key of the file; use lower-case words "
+                      "joined by dots, never under version")
+    if names.count(row.name) > 1:
+        faults.append(f"{who} shares its name with another row; give each row a name of its own")
+    elif name and any(isinstance(other, str) and other.startswith(name + ".") for other in names):
+        faults.append(f"{who} is also the table of another row, and a file cannot hold both; rename one")
+    if row.type not in KINDS:
+        faults.append(f"{who} has no type of bool, int, float or str (found {row.type!r}); give it one")
+    elif row.default is None:
+        faults.append(f"{who} has no default; give it the value in force when the file does not set it")
+    elif type(row.default) is not row.type or (row.type is float and not math.isfinite(row.default)):
+        faults.append(f"{who} has a default of another type ({type(row.default).__name__}, the row is "
+                      f"{row.type.__name__}); give it a default of its own type")
+    bounds = [edge for edge in (row.floor, row.ceiling) if edge is not None]
+    if bounds and row.type not in (int, float):
+        faults.append(f"{who} has a floor or a ceiling but is not a number; take them away")
+    elif any(type(edge) not in (int, float) or not math.isfinite(edge) for edge in bounds):
+        faults.append(f"{who} has a floor or a ceiling that is not a finite number; give it one")
+    elif row.floor is not None and row.ceiling is not None and row.floor > row.ceiling:
+        faults.append(f"{who} has its floor above its ceiling; swap them")
+    elif bounds and type(row.default) is row.type and ((row.floor is not None and row.default < row.floor)
+                                                       or (row.ceiling is not None and row.default > row.ceiling)):
+        faults.append(f"{who} has its default {row.default!r} outside its own floor and ceiling; give it a default "
+                      "inside them")
+    says = row.says
+    if not isinstance(says, str) or not says.strip():
+        faults.append(f"{who} has no description; say in one sentence what a person trades by changing it")
+    elif says != says.strip() or "\n" in says or not says[0].isupper() or not says.endswith(".") or " " not in says:
+        faults.append(f"{who} has a description that is not one plain sentence (a capital first, a full stop last, "
+                      "on one line); write it so")
+    return faults
+
+
+def _registry(case: unittest.TestCase, rows) -> None:
+    """``rows`` are the registry for the rest of the test ``case``; the product's registry is back after it."""
+    rows = tuple(rows)
+    for name, value in (("SETTINGS", rows), ("DECLARED", MappingProxyType({row.name: row for row in rows}))):
+        patcher = mock.patch.object(settings, name, value)
+        patcher.start()
+        case.addCleanup(patcher.stop)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class EveryRowOfTheRegistry(_Folder):
+    """Seven cases for each row of ``settings.SETTINGS``, each made from the row itself."""
+
+    def read(self, text: str):
+        self.put(text)
+        return settings.load(self.environ)
+
+    def test_every_row_is_declared_with_a_name_a_type_a_default_and_a_description(self) -> None:
+        names = [row.name for row in settings.SETTINGS]
+        self.assertTrue(names)
+        for row in settings.SETTINGS:
+            with self.subTest(row=row.name):
+                self.assertEqual([], _row_faults(row, names))
+        self.assertEqual(names, list(settings.DECLARED))  # DECLARED is the one declaration, in its order, no row lost
+
+    def test_every_row_has_its_default_with_no_file_and_with_an_empty_file(self) -> None:
+        for text in (None, "version = 1\n"):
+            if text is not None:
+                self.put(text)
+            loaded = settings.load(self.environ)
+            self.assertEqual([], self.codes(loaded))
+            for row in settings.SETTINGS:
+                with self.subTest(row=row.name, file=text):
+                    value = loaded.values[row.name]
+                    self.assertEqual((row.default, row.type, row.default, settings.SOURCE_DEFAULT),
+                                     (value.value, type(value.value), value.default, value.source))
+
+    def test_every_row_takes_a_value_of_its_own_type_from_the_file_and_shows_it(self) -> None:
+        for row in settings.SETTINGS:
+            with self.subTest(row=row.name):
+                other = _another_value(row)
+                loaded = self.read(f"version = 1\n{row.name} = {_toml(other)}\n")
+                self.assertEqual([], self.codes(loaded))
+                self.assertEqual((other, settings.SOURCE_FILE), (loaded[row.name], loaded.values[row.name].source))
+                self.assertIn(f"{row.name} = {settings._shown(other)} (default {settings._shown(row.default)}; "
+                              "source: settings file)", settings.lines(loaded))
+                self.assertEqual([], [n for n, v in loaded.values.items()
+                                      if n != row.name and v.source != settings.SOURCE_DEFAULT])
+
+    def test_every_row_refuses_a_value_of_another_type_and_the_note_names_it_and_what_to_write(self) -> None:
+        for row in settings.SETTINGS:
+            for written, shown in WRONG_TYPE[row.type]:
+                with self.subTest(row=row.name, found=written):
+                    loaded = self.read(f"version = 1\n{row.name} = {written}\n")
+                    self.assertEqual((row.default, settings.SOURCE_DEFAULT),
+                                     (loaded[row.name], loaded.values[row.name].source))
+                    self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
+                    detail = loaded.notes[0].detail
+                    self.assertTrue(detail.startswith(f"{row.name}: found {shown}; "), detail)  # the key and its value
+                    self.assertIn(f"; allowed: {_allowed_words(row)}; ", detail)  # what the person can write instead
+                    kept = f"the default {settings._shown(row.default)} stays in force"
+                    self.assertTrue(detail.endswith(kept), detail)
+
+    def test_every_row_holds_its_floor_and_ceiling_at_their_edges(self) -> None:
+        for row in settings.SETTINGS:
+            edges = []
+            if row.floor is not None:
+                edges += [(row.floor, True), (_past(row, row.floor, -1), False)]
+            if row.ceiling is not None:
+                edges += [(row.ceiling, True), (_past(row, row.ceiling, 1), False)]
+            for value, taken in edges:
+                with self.subTest(row=row.name, value=value):
+                    loaded = self.read(f"version = 1\n{row.name} = {_toml(value)}\n")
+                    found = (self.codes(loaded), loaded[row.name], loaded.values[row.name].source)
+                    if taken:
+                        self.assertEqual(([], value, settings.SOURCE_FILE), found)
+                    else:
+                        self.assertEqual(([settings.OUT_OF_RANGE], row.default, settings.SOURCE_DEFAULT), found)
+                        self.assertIn(f"; allowed: {_allowed_words(row)}; ", loaded.notes[0].detail)
+
+    def test_every_rows_undeclared_neighbour_is_skipped_and_never_applied(self) -> None:
+        for row in settings.SETTINGS:
+            neighbour = row.name + "_undeclared"
+            with self.subTest(row=row.name):
+                loaded = self.read(f"version = 1\n{neighbour} = {_toml(_another_value(row))}\n")
+                self.assertEqual([settings.UNKNOWN_KEY], self.codes(loaded))
+                self.assertTrue(loaded.notes[0].warns)
+                self.assertIn(repr(neighbour), loaded.notes[0].detail)
+                self.assertEqual(list(settings.DECLARED), list(loaded.values))  # nothing undeclared is taken in
+                self.assertEqual(settings.SOURCE_DEFAULT, loaded.values[row.name].source)
+
+    def test_status_shows_each_row_once_in_the_registrys_order_then_each_note(self) -> None:
+        wrong = "".join(f"{row.name} = {WRONG_TYPE[row.type][-1][0]}\n" for row in settings.SETTINGS)
+        loaded = self.read("version = 1\nnot_a_row = 1\n" + wrong)
+        shown, count = settings.lines(loaded), len(settings.SETTINGS)
+        self.assertEqual(1 + count, len(loaded.notes))
+        for row, line in zip(settings.SETTINGS, shown):
+            self.assertEqual(f"{row.name} = {settings._shown(row.default)} (default {settings._shown(row.default)}; "
+                             "source: default)", line)
+        notes = [f"{settings.WARNED if note.warns else ''}note {note}" for note in loaded.notes]
+        self.assertEqual(notes, shown[count:])
+
+
+GOLDEN_ROWS = (
+    settings.Setting("golden.flag", bool, True, "Whether the golden row is on; a row of this test only."),
+    settings.Setting("golden.count", int, 3, "How many golden things are kept, a count; a row of this test only.",
+                     1, 10),
+    settings.Setting("golden.share", float, 0.5, "What share of golden things is kept, from 0 to 1; a row of this "
+                     "test only.", 0.0, 1.0),
+    settings.Setting("golden.label", str, "x", "What the golden row is called; a row of this test only."),
+)
+GOLDEN_FILE = 'version = 1\n\n[golden]\nflag = false\ncount = 11\nlabel = "y"\nzzz = 1\n'
+GOLDEN_LINES = [
+    "golden.flag = false (default true; source: settings file)",
+    "golden.count = 3 (default 3; source: default)",
+    "golden.share = 0.5 (default 0.5; source: default)",
+    "golden.label = 'y' (default 'x'; source: settings file)",
+    "note settings_value_out_of_range: golden.count: found 11; allowed: a whole number from 1 to 10; the default 3 "
+    "stays in force",
+    "warning: note settings_unknown_key: 'golden.zzz' is not a setting this version knows; it is skipped",
+]
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class TheWordsOfStatusForRowsTheTestRegisters(_Folder):
+    """The exact words of status, pinned for rows this test registers in place of the product's."""
+
+    def test_status_shows_these_words_in_this_order_and_nothing_else(self) -> None:
+        _registry(self, GOLDEN_ROWS)
+        self.put(GOLDEN_FILE)
+        self.assertEqual(GOLDEN_LINES, settings.lines(settings.load(self.environ)))
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class ThePublishedPlacesHoldEachRow(_Folder):
+    """The README's table holds each row of the registry once, in its order, with its type, default and words."""
+
+    def test_the_readme_table_holds_each_row_with_its_type_default_and_description_and_no_other(self) -> None:
+        readme = (SCHEMA_DIR / "README.md").read_text(encoding="utf-8")
+        table, names = {}, []
+        for line in readme.splitlines():
+            found = re.fullmatch(r"\| `([^`]+)` \| (\w+) \| `([^`]*)` \| (.+) \|", line)
+            if found:
+                names.append(found.group(1))
+                table[found.group(1)] = found.groups()[1:]
+        said = "the README's table of settings and the registry differ; give each row one line there"
+        repeated = [f"{name} ({count} times)" for name, count in collections.Counter(names).items() if count > 1]
+        if repeated:
+            said += "; written more than once: " + ", ".join(repeated)
+        self.assertEqual([row.name for row in settings.SETTINGS], names, said)
+        for row in settings.SETTINGS:
+            with self.subTest(row=row.name):
+                kind, default, says = table[row.name]
+                self.assertEqual((KINDS[row.type], _toml(row.default)), (kind, default))
+                self.assertTrue(says.startswith(row.says), f"the README's words for {row.name} do not begin with "
+                                                          "the row's description")
+
+
+README_TABLE_TEST = "test_the_readme_table_holds_each_row_with_its_type_default_and_description_and_no_other"
+SCHEMA_TESTS = {"test_the_schema_declares_exactly_the_table", "test_the_schema_describes_the_readers_version_type"}
+
+
+# Rows a later version might add, one of each type, one in a table the product already has and one two tables deep.
+THROWAWAY_ROWS = (
+    settings.Setting("test_only.count", int, 3, "How many throwaway things are kept, a count; a row of this test "
+                     "only.", 0, 10),
+    settings.Setting("test_only.share", float, 0.25, "What share is thrown away, from 0 to 1; a row of this test "
+                     "only.", 0.0, 1.0),
+    settings.Setting("test_only.label", str, "", "What the throwaway row is called; a row of this test only."),
+    settings.Setting("test_only.deep.flag", bool, False, "Whether the deep throwaway row is on; a row of this test "
+                     "only."),
+    settings.Setting("plugin_host.test_only_wait", float, 2.5, "How long a throwaway wait lasts, in seconds; a row of "
+                     "this test only.", 0, None),
+)
+# The tests that compare the registry with a published place: a row the module declares and a place lacks is red.
+PUBLISHED_PLACES = {
+    "test_the_schema_declares_exactly_the_table": None,
+    "test_the_readme_names_each_setting": "`test_only.count`",
+    "test_the_good_fixture_is_read_whole_and_the_bad_one_keeps_the_default": "test_only.count",
+    "test_the_readme_table_holds_each_row_with_its_type_default_and_description_and_no_other": "test_only.count",
+}
+# Rows that lack something, and the words their failure must hold beside the row's name.
+LACKING_ROWS = (
+    (settings.Setting("lacking.default", int, None, "How many, a count; a row of this test only."), "has no default"),
+    (settings.Setting("lacking.type", None, 1, "How many, a count; a row of this test only."), "has no type"),
+    (settings.Setting("lacking.says", int, 1, ""), "has no description"),
+    (settings.Setting("lacking.sentence", int, 1, "how many"), "not one plain sentence"),
+    (settings.Setting("outside.bounds", int, 20, "How many, a count; a row of this test only.", 0, 10),
+     "outside its own floor and ceiling"),
+    (settings.Setting("wrong.default", int, "3", "How many, a count; a row of this test only."),
+     "a default of another type"),
+    (settings.Setting("plugin_host.gil_check", bool, False, "A second row of the same name; a row of this test only."),
+     "shares its name"),
+)
+
+
+def _each_test(suite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from _each_test(item)
+        else:
+            yield item
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class ANewRowNeedsNoTestEdit(_Folder):
+    """Every test of this file is run again with rows added to a copy of the registry, and nothing here is edited."""
+
+    def run_with(self, rows, keep) -> unittest.TestResult:
+        tests = [test for test in _each_test(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
+                 if not isinstance(test, ANewRowNeedsNoTestEdit) and keep(test)]
+        self.assertTrue(tests)
+        result = unittest.TestResult()
+        with mock.patch.object(settings, "SETTINGS", tuple(rows)), \
+                mock.patch.object(settings, "DECLARED", MappingProxyType({row.name: row for row in rows})):
+            unittest.TestSuite(tests).run(result)
+        return result
+
+    def failed(self, result: unittest.TestResult) -> dict[str, str]:
+        """Each failed test method by its name, with the text of every failure and error it had (subtests too)."""
+        texts = collections.defaultdict(list)
+        for test, text in result.failures + result.errors:
+            texts[getattr(test, "test_case", test).id().rsplit(".", 1)[-1]].append(text)
+        return {name: "\n".join(parts) for name, parts in texts.items()}
+
+    def test_new_rows_pass_every_test_of_this_file_with_no_edit(self) -> None:
+        result = self.run_with(settings.SETTINGS + THROWAWAY_ROWS,
+                               lambda test: test.id().rsplit(".", 1)[-1] not in PUBLISHED_PLACES)
+        self.assertEqual({}, self.failed(result))
+        self.assertGreater(result.testsRun, len(PUBLISHED_PLACES))
+
+    def test_the_golden_rows_pass_every_case_made_from_the_registry(self) -> None:
+        result = self.run_with(settings.SETTINGS + GOLDEN_ROWS, lambda test: isinstance(test, EveryRowOfTheRegistry))
+        self.assertEqual({}, self.failed(result))
+        self.assertEqual(len(unittest.defaultTestLoader.getTestCaseNames(EveryRowOfTheRegistry)), result.testsRun)
+
+    def test_a_row_the_published_places_lack_is_red_there_and_named(self) -> None:
+        # The new rows come first, so the words name them even where a product row is missing from a place too.
+        result = self.run_with(THROWAWAY_ROWS + settings.SETTINGS,
+                               lambda test: test.id().rsplit(".", 1)[-1] in PUBLISHED_PLACES)
+        failed = self.failed(result)
+        self.assertEqual(set(PUBLISHED_PLACES), set(failed))
+        for name, words in PUBLISHED_PLACES.items():
+            if words is not None:
+                with self.subTest(test=name):
+                    self.assertIn(words, failed[name])
+
+    def a_copy_of_the_published_places(self, change) -> Path:
+        """The README and the schema copied into the test's own folder, each text made by ``change(name, text)``."""
+        folder = self.tmp / "published"
+        folder.mkdir()
+        for name in ("README.md", "settings.v1.json"):
+            text = (SCHEMA_DIR / name).read_text(encoding="utf-8")
+            (folder / name).write_text(change(name, text), encoding="utf-8")
+        return folder
+
+    def run_against(self, folder: Path, names: set[str]) -> dict[str, str]:
+        """The named tests of this file run on the real registry with SCHEMA_DIR pointed at ``folder``."""
+        with mock.patch.object(sys.modules[__name__], "SCHEMA_DIR", folder):
+            result = self.run_with(settings.SETTINGS, lambda test: test.id().rsplit(".", 1)[-1] in names)
+        self.assertEqual(len(names), result.testsRun)
+        return self.failed(result)
+
+    def test_copies_of_the_real_readme_and_schema_pass_the_tests_that_read_them(self) -> None:
+        folder = self.a_copy_of_the_published_places(lambda name, text: text)
+        self.assertEqual({}, self.run_against(folder, {README_TABLE_TEST} | SCHEMA_TESTS))
+
+    def test_a_line_of_the_readme_table_written_twice_is_red_and_the_row_is_named_with_its_count(self) -> None:
+        def twice(name: str, text: str) -> str:
+            if name != "README.md":
+                return text
+            lines = text.splitlines(keepends=True)
+            at = [i for i, line in enumerate(lines) if line.startswith("| `plugin_host.gil_check` |")]
+            self.assertEqual(1, len(at))
+            return "".join(lines[:at[0] + 1] + lines[at[0]:])  # the same line again, right after itself
+
+        failed = self.run_against(self.a_copy_of_the_published_places(twice), {README_TABLE_TEST})
+        self.assertEqual({README_TABLE_TEST}, set(failed))
+        self.assertIn("plugin_host.gil_check (2 times)", failed[README_TABLE_TEST])
+
+    def test_a_key_of_the_schema_written_twice_is_red_and_named(self) -> None:
+        def twice(name: str, text: str) -> str:
+            if name != "settings.v1.json":
+                return text
+            key = '"gil_check": '
+            self.assertEqual(1, text.count(key))
+            start = text.index(key)
+            _, end = json.JSONDecoder().raw_decode(text, start + len(key))
+            return text[:end] + ",\n        " + text[start:end] + text[end:]  # the whole property again
+
+        folder = self.a_copy_of_the_published_places(twice)
+        real = (SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8")
+        doubled = (folder / "settings.v1.json").read_text(encoding="utf-8")
+        self.assertNotEqual(real, doubled)
+        self.assertEqual(json.loads(real), json.loads(doubled))  # json.loads keeps the last of two keys, says nothing
+        failed = self.run_against(folder, SCHEMA_TESTS)
+        self.assertEqual(SCHEMA_TESTS, set(failed))
+        for name, text in failed.items():
+            with self.subTest(test=name):
+                self.assertIn("'gil_check'", text)
+                self.assertIn("twice", text)
+
+    def test_a_row_that_lacks_something_fails_with_words_that_name_it_and_what_it_lacks(self) -> None:
+        for row, lack in LACKING_ROWS:
+            with self.subTest(row=row.name, lacks=lack):
+                result = self.run_with(settings.SETTINGS + (row,), lambda test: test.id().endswith(
+                    ".test_every_row_is_declared_with_a_name_a_type_a_default_and_a_description"))
+                text = "\n".join(self.failed(result).values())
+                self.assertTrue(result.failures, f"a row that {lack} passed")
+                self.assertIn(repr(row.name), text)
+                self.assertIn(lack, text)
 
 
 if __name__ == "__main__":

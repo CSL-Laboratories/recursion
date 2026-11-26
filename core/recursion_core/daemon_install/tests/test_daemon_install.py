@@ -32,6 +32,7 @@ from recursion_core.daemon_install import (
     uninstall,
     upgrade,
 )
+from recursion_core.daemon_install.tests.mount_stub import setUpModule, tearDownModule  # noqa: F401
 from recursion_core.plugin_security import stores
 
 PY = "/opt/recursion/venv/bin/python3.14t"
@@ -1570,12 +1571,14 @@ class InstallTests(unittest.TestCase):
             return real_fsync(fd)
         with mock.patch("os.fsync", side_effect=fsync):
             install(self.roots, EXEC)
-            # Each new store's folder (``stores._create``; SQLite syncs the store's own file), then the unit.
-            self.assertEqual(synced, ["dir", "dir", "file", "dir"])
+            # Each new store: its build folder (``stores._create``; SQLite syncs the built file), then the store as
+            # written through its folder and that folder (``_Run.store``); then the unit and its folder.
+            made = ["dir", "file", "dir"] * 2 + ["file", "dir"]
+            self.assertEqual(synced, made)
             upgrade(self.roots, EXEC_NEXT)
-            self.assertEqual(synced, ["dir", "dir", "file", "dir", "file", "dir"])
+            self.assertEqual(synced, made + ["file", "dir"])
             uninstall(self.roots)
-            self.assertEqual(synced, ["dir", "dir", "file", "dir", "file", "dir", "dir"])
+            self.assertEqual(synced, made + ["file", "dir", "dir"])
 
 
 @unittest.skipUnless(os.name == "posix", "the installer is Linux-only")
@@ -1709,15 +1712,14 @@ class StoreTests(unittest.TestCase):
                 self.assertIn(type(exc).__name__, error.detail)
                 self.assertFalse(os.path.lexists(self.unit))
         # For real: a umask that takes the owner's own write bit leaves a folder no store can be made in.
-        shutil.rmtree(self.store_dir)
+        self.assertFalse(os.path.lexists(self.store_dir))  # the refused runs removed the folder they made
         old = os.umask(0o277)
         try:
             error = self.refused("store_not_created", install, self.roots, EXEC)
         finally:
             os.umask(old)
-            os.chmod(self.store_dir, 0o700)
         self.assertIn("PermissionError", error.detail)
-        self.assertEqual(os.listdir(self.store_dir), [])
+        self.assertFalse(os.path.lexists(self.store_dir))  # the folder made for the store is removed with it
         self.assertFalse(os.path.lexists(self.unit))
 
     def test_a_store_the_helper_cannot_link_into_place_is_not_created(self) -> None:
@@ -1728,7 +1730,7 @@ class StoreTests(unittest.TestCase):
             for number in (errno.ENOSPC, errno.EIO, errno.EPERM):
                 with self.subTest(store=os.path.basename(path), errno=number):
                     def link(src, dst, *args, **kwargs):
-                        if os.fspath(dst) == path:
+                        if os.fspath(dst) in (path, os.path.basename(path)):  # by path, or through its folder
                             raise OSError(number, os.strerror(number), dst)
                         return real_link(src, dst, *args, **kwargs)
                     with mock.patch("os.link", side_effect=link):
@@ -1737,7 +1739,7 @@ class StoreTests(unittest.TestCase):
                     self.assertIn("cannot link the new store", error.detail)
                     self.assertFalse(os.path.lexists(path))
                     self.assertFalse(os.path.lexists(self.unit))
-                    self.assertLessEqual(set(os.listdir(self.store_dir)), {"breaker.sqlite3"})  # no temporary file
+                    self.assertFalse(os.path.lexists(self.store_dir))  # nothing of the refused run, no temporary file
 
 
 @unittest.skipUnless(os.name == "posix", "the installer is Linux-only")
@@ -1794,7 +1796,8 @@ class CustodyRootMadeTests(unittest.TestCase):
                     if command == "install":
                         uninstall(self.roots)
                     before = self.unit_bytes() if os.path.lexists(self.unit) else None
-                    os.rmdir(self.homes)
+                    if os.path.lexists(self.homes):  # a refused round removes the root it made
+                        os.rmdir(self.homes)
                     old = os.umask(umask)
                     try:
                         error = self.refused(install if command == "install" else upgrade, self.roots, args)
@@ -1803,6 +1806,7 @@ class CustodyRootMadeTests(unittest.TestCase):
                         if os.path.lexists(self.homes):
                             os.chmod(self.homes, 0o700)
                     self.assertIn("readable, writable and searchable by its owner", error.detail)
+                    self.assertFalse(os.path.lexists(self.homes))  # the root the refused round made is removed
                     if before is None:
                         self.assertFalse(os.path.lexists(self.unit))
                         install(self.roots, EXEC)

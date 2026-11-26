@@ -27,6 +27,7 @@ import recursion_core
 from recursion_core.control.commands import setup
 from recursion_core.daemon_install import Roots, daemon_exec_args, install as install_function, owned_paths
 from recursion_core.daemon_install.tests.test_daemon_install import POSIX_PATHS
+from recursion_core.daemon_install.tests.mount_stub import setUpModule, tearDownModule  # noqa: F401
 from recursion_core.plugin_security.signing import backend_available, key_id
 
 # The module, not the package attribute ``install``, which is the function.
@@ -420,7 +421,7 @@ class AnchorKeyTests(unittest.TestCase):
                 self.assert_neither_then_whole(root, home, environ, paths, answer, err)
 
     @needs_crypto
-    def test_a_ledger_made_and_then_its_step_failing_keeps_the_key_with_it(self):
+    def test_a_ledger_step_failing_after_the_ledger_was_built_removes_the_key_made_with_it(self):
         from recursion_core.plugin_security import stores
         real_create = stores.create_ledger
         for root, home, environ in self.profiles():
@@ -433,16 +434,16 @@ class AnchorKeyTests(unittest.TestCase):
                 with mock.patch.object(stores, "create_ledger", side_effect=create_then_fail):
                     code, answer, err = self.run_action(home, environ)
                 self.assertEqual((code, answer["code"]), (1, "store_not_created"), answer)
-                self.assertTrue(os.path.lexists(paths.anchor_key))
-                self.assertEqual(self.ledger_anchor(paths.ledger), key_id(self.public_of(paths.anchor_key)))
-                self.assertEqual(err, install_module.ANCHOR_MADE.format(path=paths.anchor_key) + "\n")
-                before = self.public_of(paths.anchor_key)
+                self.assertFalse(os.path.lexists(paths.anchor_key))  # nothing this run made is left
+                self.assertFalse(os.path.lexists(paths.ledger))
+                self.assertEqual(err, "")  # no key is said to be made: none is kept
                 code, again, err = self.run_action(home, environ)
-                self.assertEqual((code, again["code"], again["ledger"]["created"], err), (0, "ok", False, ""), again)
-                self.assertEqual(self.public_of(paths.anchor_key), before)
+                self.assertEqual((code, again["code"], again["ledger"]["created"], err),
+                                 (0, "ok", True, install_module.ANCHOR_MADE.format(path=paths.anchor_key) + "\n"), again)
+                self.assertEqual(self.ledger_anchor(paths.ledger), key_id(self.public_of(paths.anchor_key)))
 
     @needs_crypto
-    def test_the_made_line_is_shown_when_a_later_step_fails(self):
+    def test_no_made_line_is_shown_when_a_later_step_fails_and_the_key_is_removed(self):
         if os.geteuid() == 0:
             self.skipTest("root writes into a folder whose mode refuses its owner")
         for root, home, environ in self.profiles():
@@ -454,11 +455,13 @@ class AnchorKeyTests(unittest.TestCase):
                 self.addCleanup(os.chmod, systemd, 0o700)
                 code, answer, err = self.run_action(home, environ)
                 self.assertEqual((code, answer["code"]), (1, "filesystem_error"), answer)
-                self.assertEqual(self.ledger_anchor(paths.ledger), key_id(self.public_of(paths.anchor_key)))
-                self.assertEqual(err, install_module.ANCHOR_MADE.format(path=paths.anchor_key) + "\n")
+                self.assertFalse(os.path.lexists(paths.ledger))  # nothing this run made is left
+                self.assertFalse(os.path.lexists(paths.anchor_key))
+                self.assertEqual(err, "")  # no key is said to be made: none is kept
                 os.chmod(systemd, 0o700)
                 code, again, err = self.run_action(home, environ)
-                self.assertEqual((code, again["code"], err), (0, "ok", ""), again)
+                self.assertEqual((code, again["code"], err),
+                                 (0, "ok", install_module.ANCHOR_MADE.format(path=paths.anchor_key) + "\n"), again)
 
     @needs_crypto
     def test_a_key_or_a_ledger_alone_is_refused_with_a_next_step_that_works(self):

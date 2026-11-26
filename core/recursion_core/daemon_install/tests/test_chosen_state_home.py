@@ -24,6 +24,7 @@ from recursion_core.control.commands import setup
 from recursion_core.daemon_install import InstallRefused, Roots, install, owned_paths, render_unit, uninstall, upgrade
 from recursion_core.daemon_install.install import ensure_ledger
 from recursion_core.daemon_install.tests.test_daemon_install import EXEC, EXEC_NEXT, POSIX_PATHS, PY
+from recursion_core.daemon_install.tests.mount_stub import setUpModule, tearDownModule  # noqa: F401
 from recursion_core.daemon_install.unit import UNIT_NAME, state_elsewhere
 from recursion_core.plugin_security import stores
 

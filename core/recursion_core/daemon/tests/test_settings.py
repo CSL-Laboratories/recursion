@@ -899,10 +899,25 @@ class WhatAPluginIsHanded(_Folder):
         self.assertTrue(_held_of_settings(handed))
 
 
+def _no_key_twice(pairs: list) -> dict:
+    """json.loads keeps the last of two equal keys and says nothing; the published schema may not repeat one."""
+    found = {}
+    for key, part in pairs:
+        if key in found:
+            raise AssertionError(f"the schema writes the key {key!r} twice in one object; "
+                                 "give each key one entry there")
+        found[key] = part
+    return found
+
+
+def _published_schema() -> dict:
+    return json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"), object_pairs_hook=_no_key_twice)
+
+
 @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
 class PublishedShape(_Folder):
     def test_the_schema_declares_exactly_the_table(self) -> None:
-        schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
+        schema = _published_schema()
         self.assertEqual({"const": settings.FILE_VERSION}, schema["properties"]["version"])
         kinds = {bool: "boolean", int: "integer", float: "number", str: "string"}
         found = {}
@@ -922,7 +937,7 @@ class PublishedShape(_Folder):
         self.assertEqual(expect, found)
 
     def test_the_schema_describes_the_readers_version_type(self) -> None:
-        schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
+        schema = _published_schema()
         self.assertIn("The settings file reader accepts version only as a TOML integer "
                       "(a whole number such as 1) and rejects a float such as 1.0.",
                       schema["description"])
@@ -1277,19 +1292,27 @@ class ThePublishedPlacesHoldEachRow(_Folder):
 
     def test_the_readme_table_holds_each_row_with_its_type_default_and_description_and_no_other(self) -> None:
         readme = (SCHEMA_DIR / "README.md").read_text(encoding="utf-8")
-        table = {}
+        table, names = {}, []
         for line in readme.splitlines():
             found = re.fullmatch(r"\| `([^`]+)` \| (\w+) \| `([^`]*)` \| (.+) \|", line)
             if found:
+                names.append(found.group(1))
                 table[found.group(1)] = found.groups()[1:]
-        self.assertEqual([row.name for row in settings.SETTINGS], list(table),
-                         "the README's table of settings and the registry differ; give each row one line there")
+        said = "the README's table of settings and the registry differ; give each row one line there"
+        repeated = [f"{name} ({count} times)" for name, count in collections.Counter(names).items() if count > 1]
+        if repeated:
+            said += "; written more than once: " + ", ".join(repeated)
+        self.assertEqual([row.name for row in settings.SETTINGS], names, said)
         for row in settings.SETTINGS:
             with self.subTest(row=row.name):
                 kind, default, says = table[row.name]
                 self.assertEqual((KINDS[row.type], _toml(row.default)), (kind, default))
                 self.assertTrue(says.startswith(row.says), f"the README's words for {row.name} do not begin with "
                                                           "the row's description")
+
+
+README_TABLE_TEST = "test_the_readme_table_holds_each_row_with_its_type_default_and_description_and_no_other"
+SCHEMA_TESTS = {"test_the_schema_declares_exactly_the_table", "test_the_schema_describes_the_readers_version_type"}
 
 
 # Rows a later version might add, one of each type, one in a table the product already has and one two tables deep.
@@ -1376,6 +1399,61 @@ class ANewRowNeedsNoTestEdit(_Folder):
             if words is not None:
                 with self.subTest(test=name):
                     self.assertIn(words, failed[name])
+
+    def a_copy_of_the_published_places(self, change) -> Path:
+        """The README and the schema copied into the test's own folder, each text made by ``change(name, text)``."""
+        folder = self.tmp / "published"
+        folder.mkdir()
+        for name in ("README.md", "settings.v1.json"):
+            text = (SCHEMA_DIR / name).read_text(encoding="utf-8")
+            (folder / name).write_text(change(name, text), encoding="utf-8")
+        return folder
+
+    def run_against(self, folder: Path, names: set[str]) -> dict[str, str]:
+        """The named tests of this file run on the real registry with SCHEMA_DIR pointed at ``folder``."""
+        with mock.patch.object(sys.modules[__name__], "SCHEMA_DIR", folder):
+            result = self.run_with(settings.SETTINGS, lambda test: test.id().rsplit(".", 1)[-1] in names)
+        self.assertEqual(len(names), result.testsRun)
+        return self.failed(result)
+
+    def test_copies_of_the_real_readme_and_schema_pass_the_tests_that_read_them(self) -> None:
+        folder = self.a_copy_of_the_published_places(lambda name, text: text)
+        self.assertEqual({}, self.run_against(folder, {README_TABLE_TEST} | SCHEMA_TESTS))
+
+    def test_a_line_of_the_readme_table_written_twice_is_red_and_the_row_is_named_with_its_count(self) -> None:
+        def twice(name: str, text: str) -> str:
+            if name != "README.md":
+                return text
+            lines = text.splitlines(keepends=True)
+            at = [i for i, line in enumerate(lines) if line.startswith("| `plugin_host.gil_check` |")]
+            self.assertEqual(1, len(at))
+            return "".join(lines[:at[0] + 1] + lines[at[0]:])  # the same line again, right after itself
+
+        failed = self.run_against(self.a_copy_of_the_published_places(twice), {README_TABLE_TEST})
+        self.assertEqual({README_TABLE_TEST}, set(failed))
+        self.assertIn("plugin_host.gil_check (2 times)", failed[README_TABLE_TEST])
+
+    def test_a_key_of_the_schema_written_twice_is_red_and_named(self) -> None:
+        def twice(name: str, text: str) -> str:
+            if name != "settings.v1.json":
+                return text
+            key = '"gil_check": '
+            self.assertEqual(1, text.count(key))
+            start = text.index(key)
+            _, end = json.JSONDecoder().raw_decode(text, start + len(key))
+            return text[:end] + ",\n        " + text[start:end] + text[end:]  # the whole property again
+
+        folder = self.a_copy_of_the_published_places(twice)
+        real = (SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8")
+        doubled = (folder / "settings.v1.json").read_text(encoding="utf-8")
+        self.assertNotEqual(real, doubled)
+        self.assertEqual(json.loads(real), json.loads(doubled))  # json.loads keeps the last of two keys, says nothing
+        failed = self.run_against(folder, SCHEMA_TESTS)
+        self.assertEqual(SCHEMA_TESTS, set(failed))
+        for name, text in failed.items():
+            with self.subTest(test=name):
+                self.assertIn("'gil_check'", text)
+                self.assertIn("twice", text)
 
     def test_a_row_that_lacks_something_fails_with_words_that_name_it_and_what_it_lacks(self) -> None:
         for row, lack in LACKING_ROWS:

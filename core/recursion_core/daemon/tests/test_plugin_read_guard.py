@@ -43,6 +43,9 @@ FILE_CODES = {'fifo': 'plugin_file_untrusted', 'socket': 'plugin_file_untrusted'
 TAIL = '; a label, not a gate'
 NOT_READ_DIRECTORY = 'not read (the plugin directory was refused, so nothing in it was opened)'
 NOT_READ_MANIFEST = 'not read (manifest.json was refused)'
+NOT_READ_INSTALL = 'not read (install.json or its directory was refused)'
+REREAD = 'a directory repaired after the daemon started is read again only after a restart of the daemon'
+GROUP_WRITABLE = 'must be an operator-owned directory, not group/other writable; found: group-writable'
 PLUGINS_PY = Path(plugins.__file__).resolve()
 PACKAGE = PLUGINS_PY.parent.parent
 
@@ -182,6 +185,9 @@ class PluginReadGuardTests(unittest.TestCase):
                     self.assertTrue(blocker.startswith('refused: ' + code), blocker)
                     if available:
                         self.assertIn('found: group-writable', blocker)
+                    else:  # refused for another reason: the row still gives the directory's own
+                        self.assertIn('; the plugin directory %s %s' % (directory, GROUP_WRITABLE), blocker)
+                    self.assertIn(REREAD, blocker)
                     self.assertTrue(blocker.endswith('; registry label: ' + NOT_READ_DIRECTORY + TAIL), blocker)
 
     def test_a_refused_directory_stays_refused_for_the_run(self):
@@ -189,7 +195,63 @@ class PluginReadGuardTests(unittest.TestCase):
         host = self.host(config, True)
         os.chmod(directory, 0o700)  # it looks owned now; this run read nothing there and reads nothing now
         self.assertTrue(self.row(host).endswith(NOT_READ_DIRECTORY + TAIL))
+        self.assertIn(REREAD, self.row(host))  # the row says that a restart is what reads it again
         self.assertEqual(self.opened_under(directory), [])
+
+    # -- an install directory others can write ---------------------------------------------------------
+    def test_a_plugin_named_outside_an_install_directory_others_can_write_loads_without_install_json(self):
+        for available in (True, False):
+            with self.subTest(verification_available=available):
+                self.count += 1
+                root = self.tmp / ('outside-%d' % self.count)
+                config, own = root / 'recursion', root / 'own' / 'mine'
+                manifest = fx.write_plugin(own, SOURCE, plugin_id='fixture.mine', permissions=('panel',))
+                # install.json grants the plugin and labels its bytes, but others can write its directory
+                installed = fx.write_install(config, registry_labels={_digest(manifest): 'verified'},
+                                             grants=[fx.grant_for(SOURCE, plugin_id='fixture.mine',
+                                                                  permissions=('panel',))])
+                os.chmod(installed, 0o770)
+
+                def build():
+                    with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+                        return plugins.PluginHost(config, root / 'state', plugin_dirs=[own], gil_probe=FakeGilProbe(),
+                                                  verification_available=lambda: available)
+                host = self.bounded('the daemon start (PluginHost)', build)
+                self.addCleanup(host.close)
+                rows = {r['id']: r['blocker'] for r in self.bounded('the plugin rows', host.route_records)}
+                self.assertNotIn(str(installed / 'install.json'), self.opened)
+                mine = rows['plugin:fixture.mine' if available else 'plugin:mine']
+                unread = ('install.json was not read: the install directory %s %s; so no trusted key, grant, '
+                          'reserved effect, authority anchor or registry label came from it; to have them, make %s '
+                          'a directory you own that group and other cannot write (chmod go-w %s when only its mode '
+                          'is wrong), then restart the daemon' % (installed, GROUP_WRITABLE, installed, installed))
+                self.assertIn('; ' + unread + '; registry label: ' + NOT_READ_INSTALL + TAIL, mine)
+                self.assertTrue(mine.endswith('; registry label: ' + NOT_READ_INSTALL + TAIL), mine)
+                if available:
+                    # it loads as it did before, but nothing of the file others can write is taken: no grant
+                    record = next(r for r in host.records if r['source'] == str(own))
+                    self.assertEqual((record['state'], record['trust'], record['permissions']),
+                                     ('loaded', 'unsigned', []))
+                    self.assertTrue(mine.startswith('loaded unsigned; permissions: none; '), mine)
+                    self.assertEqual(host.status('fixture.mine')['plugin']['registry_label'], NOT_READ_INSTALL)
+                else:
+                    self.assertTrue(mine.startswith('refused: plugin_verification_unavailable: '), mine)
+                # its own directory is not blamed; the install directory's own row names it and what to do
+                self.assertNotIn('the plugin directory %s' % own, mine)
+                self.assertNotIn(str(own), mine)
+                self.assertIn('refused: plugin_directory_untrusted: install directory %s %s; ' % (installed, GROUP_WRITABLE)
+                              + 'no plugin in it and not its install.json was read; make it a directory you own that '
+                              'group and other cannot write (chmod go-w %s when only its mode is wrong), then '
+                              'restart the daemon' % installed, rows['plugin:plugins'])
+
+    def test_install_json_in_a_directory_others_can_write_is_refused_never_read_as_no_file(self):
+        config = self.tmp / 'gw' / 'recursion'
+        installed = fx.write_install(config, registry_labels={'0' * 64: 'verified'})
+        os.chmod(installed, 0o770)
+        with self.assertRaises(plugins.PluginRefused) as caught:
+            plugins.read_install(installed)
+        self.assertEqual((caught.exception.code, caught.exception.detail), ('plugin_directory_untrusted', GROUP_WRITABLE))
+        self.assertNotIn(str(installed / 'install.json'), self.opened)
 
     # -- a directory the operator owns ---------------------------------------------------------------
     def test_each_planted_entry_is_refused_with_its_kind_and_never_opened(self):

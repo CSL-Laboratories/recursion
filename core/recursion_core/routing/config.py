@@ -57,8 +57,12 @@ from recursion_core.routes import limits as route_limits
 CONFIG_FILE = "routing.json"            # beside routes.json: $XDG_CONFIG_HOME/recursion/routing.json
 VERSION = 1
 SCHEMA_FILE = Path(__file__).resolve().parent / "schema" / "routing_config.v1.json"
-# The engines a route may name: the route contract's own ids (claude_code, codex, pi, hermes, opencode).
-ENGINES = contract.ENGINES
+# The engines a route may name: the route contract's own ids (claude_code, codex, pi, hermes, opencode), and
+# recursion_loop, the own loop, which lane LOOP registers in the engine table. It is a target the config may
+# name from now on; it is routable only once routes.json configures it (which the daemon accepts only when
+# its factory is registered) and its key is present and opted in (detect.py).
+RECURSION_LOOP = "recursion_loop"
+ENGINES = (*contract.ENGINES, RECURSION_LOOP)
 # Canonical vendor ids, matched exactly: "Anthropic" or "anthropic-ai" is refused, never merged.
 VENDORS = ("anthropic", "openai", "xai", "google", "cursor", "opencode")
 LOGIN_KINDS = ("subscription", "api_key")

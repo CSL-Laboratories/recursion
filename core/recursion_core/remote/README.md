@@ -150,6 +150,36 @@ device and label, the client address, the time), newest last, at most `--record-
 (first value 1000; older lines go first; `none` keeps every line; `0` keeps none). One line is also
 written on stderr, which sshd hands to the client that was refused.
 
+A request whose kind is to end something is never counted: `run.stop`, `session.stop`,
+`session.interrupt`, `queue.cancel`, and `approval.answer` whose `answer` is `deny`
+(`rights.ENDING_METHODS`, `rights.ends_something`). Once the key's rights cover it and it fits a frame, it
+is sent to the daemon at once and answered only by the daemon's own answer: it takes no slot, reads no
+window file and waits on no file, so a key whose own watching used up its frames can still stop what it
+watches, and a window that cannot be read never holds it back. A `rate_limited` answer says the cap, the
+window, the scope and `retry_after_s`, the seconds until the next ordinary frame can go, with a sentence
+(`message`) that says what the person can do. A relay whose folder is refused at the start (a wrong mode,
+another owner) starts for no request, a Stop included, until the folder is put right.
+
+No session waits without end on a file: an ordinary frame waits for the lock of its key's window and of
+the record at most `--lock-wait-s S` seconds in all (first value 2; `0` asks once), and asks for each lock
+again at least every `--lock-try-s S` seconds (first value 0.001), so that the sessions of one key at once,
+each holding a lock for one read and write, never hold each other near the bound. Either one above 3600
+seconds (a wait no person means: a Stop behind that frame in the same session would wait as long), not a
+number, or a negative zero is refused at the start, as is a `--lock-try-s` of 0. A lock another session
+or program held each time it was asked for then refuses the frame (`rate_limited`, detail `window_busy`,
+not delivered, with a sentence that says so) or leaves its refusal
+out of the record (its stderr line still goes), and the session reads its next frame. Frames of one
+session are served in order, so a request of the ending kind sent behind ordinary frames in the same
+session waits for each of them at most `--lock-wait-s` on files, plus the daemon's reply when that frame
+is sent; one sent in a session of its own, as the client sends `run.stop`, waits on no file.
+
+Requests of the ending kind have no bound of their own here. The daemon's socket keeps its reserved slots
+for `run.stop` only; so one key that sends Stops without pause can hold every slot, the reserved ones
+included, while it sends, and a Stop given on the daemon's machine or from another device is answered
+busy, not delivered, meanwhile: fifty `run.stop` of one key at once, against a socket set as the daemon
+sets it and a handler that takes 0.6 seconds, had 20 answered by the daemon and 30 answered busy, and a
+local Stop made then was busy too.
+
 Not yet: the relay still connects to the socket as the owner's uid. Until the daemon checks a paired
 device's rights at its own socket, the relay's table is the only lock between a device's key and the
 daemon.

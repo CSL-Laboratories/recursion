@@ -62,6 +62,11 @@ NOT_ADMITTED_FRAME = encode_frame(
 # A connection on a reserved slot must send its one priority request within this long.
 RESERVED_TIMEOUT_S = 2.0
 _ACCEPT_POLL_S = 0.1
+# Floor of the one shutdown deadline shared by the accept thread and every handler. The deadline
+# is also at least idle_timeout_s + 1, the per-handler drain already used for the daemon's default
+# of 30 s, so that drain is never shortened. One clock for the whole shutdown, not a fresh wait
+# per thread: many wedged handlers cannot stack this bound.
+SHUTDOWN_DRAIN_BOUND_S = 15.0
 # Linux sun_path is 108 bytes including the trailing NUL.
 _MAX_SUN_PATH = 107
 _URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
@@ -328,9 +333,15 @@ class UnixControlServer:
                 raise RuntimeError("server already closed")
             ensure_private_dir(self.directory)
             lock_fd = _acquire_lock(self._path + ".lock")
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock: socket.socket | None = None
+            thread: threading.Thread | None = None
             bound = False
             try:
+                # Everything after the lock is taken is inside this try, so a start that fails at any step gives
+                # back what it took: a socket that cannot be made (EMFILE) no longer keeps the fd holding the
+                # lock (sweep s7 D04), and an accept thread that cannot start no longer leaves the bound path,
+                # the listener and the lock behind for a close() that then raised (s7 D05).
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 _clear_stale_socket(self._path)
                 # The 0700 directory already keeps other uids out of the bind-to-chmod window;
                 # chmod rather than umask because umask is process-wide and racy across threads.
@@ -342,8 +353,23 @@ class UnixControlServer:
                     raise InsecureSocketPath(f"{self._path} changed under us after bind")
                 sock.listen(socket.SOMAXCONN)
                 sock.settimeout(_ACCEPT_POLL_S)
+                self._sock = sock
+                self._lock_fd = lock_fd
+                self._bound = (st.st_dev, st.st_ino)
+                thread = threading.Thread(target=self._accept_loop, name="control-transport-accept", daemon=True)
+                self._thread = thread
+                thread.start()
             except BaseException:
-                sock.close()
+                if thread is not None and thread.ident is not None:
+                    # Only an interrupt raised after the thread began can land here. Stop the loop
+                    # before clearing the listener it reads, or its first line sees None.
+                    self._stop.set()
+                self._sock = None
+                self._lock_fd = None
+                self._bound = None
+                self._thread = None
+                if sock is not None:
+                    sock.close()
                 if bound:
                     try:
                         os.unlink(self._path)
@@ -351,17 +377,26 @@ class UnixControlServer:
                         pass
                 os.close(lock_fd)
                 raise
-            self._sock = sock
-            self._lock_fd = lock_fd
-            self._bound = (st.st_dev, st.st_ino)
-            self._thread = threading.Thread(target=self._accept_loop, name="control-transport-accept", daemon=True)
-            self._thread.start()
 
     def close(self) -> None:
+        """Stop accepting, wait for handlers that have begun, then give up the path and the lock.
+
+        One deadline covers the accept thread and every started connection worker. Its length is the
+        longer of ``SHUTDOWN_DRAIN_BOUND_S`` and ``idle_timeout_s + 1`` (the per-handler drain the
+        daemon already had; 31 s at the default idle timeout). A handler still running inside that
+        deadline keeps this call from giving up the path and the lock (sweep s7 D06: a short timed
+        join returned, and the next owner took the lock, while a handler could still write). Each
+        open connection is shut first, so a worker waiting for its peer ends at once. After the
+        deadline, this call returns and gives up the path and the lock even if a handler has not
+        returned, so two handlers each waiting on the other both return. The worst case is that one
+        deadline, not one fresh wait per thread. Whether an incomplete drain should be reported is
+        not decided here. A call from one of this server's own threads does not wait for that thread.
+        """
+        deadline = time.monotonic() + max(SHUTDOWN_DRAIN_BOUND_S, self._idle_timeout_s + 1.0)
         self._stop.set()
         thread = self._thread
-        if thread is not None:
-            thread.join(timeout=5.0)
+        if thread is not None and thread.ident is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._lock:
             workers = list(self._workers)
             conns = list(self._conns)
@@ -376,7 +411,7 @@ class UnixControlServer:
             # (the round-2 read of #407 by DeepSeek, F2; the same on master). Its connection was shut above.
             if worker.ident is None or worker is threading.current_thread():
                 continue
-            worker.join(timeout=self._idle_timeout_s + 1.0)
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._lock:
             sock, self._sock = self._sock, None
             lock_fd, self._lock_fd = self._lock_fd, None
@@ -410,14 +445,19 @@ class UnixControlServer:
 
     def _accept_loop(self) -> None:
         sock = self._sock
-        assert sock is not None
+        # Rollback can clear the listener before this thread runs. Returning is the stop; an
+        # assertion here kills the thread, and under -O the next use of None would too.
+        if sock is None:
+            return
         while not self._stop.is_set():
             try:
                 conn, _ = sock.accept()
             except TimeoutError:
                 continue
             except OSError:
-                if self._stop.is_set():
+                # The listener this loop captured may already have been dropped. An interrupt during
+                # Thread.start can clear it before ident is visible; retrying on that socket spins.
+                if self._stop.is_set() or self._sock is not sock:
                     return
                 continue
             try:

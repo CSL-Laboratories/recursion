@@ -8,12 +8,13 @@ a numbered section) or by a decision cited by role and date. This test is red wh
      names it, or a rule of the [rules] table skips something it may not skip: an ignored folder that holds a
      module, a test folder that holds anything but tests, a module named as an other file;
   2. a row of the sections core, for_owner or leaving names a package that does not stand, a rule entry matches
-     nothing under the core, or a leaving row is past its leave_by while the file says that is red;
+     nothing under the core, a leaving row is past its leave_by while the file says that is red, or an entry of
+     [sweep] scan stands but holds no file the sweep reads;
   3. a row of the section expected names a package that stands, or one the hooks seam no longer names, or the
      hooks seam names a top package that neither stands nor has an expected row, or the seam is not a literal
      tuple of strings;
   4. a row or a cite is malformed, or a cite carries a digest (the digests of the contract's lines are kept
-     outside this repository);
+     outside this repository), or an entry of [sweep] scan or leave_out is not in its one plain spelling;
   5. a cite is not in the pinned bytes of the product contract. This runs only when CSL_RESEARCH_VAULT names a
      local clone of the research repository AND CSL_CORE_LIST_DIGESTS names the file of digests kept outside
      this repository; it never touches the network. When neither is set, the printed state line says that the
@@ -43,6 +44,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve()
 REPO = HERE.parent.parent.parent
@@ -127,6 +129,7 @@ def _base_name(node) -> str:
 
 def _is_main_guard(test) -> bool:
     return (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name) and test.left.id == "__name__"
+            and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)
             and len(test.comparators) == 1 and isinstance(test.comparators[0], ast.Constant)
             and test.comparators[0].value == "__main__")
 
@@ -160,8 +163,13 @@ def not_a_test(path: Path):
             if isinstance(node, ast.AnnAssign) else None
         if targets is not None and all(isinstance(t, ast.Name) for t in targets):
             continue
-        if isinstance(node, ast.If) and _is_main_guard(node.test):
+        if isinstance(node, ast.If) and _is_main_guard(node.test) and not node.orelse:
             continue
+        if isinstance(node, ast.If) and any(isinstance(n, ast.Name) and n.id == "__name__"
+                                            for n in ast.walk(node.test)):
+            return (f"holds an if on __name__ at line {node.lineno} that is not the plain guard, and the other "
+                    "forms run code when the module is imported. Write it as 'if __name__ == \"__main__\":' "
+                    "with no else, or move the code into a test")
         if isinstance(node, ast.ClassDef) and any(_base_name(b).endswith("TestCase") for b in node.bases):
             tests += 1
             continue
@@ -256,6 +264,10 @@ def scan_core(root: Path, rules=None):
                     problems.append((1, f"{where} is a module, and the [rules] table of {LIST_FILE} names it under "
                                         "other_files. A module needs a row: give it one, or move it out of the "
                                         "core."))
+            elif child.is_file() and importable(child) and name.split(".")[0]:
+                # A native module is named by the part before its first dot: fast.cpython-312-x86_64-linux-gnu.so
+                # is fast.
+                entries.append((name.split(".")[0], "module"))
             else:
                 problems.append((1, f"{where} is neither a folder nor a .py module, so the scan cannot classify "
                                     f"it. Remove it, or list it under other_files in the [rules] table of "
@@ -295,7 +307,7 @@ def read_registrants(root: Path):
               "cannot be read. Write it as a literal tuple of strings, or change this test with it.")
     if value is None:
         return [], [bad]
-    if not isinstance(value, (ast.Tuple, ast.List)):
+    if not isinstance(value, ast.Tuple):
         return [], [bad]
     names = []
     for element in value.elts:
@@ -379,6 +391,24 @@ def check_cite(row_name: str, cite, where: str):
     return problems
 
 
+def spelling_problem(key: str, entry: str):
+    """What is wrong with the spelling of one [sweep] scan or leave_out entry, or None when it is plain.
+    The plain spelling has no leading ./, no trailing /, no doubled /, no backslash and no . or .. part; the
+    whole tree is the single entry "." of scan."""
+    parts = entry.replace("\\", "/").split("/")
+    tag = f"{LIST_FILE}: sweep.{key} holds {entry!r}"
+    if ".." in parts:
+        return f"{tag}, which uses '..'. Write the path from the repository root without it."
+    plain = "/".join(part for part in parts if part not in ("", ".")) or SWEEP_ROOT
+    if plain == SWEEP_ROOT and key == "leave_out":
+        return (f"{tag}, which leaves out the whole tree, so the sweep would read nothing. Name the files or "
+                "folders to leave out.")
+    if plain != entry:
+        return (f"{tag}, which is not written in its one plain spelling, so the sweep could match nothing for it "
+                f"without saying so. Write {plain!r} in its place.")
+    return None
+
+
 def check_form(data):
     """The form of the file: the summary, every row, every cite."""
     problems = []
@@ -403,6 +433,9 @@ def check_form(data):
             problems.append((4, f"{LIST_FILE}: [sweep] holds run_words (a whole number, 2 or more), scan and "
                                 "leave_out (lists of paths from the repository root, none starting with / or "
                                 "holding ..) only. Correct it."))
+        elif ok:
+            for key, group in ("scan", paths[0]), ("leave_out", paths[1]):
+                problems += [(4, text) for text in (spelling_problem(key, v) for v in group) if text]
     table = data.get("rules")
     if table is not None:
         if not isinstance(table, dict) or set(table) - set(RULE_KEYS):
@@ -610,6 +643,9 @@ def analyse(root: Path, today=None):
                 if isinstance(left, str) and not (root / left).exists():
                     problems.append((2, f"{LIST_FILE}: sweep.{key} names {left}, but nothing of that name stands in "
                                         "the tree. Remove it from the table."))
+        if all(isinstance(sweep.get(key, []), list) for key in ("scan", "leave_out")):
+            standing = [e for e in sweep_settings(data)[1] if isinstance(e, str) and (root / e).exists()]
+            problems += unmatched_scan(root, standing, sweep_settings(data)[2])
     return problems, state_line(entries, data, test_folders, today)
 
 
@@ -834,18 +870,31 @@ SWEEP_RUN_WORDS = 6
 SWEEP_SKIPPED_FOLDERS = (".git", "__pycache__", "node_modules")
 
 
-def public_text_files(root: Path, skip=()):
-    """(path, text) of every file under root that reads as UTF-8; the .git folder, caches and skip are left out."""
+def inside(where: str, entry: str) -> bool:
+    """True when the path where (from the root, with /) is the entry or stands under it."""
+    return entry == SWEEP_ROOT or where == entry or where.startswith(entry.rstrip("/") + "/")
+
+
+def public_files(root: Path, skip=(), wanted=None):
+    """The paths of the files under root that the sweep may read: the .git folder, caches and skip are left out,
+    and so is every file whose path from the root wanted refuses. Nothing is opened here."""
     skip = [Path(s).resolve() for s in skip]
     for folder, names, files in os.walk(root):
         names[:] = sorted(n for n in names if n not in SWEEP_SKIPPED_FOLDERS
                           and not any(Path(folder, n).resolve() == s for s in skip))
         for file in sorted(files):
             path = Path(folder, file)
-            try:
-                yield path, path.read_bytes().decode("utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
+            if wanted is None or wanted(path.relative_to(root).as_posix()):
+                yield path
+
+
+def public_text_files(root: Path, skip=(), wanted=None):
+    """(path, text) of every wanted file under root that reads as UTF-8; a file that is not wanted is not opened."""
+    for path in public_files(root, skip, wanted):
+        try:
+            yield path, path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
 
 
 def words_of(text: str):
@@ -882,19 +931,37 @@ def sweep_settings(data):
             list(table.get("leave_out", [])))
 
 
+def unmatched_scan(root: Path, scan, leave_out=(), skip=()):
+    """(2, message) for every entry of scan that matches no file the sweep reads: a folder with no file, one that
+    holds only caches or the clone, or one whose files are all left out; an entry that does not stand is named too."""
+    problems = []
+    for entry in scan:
+        if not (root / entry).exists():
+            problems.append((2, f"{LIST_FILE}: sweep.scan names {entry}, but nothing of that name stands in the "
+                                "tree. Remove it from the table."))
+            continue
+        wanted = lambda where: inside(where, entry) and not any(inside(where, left) for left in leave_out)
+        if next(public_files(root, skip, wanted), None) is None:
+            problems.append((2, f"{LIST_FILE}: sweep.scan names {entry}, which stands but holds no file the sweep "
+                                "reads (it is empty, holds only caches, or all of it is in leave_out), so it checks "
+                                "nothing. Name a file or folder that holds the files to sweep, or remove the "
+                                "entry."))
+    return problems
+
+
 def sweep_public_tree(root: Path, contract: str, skip=(), run_words: int = SWEEP_RUN_WORDS, scan=(SWEEP_ROOT,),
-                      leave_out=()):
+                      leave_out=(), refuse_unmatched: bool = False):
     """Check 8 on one tree. The contract is given as text; no message holds a word of it. scan names the files or
-    folders (paths from the root; "." is the whole tree) that are read, leave_out those of them that are not."""
-    inside = lambda where, entry: entry == SWEEP_ROOT or where == entry or where.startswith(entry.rstrip("/") + "/")
+    folders (paths from the root; "." is the whole tree) that are read, leave_out those of them that are not;
+    a file outside scan, or in leave_out, is never opened. With refuse_unmatched, an entry of scan that matches
+    no file the sweep reads is a problem of its own."""
+    wanted = lambda where: any(inside(where, e) for e in scan) and not any(inside(where, e) for e in leave_out)
     headings, runs = contract_marks(contract, run_words)
     pattern = re.compile("|".join(r"(?<![#\w])" + re.escape(h) + r"(?!\w)"
                                   for h in sorted(headings, key=len, reverse=True))) if headings else None
-    problems = []
-    for path, text in public_text_files(root, skip):
+    problems = [(8, text) for _, text in unmatched_scan(root, scan, leave_out, skip)] if refuse_unmatched else []
+    for path, text in public_text_files(root, skip, wanted):
         where = path.relative_to(root).as_posix()
-        if not any(inside(where, entry) for entry in scan) or any(inside(where, entry) for entry in leave_out):
-            continue
         for number, line in enumerate(text.splitlines(), 1):
             found = pattern.search(fold(line)) if pattern else None
             if found:
@@ -984,7 +1051,7 @@ class RealTreeTests(unittest.TestCase):
                                               f"{PIN_FILE}. Use a clone that holds the pinned commit.")
         run_words, scan, leave_out = sweep_settings(real()["data"])
         problems = sweep_public_tree(REPO, blob.decode("utf-8"), skip=[vault], run_words=run_words, scan=scan,
-                                     leave_out=leave_out)
+                                     leave_out=leave_out, refuse_unmatched=True)
         self.assertEqual(problems, [])
 
 
@@ -1537,6 +1604,119 @@ class TestsOfTheTest(unittest.TestCase):
         root.mkdir()
         (root / "b.bin").write_bytes(b"\xff\xfe### 3.3 Quillfern section\n")
         self.assertEqual(sweep_public_tree(root, PRODUCT), [])
+
+
+    # A sweep entry narrows in silence unless it is written in one plain spelling and matches a file the sweep reads.
+    def sweep_table(self, **table):
+        body = "".join(f"{key} = {json.dumps(value)}\n" for key, value in table.items())
+        return list_text(extra=f"\n[sweep]\n{body}")
+
+    def test_4_a_sweep_entry_not_in_its_plain_spelling_is_red_and_names_the_spelling_to_write(self):
+        for key in ("scan", "leave_out"):
+            for entry, plain in (("./core/tests", "core/tests"), ("core/tests/", "core/tests"),
+                                 ("core//tests", "core/tests"), ("core/./tests", "core/tests"),
+                                 ("core\\tests", "core/tests")):
+                tree = self.tree(list_body=self.sweep_table(**{key: [entry]}))
+                self.red(4, tree, f"sweep.{key} holds {entry!r}, which is not written in its one plain spelling")
+                self.red(4, tree, f"Write {plain!r} in its place")
+
+    def test_4_a_sweep_entry_that_leaves_the_tree_or_leaves_out_all_of_it_is_red(self):
+        self.red(4, self.tree(list_body=self.sweep_table(scan=["core\\..\\x"])), "which uses '..'")
+        self.red(4, self.tree(list_body=self.sweep_table(leave_out=["."])),
+                 "sweep.leave_out holds '.', which leaves out the whole tree, so the sweep would read nothing")
+
+    def test_4_the_plain_spellings_stay_green(self):
+        for table in ({"scan": ["."]}, {"scan": ["core"], "leave_out": ["core/recursion_core/control"]},
+                      {"scan": ["core/CORE-PACKAGES.toml", "core/tests"]}):
+            tree = self.tree(list_body=self.sweep_table(**table))
+            (tree / "core" / "tests").mkdir(exist_ok=True)
+            (tree / "core" / "tests" / "test_x.py").write_text(TEST_BODY, encoding="utf-8")
+            self.assertEqual(analyse(tree)[0], [], table)
+
+    def test_2_a_scan_entry_that_matches_no_file_of_the_sweep_is_red(self):
+        tree = self.tree(list_body=self.sweep_table(scan=["docs"]))
+        (tree / "docs").mkdir()
+        self.red(2, tree, "sweep.scan names docs, which stands but holds no file the sweep reads")
+        (tree / "docs" / "__pycache__").mkdir()
+        (tree / "docs" / "__pycache__" / "x.py").write_text("x = 1\n", encoding="utf-8")
+        self.red(2, tree, "sweep.scan names docs, which stands but holds no file the sweep reads")
+        (tree / "docs" / "a.md").write_text("words\n", encoding="utf-8")
+        self.assertEqual(analyse(tree)[0], [])
+        tree = self.tree(list_body=self.sweep_table(scan=["docs"], leave_out=["docs"]))
+        (tree / "docs").mkdir()
+        (tree / "docs" / "a.md").write_text("words\n", encoding="utf-8")
+        self.red(2, tree, "sweep.scan names docs, which stands but holds no file the sweep reads")
+
+    def test_8_the_sweep_refuses_a_scan_entry_that_matches_no_file_when_asked_to(self):
+        self.n += 1
+        root = self.base / f"pub{self.n}"
+        (root / "docs").mkdir(parents=True)
+        (root / "a.md").write_text("### 3.3 Quillfern section\n", encoding="utf-8")
+        problems = sweep_public_tree(root, PRODUCT, scan=["docs"], refuse_unmatched=True)
+        self.assertEqual([code for code, _ in problems], [8])
+        self.assertIn("sweep.scan names docs, which stands but holds no file the sweep reads", problems[0][1])
+        self.assertEqual(sweep_public_tree(root, PRODUCT, scan=["a.md"], refuse_unmatched=True)[0][0], 8)
+        self.assertNotIn("holds no file", sweep_public_tree(root, PRODUCT, scan=["a.md"], refuse_unmatched=True)[0][1])
+
+    def test_8_a_file_outside_the_scan_is_never_opened(self):
+        self.n += 1
+        root = self.base / f"pub{self.n}"
+        (root / "in").mkdir(parents=True)
+        (root / "out").mkdir()
+        (root / "left").mkdir()
+        (root / "in" / "a.md").write_text("### 3.3 Quillfern section\n", encoding="utf-8")
+        (root / "in" / "skip.md").write_text("plain\n", encoding="utf-8")
+        (root / "out" / "b.bin").write_bytes(b"\xff\xfe\x00 not text")
+        (root / "out" / "c.md").write_text("### 3.3 Quillfern section\n", encoding="utf-8")
+        opened, real_read = [], Path.read_bytes
+
+        def counting(path):
+            opened.append(path.relative_to(root).as_posix())
+            return real_read(path)
+
+        with mock.patch.object(Path, "read_bytes", counting):
+            problems = sweep_public_tree(root, PRODUCT, scan=["in"], leave_out=["in/skip.md"])
+        self.assertEqual(opened, ["in/a.md"])
+        self.assertEqual([t.split(" line")[0] for _, t in problems], ["in/a.md"])
+
+    def test_1_an_if_on_name_that_is_not_the_plain_guard_is_red_in_a_test_folder(self):
+        for guard in ('if __name__ != "__main__":\n    import os\n',
+                      'if __name__ == "__main__":\n    unittest.main()\nelse:\n    import os\n',
+                      'if __name__ == "__main__":\n    unittest.main()\nelif True:\n    import os\n',
+                      'if __name__ in ("__main__",):\n    unittest.main()\n'):
+            tree = self.with_tests_folder({"test_a.py": TEST_BODY + "\n\n" + guard})
+            self.red(1, tree, "holds an if on __name__ at line 9 that is not the plain guard")
+        self.red(1, self.with_tests_folder({"test_a.py": TEST_BODY + "\n\n" + 'if __name__ != "__main__":\n    pass\n'}),
+                 "Write it as 'if __name__ == \"__main__\":' with no else, or move the code into a test")
+        tree = self.with_tests_folder({"test_a.py": TEST_BODY + "\n\n" + 'if __name__ == "__main__":\n    unittest.main()\n'})
+        self.assertEqual(analyse(tree)[0], [])
+
+    def test_3_a_registrants_list_is_not_a_literal_tuple_and_is_red(self):
+        hooks = "REGISTRANTS = ['recursion_core.alpha.hooks', 'recursion_core.beta.hooks', 'recursion_core.later.hooks']\n"
+        self.red(3, self.tree(list_body=list_text(), hooks=hooks), "is not a literal tuple of strings")
+        names, found = read_registrants(self.tree(list_body=list_text()))
+        self.assertEqual((names, found), (["recursion_core.alpha.hooks", "recursion_core.beta.hooks",
+                                           "recursion_core.later.hooks"], []))
+
+    def test_1_a_native_module_directly_under_the_core_needs_a_row(self):
+        name = "fast.cpython-312-x86_64-linux-gnu.so"
+        row = f'\n[[package]]\nname = "fast"\nsection = "core"\nwhat = "Native."\nplaced_by = [{DECISION}]\n'
+        for suffix in (".so", ".pyd"):
+            tree = self.tree(list_body=list_text())
+            (tree / CORE_DIR / f"fast{suffix}").write_bytes(b"")
+            self.red(1, tree, "core/recursion_core/fast stands under the core and core/CORE-PACKAGES.toml has no row")
+            tree = self.tree(list_body=list_text(extra=row))
+            (tree / CORE_DIR / f"fast{suffix}").write_bytes(b"")
+            self.assertEqual(analyse(tree)[0], [], suffix)
+        tree = self.tree(list_body=list_text(extra=row))
+        (tree / CORE_DIR / name).write_bytes(b"")
+        self.assertEqual(analyse(tree)[0], [])
+        tree = self.tree(list_body=list_text(extra=row), modules=("fast",))
+        (tree / CORE_DIR / name).write_bytes(b"")
+        self.red(7, tree, "stands twice")
+        tree = self.tree(list_body=list_text())
+        (tree / CORE_DIR / ".hidden.so").write_bytes(b"")
+        self.red(1, tree, "is neither a folder nor a .py module")
 
 
 if __name__ == "__main__":

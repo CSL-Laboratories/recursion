@@ -57,7 +57,9 @@ The rules this module keeps:
   address written wholly percent-escaped, and a secret written as the scheme at the very start of a run.
   The look-alike rule is only a second net: it misses a short key, a key of
   one case or of digits only, a UUID, base64 cut by ``+`` or ``/``, and a key split over a list's items, so
-  such a value under a name not on the list is shown. Every line is one line: a line break, a control
+  such a value under a name not on the list is shown. A value or a key whose own text, as the person wrote
+  it, carries a password label or a known key prefix is never shown, not in part, wherever an @ stands in
+  it: ``password=ab@cdefgh`` is hidden whole. Every line is one line: a line break, a control
   character or a direction or format character is shown escaped (``\\n``, ``\\u202e``).
 * A FILE ADDS AND NEVER TAKES AWAY. The words of ``status.hidden_names`` a file lists are added to the
   shipped words, which no file can take away; an empty or missing list keeps the shipped words alone. A
@@ -134,7 +136,7 @@ _KEY_PREFIXES = ("sk-", "sk_", "pk_", "rk_", "ghp_", "gho_", "ghu_", "ghs_", "gh
                  "hf_", "npm_", "pypi-")
 _KEY_RUN_TEXT = re.compile("[A-Za-z0-9]{%d,}" % _KEY_RUN)
 _KEY_LABEL = re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|bearer|token)\b\s*[:=]?\s*\S{%d,}" % _KEY_TAIL)
-_KEY_PREFIX = re.compile(r"(?<![A-Za-z0-9])(?:%s)[A-Za-z0-9_.+/=-]{%d,}"
+_KEY_PREFIX = re.compile(r"(?<![A-Za-z0-9])(?:%s)\S{%d,}"
                          % ("|".join(re.escape(prefix) for prefix in _KEY_PREFIXES), _KEY_TAIL))
 _SPACE = re.compile(r"(\s+)")
 _SCHEME_AT_START = re.compile(r"[A-Za-z0-9+.-]+://")  # the scheme and its mark a run may begin with
@@ -262,6 +264,26 @@ def _looks_like_a_key(text: str) -> bool:
                for run in _KEY_RUN_TEXT.findall(text))
 
 
+def _key_shape_as_written(text: str) -> bool:
+    """Whether ``text``, as the person wrote it and before the sign-in rule, carries a password label or a known
+    key prefix (``_KEY_LABEL``, ``_KEY_PREFIX``). Where it does, the whole text is never shown, even where the
+    label or prefix stands in a part the sign-in rule would hide: then one fact about that part is shown, that
+    it looks like a key or a password, and never a character of it."""
+
+    return bool(_KEY_LABEL.search(text) or _KEY_PREFIX.search(text))
+
+
+def _never_shown(text: str) -> bool:
+    """Whether a text of the person's file, a value or a key, is never shown, not in part: the one predicate
+    the value path (``_piece``) and the key path (``load``) both ask. A password label or a known key prefix
+    is read on the text as the person wrote it, so the sign-in rule cannot take a label away and leave the end
+    of its password in view: ``password=ab@cdefgh`` is hidden whole, wherever the @ stands. The whole
+    look-alike rule is read on the text after the sign-in rule as well. The long-run test is not read on the
+    text as written: a long run inside a sign-in the rule hides would hide the whole address."""
+
+    return _key_shape_as_written(text) or _looks_like_a_key(_without_sign_in(text))
+
+
 def _without_sign_in(text: str) -> str:
     """``text`` with what the sign-in rule hides in each run (``_run_without_sign_in``) replaced by words that
     say so; the rest stays. A run ends at every white-space character as Python counts them (``str.isspace``);
@@ -327,10 +349,10 @@ def _piece(value: object) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
-        text = _without_sign_in(str.__str__(value))  # its own text: never a subclass's __str__ or __repr__
-        if _looks_like_a_key(text):  # never shown, not in part and not by its length, whatever the cap
+        text = str.__str__(value)  # its own text: never a subclass's __str__ or __repr__
+        if _never_shown(text):  # never shown, not in part and not by its length, whatever the cap
             return _HIDDEN_KEY
-        return repr(text)
+        return repr(_without_sign_in(text))
     if isinstance(value, (int, float)):
         try:
             return (float.__repr__ if isinstance(value, float) else int.__repr__)(value)
@@ -550,7 +572,7 @@ def load(environ) -> Loaded:
 
     def key_text(name: str) -> str:  # a key shown is capped with its digest; a key hidden carries its ordinal only
         nonlocal hidden_keys
-        if _looks_like_a_key(_without_sign_in(name)):
+        if _never_shown(name):
             hidden_keys += 1
             return _HIDDEN_KEY_NAME.format(hidden_keys)
         return _shown(name, cap, key=chars)

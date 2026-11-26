@@ -58,6 +58,8 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
   scheme at the very start of a run. The look-alike rule
   is only a second net: it misses a short key, a key of one case or of digits only, a UUID, base64 cut by
   `+` or `/`, and a key split over a list's items, so such a value under a name not on the list is shown.
+  A value or a key whose own text, as the person wrote it, carries a password label or a known key
+  prefix is never shown, not in part, wherever an @ stands in it: `password=ab@cdefgh` is hidden whole.
   Put a key only under a setting whose name says so.
 - A settings file adds words to `status.hidden_names` and never takes the shipped words away; an empty
   list keeps them alone. A setting named whole in `status.shown_names` is shown although its name holds

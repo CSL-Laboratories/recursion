@@ -2287,6 +2287,47 @@ GENERATED_FORMS = (
 )
 
 
+# The second generator: a password label of the look-alike rule (each spelling, in lower, upper and mixed case,
+# then each mark or none) or a known key prefix, then a made-up password from GENERATED_ALPHABET that holds an @:
+# the last @ at any place and the tail after it of every length from 0 to GENERATED_LONGEST, for each form in turn.
+# The reproduced cases come first, set by hand.
+LABELLED_SEED = 2311
+LABELLED_DRAWS = 50  # for each label, case and mark, and for each key prefix: two of each tail length
+LABELLED_WORDS = ("password", "passwd", "secret", "apikey", "api_key", "api-key", "bearer", "token")
+LABELLED_MARKS = ("=", ":", ": ", " = ", "")
+LABELLED_BY_HAND = (("password=", "hunter2@x7Gq9zLm"), ("token:", "abc@defghijk"), ("password=", "hunter2@x7Gq"))
+
+
+def _labelled_forms() -> list[tuple[str, bool]]:
+    """(the label and its mark, or a key prefix; whether it is a label with no mark)."""
+    forms = []
+    for word in LABELLED_WORDS:
+        mixed = "".join(c.upper() if i % 2 else c for i, c in enumerate(word))
+        for spelled in (word, word.upper(), mixed):
+            forms.extend((spelled + mark, not mark) for mark in LABELLED_MARKS)
+    return forms + [(prefix, False) for prefix in settings._KEY_PREFIXES]
+
+
+def _labelled_draws():
+    """(the form, the password) of each draw: the reproduced cases, then LABELLED_DRAWS for each form."""
+    yield from LABELLED_BY_HAND
+    draw = random.Random(LABELLED_SEED)
+    no_at = tuple(c for c in GENERATED_ALPHABET if c != "@")
+    marks = tuple(c for c in GENERATED_ALPHABET if not c[0].isalnum())
+    for form, bare in _labelled_forms():
+        for i in range(LABELLED_DRAWS):
+            tail = "".join(draw.choice(no_at) for _ in range(i % (GENERATED_LONGEST + 1)))
+            before = "".join(draw.choice(GENERATED_ALPHABET) for _ in range(draw.randint(0, GENERATED_LONGEST)))
+            while len(before) + 1 + len(tail) < settings._KEY_TAIL:  # the label rule reads a password this long
+                before += draw.choice(GENERATED_ALPHABET)
+            password = before + "@" + tail
+            if bare and (password[0].isalnum() or password[0] == "_"):
+                # a label and a password with no mark between them that read as one longer word ('tokenab@c')
+                # are no label to the look-alike rule; a mark begins the password instead
+                password = draw.choice(marks) + password
+            yield form, password
+
+
 class AGeneratedPasswordNeverReachesALine(unittest.TestCase):
     """In every draw no run of 3 characters of the password (so no longer run either) stands in a line shown for
     it, as a value whole and cut and as a key cut, and every such line, the cut key's digest with it, is the line
@@ -2315,6 +2356,76 @@ class AGeneratedPasswordNeverReachesALine(unittest.TestCase):
                     if leaked or line != before:
                         self.fail(f"form {form!r}, password {password!r}: {leaked} in {line!r}")
         self.assertEqual(len(GENERATED_FORMS) * GENERATED_DRAWS, drawn)
+
+    def test_a_labelled_password_that_holds_an_at_sign_is_hidden_whole(self) -> None:
+        # The label or prefix and the password as one value: whole, cut and as a key cut, the line is the
+        # hidden-key words and no run of 3 characters of the password stands in it.
+        drawn, failed = 0, []
+        for form, password in _labelled_draws():
+            drawn += 1
+            runs = {password[i:i + 3] for i in range(len(password) - 2)}
+            lines = self.lines(form + password)
+            leaked = sorted(run for run in runs if any(run in line for line in lines) and run not in settings._HIDDEN_KEY)
+            if leaked or set(lines) != {settings._HIDDEN_KEY}:
+                failed.append(f"{form + password!r}: {leaked} in {lines!r}")
+        self.assertEqual(len(LABELLED_BY_HAND) + len(_labelled_forms()) * LABELLED_DRAWS, drawn)
+        self.assertEqual([], failed[:4], f"{len(failed)} of {drawn} generated values show a part of the password")
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class ALabelledPasswordIsHiddenWhole(_Folder):
+    """A value or a key whose own text carries a password label or a known key prefix is never shown, not in
+    part, wherever the @ stands in it: in status (python -m recursion_core.settings) and in the start log, under
+    names that hold no hidden word."""
+
+    def shown(self, text: str) -> str:
+        self.put(text)
+        env = dict(self.environ, PATH=os.environ.get("PATH", ""), PYTHONPATH=str(CORE), TMPDIR=str(self.tmp))
+        proc = subprocess.run([sys.executable, "-B", "-m", "recursion_core.settings"], capture_output=True,
+                              text=True, env=env, cwd=str(self.tmp), timeout=60, check=False)
+        _, messages, _ = TheDaemonsStart.start_log(self)
+        logged = [message for message in messages if message.startswith("settings: ")]
+        self.assertTrue(logged)
+        return proc.stdout + proc.stderr + "\n".join(logged)
+
+    def assert_hidden_whole(self, file) -> None:
+        real = [form + password for form, password in LABELLED_BY_HAND]
+        stand_in = [form + "~" * len(password) for form, password in LABELLED_BY_HAND]
+        out = self.shown(file(real))
+        self.assertIn("<hidden", out)
+        for form, password in LABELLED_BY_HAND:
+            self.assertNotIn(password[3:], out)
+            self.assertNotIn(password[password.rfind("@"):], out)  # the tail after the last @
+        self.assertEqual(self.shown(file(stand_in)), out)  # only the password changed: every line the same
+
+    def test_as_values_under_names_that_hold_no_hidden_word(self) -> None:
+        def file(texts: list[str]) -> str:
+            return (f'version = 1\n[plugin_host]\ngil_check = "{texts[0]}"\n[status]\nvalue_max_chars = "none"\n'
+                    f'shown_names = [{", ".join(chr(34) + text + chr(34) for text in texts)}]\n')
+        self.assert_hidden_whole(file)
+
+    def test_as_keys_of_the_file(self) -> None:
+        self.assert_hidden_whole(lambda texts: "version = 1\n" + "".join(f'"{text}" = 1\n' for text in texts))
+
+    def test_every_labelled_draw_as_a_key_of_a_file_is_hidden_whole(self) -> None:
+        self.put('version = 1\n"zzzz" = 1\n"zz.zz" = 1\n')  # the words of the two notes a key can meet
+        tails = {note.detail[len(repr(key)):] for key, note in zip(("zzzz", "zz.zz"), settings.load(self.environ).notes)}
+        batches = collections.defaultdict(dict)
+        for form, password in _labelled_draws():
+            batches[form].setdefault(form + password, password)
+        drawn, failed = 0, []
+        for keys in batches.values():
+            self.put("version = 1\n" + "".join(f'"{key}" = 1\n' for key in keys))
+            notes = settings.load(self.environ).notes
+            self.assertEqual(len(keys), len(notes))
+            for number, (key, note) in enumerate(zip(keys, notes), 1):
+                drawn += 1
+                name = settings._HIDDEN_KEY_NAME.format(number)
+                rest = re.sub(r"; did you mean [a-z_.]+\?$", "", note.detail[len(name):])
+                if not note.detail.startswith(name) or rest not in tails:
+                    failed.append(f"{key!r}: {note.detail!r}")
+        self.assertEqual(sum(len(keys) for keys in batches.values()), drawn)
+        self.assertEqual([], failed[:4], f"{len(failed)} of {drawn} generated keys show a part of the password")
 
 
 # Sign-ins with no scheme at the very start of their run: (the form with {} for the made-up secret, the parts of
@@ -2464,6 +2575,12 @@ class NothingBeforeTheLastAtSignReachesALine(unittest.TestCase):
             hidden = text[begin:last]
             runs = {hidden[i:i + 3] for i in range(len(hidden) - 2)}
             stand_in = self.lines(text[:begin] + "~" + text[last:])
+            if settings._key_shape_as_written(text) and not settings._key_shape_as_written(text[:begin] + "~"
+                                                                                         + text[last:]):
+                # The one exception: the hidden part carries a password label or a known key prefix, as the
+                # module's own predicate reads it, so every line is the words for a hidden key or password.
+                seen["the hidden part carries a key shape"] += 1
+                stand_in = (settings._HIDDEN_KEY,) * len(stand_in)
             for line, before in zip(self.lines(text), stand_in):
                 leaked = sorted(run for run in runs if run in line and run not in before)
                 if leaked or line != before:

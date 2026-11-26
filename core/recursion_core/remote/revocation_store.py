@@ -53,6 +53,13 @@ like an unreadable file, with words that say how many revocations are missing an
 LATEST copy, or start knowingly with fewer by the forget command). The count is written after the record, so a
 stop between the two leaves a count that is lower, which is read and caught up at the next write; a folder
 written before the count existed gets it at the next write, which every start makes.
+
+The forget command says only what it did. It refuses a state folder that is not there, or holds no relay folder
+(it makes none); it refuses while the daemon runs: every store takes a shared lock beside the record,
+``.revocations.json.live``, at its first read or write and holds it for its life, so a running book is found
+whether it writes or not, and the record's own lock held (a write under way) refuses it too. Each run appends one
+line to ``revocations.forgotten.jsonl`` beside the record: the time, the user, and how many revocations and
+records of connections were forgotten (``null`` with the reason when the record could not be read).
 """
 
 from __future__ import annotations
@@ -63,12 +70,13 @@ import math
 import os
 import stat
 import sys
+import time
 from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from ..control.credentials import CredentialStoreError, owner_file_lock, replace_file, sweep_temps
-from .relay_store import RelayStateRefused, relay_folder
+from .relay_store import RELAY_STATE_DIR, RelayStateRefused, relay_folder
 
 REVOCATIONS_FILE = "revocations.json"   # <state folder>/relay/revocations.json
 REVOCATIONS_VERSION = 1                 # a figure of the file's format, not a setting
@@ -80,6 +88,8 @@ REVOCATIONS_MARK = f".{REVOCATIONS_FILE}.recorded"   # beside the file: revocati
 MARK_TEXT = (f"Revocations were recorded in {REVOCATIONS_FILE} of this folder. While this file is here, a missing "
              f"{REVOCATIONS_FILE} refuses every phone.\n").encode("utf-8")
 REVOCATIONS_COUNT = f".{REVOCATIONS_FILE}.count"   # beside the file: how many revocations it held at its last write
+REVOCATIONS_LIVE = f".{REVOCATIONS_FILE}.live"     # beside the file: held shared by every store while it lives
+FORGOTTEN_FILE = "revocations.forgotten.jsonl"     # beside the file: one line for each run of the forget command
 
 
 def count_text(count: int) -> bytes:
@@ -112,6 +122,18 @@ class RevocationPartlyWritten(RevocationStoreError):
         super().__init__(words)
         self.devices = devices
         self.connections = connections
+
+
+@dataclass(frozen=True)
+class Forgotten:
+    """What the forget command did: how many revocations and records of connections it forgot (``None`` with
+    ``unreadable``, the reason, when the record could not be read), and why its line could not be written
+    (``line_error``, ``None`` when it was)."""
+
+    revocations: int | None
+    connections: int | None
+    unreadable: str | None = None
+    line_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -339,9 +361,44 @@ class FileRevocationStore:
         self._lock_path = os.path.join(folder, f".{REVOCATIONS_FILE}.lock")
         self._mark_path = os.path.join(folder, REVOCATIONS_MARK)
         self._count_path = os.path.join(folder, REVOCATIONS_COUNT)
+        self._live_path = os.path.join(folder, REVOCATIONS_LIVE)
+        self.forgotten_path = os.path.join(folder, FORGOTTEN_FILE)
+        self._live_fd: int | None = None
         self._state_dir = state_dir
         self._timeout = float(lock_timeout_s)
         self._uid = os.geteuid()
+
+    # -- the live lock ------------------------------------------------------------------------------
+    def _hold_live(self) -> None:
+        """At the first read or write: a shared flock on the live lock beside the record, held for the store's life,
+        so the forget command finds a running daemon whether it writes or not. A lock that cannot be taken is no
+        refusal: the record's own lock still guards every write."""
+        if self._live_fd is not None:
+            return
+        import fcntl
+        try:
+            fd = os.open(self._live_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+                         | getattr(os, "O_CLOEXEC", 0), 0o600)
+        except OSError:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return
+        self._live_fd = fd
+
+    def close(self) -> None:
+        """Let the live lock go; the store's end does it too."""
+        fd, self._live_fd = getattr(self, "_live_fd", None), None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __del__(self) -> None:
+        self.close()
 
     # -- reading ------------------------------------------------------------------------------------
     def _refused(self, why: str) -> RevocationStoreError:
@@ -445,6 +502,7 @@ class FileRevocationStore:
         return self._counted(doc)
 
     def load(self) -> Revocations:
+        self._hold_live()
         try:
             with owner_file_lock(self._lock_path, self._uid, self._timeout):
                 sweep_temps(self.path)
@@ -457,6 +515,7 @@ class FileRevocationStore:
 
     # -- writing ------------------------------------------------------------------------------------
     def _change(self, change: Revocations | None, forget: Iterable[Hashable]) -> None:
+        self._hold_live()
         gone = set(forget)
         try:
             with owner_file_lock(self._lock_path, self._uid, self._timeout):
@@ -553,18 +612,93 @@ class FileRevocationStore:
     def forget(self, conn_ids: Iterable[Hashable]) -> None:
         self._change(None, conn_ids)
 
-    def forget_every_revocation(self) -> None:
+    def _running(self) -> int:
+        """Before the forget command changes anything: the live lock taken whole (returned, to hold for the run),
+        and the record's lock free; else refused, the daemon is running."""
+        import fcntl
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+        try:
+            live = os.open(self._live_path, flags | os.O_CREAT, 0o600)
+        except OSError as exc:
+            raise RevocationStoreError(f"{self._live_path} cannot be opened ({type(exc).__name__}), so a running "
+                                       f"daemon cannot be ruled out; the folder must be writable by the daemon's "
+                                       f"user") from None
+        try:
+            fcntl.flock(live, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(live)
+            raise RevocationStoreError(f"the daemon is running: a book holds the record of revoked phones open "
+                                       f"({self._live_path} is held); stop it first, then run the command "
+                                       f"again") from None
+        try:
+            probe = os.open(self._lock_path, flags)
+        except FileNotFoundError:
+            return live
+        except OSError as exc:
+            os.close(live)
+            raise RevocationStoreError(f"{self._lock_path} cannot be opened ({type(exc).__name__}), so a running "
+                                       f"daemon cannot be ruled out") from None
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(live)
+            raise RevocationStoreError(f"the daemon is running: the record of revoked phones is being written "
+                                       f"({self._lock_path} is held); stop it first, then run the command "
+                                       f"again") from None
+        finally:
+            os.close(probe)
+        return live
+
+    def _line(self, revocations: int | None, connections: int | None, unreadable: str | None) -> str | None:
+        """One line appended to the record of the forget command's runs: the time, the user, how many were
+        forgotten. ``None``, or why it could not be written."""
+        try:
+            import pwd
+            user = pwd.getpwuid(self._uid).pw_name
+        except (ImportError, KeyError):
+            user = str(self._uid)
+        row: dict = {"at": time.time(), "user": user, "uid": self._uid, "revocations": revocations,
+                     "connections": connections}
+        if unreadable is not None:
+            row["unreadable"] = unreadable
+        data = (json.dumps(row, sort_keys=True) + "\n").encode("ascii")
+        try:
+            fd = os.open(self.forgotten_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+                         | getattr(os, "O_CLOEXEC", 0), 0o600)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_uid != self._uid or stat.S_IMODE(st.st_mode) & 0o077:
+                    return f"{self.forgotten_path} is not an owner-only file of the daemon's user"
+                if os.write(fd, data) != len(data):
+                    return f"{self.forgotten_path} took only part of the line"
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            return f"{self.forgotten_path} could not be written ({type(exc).__name__})"
+        return None
+
+    def forget_every_revocation(self) -> Forgotten:
         """Empty the record and remove the mark and the count, whatever the file holds or whether it is there:
-        every phone revoked before may then pair again. The one knowing way to start a new record."""
+        every phone revoked before may then pair again. The one knowing way to start a new record. Refused while
+        the daemon runs; appends one line saying what it forgot (see the module text)."""
         empty = {"version": REVOCATIONS_VERSION, "boot": None, "devices": {}, "connections": []}
+        live = self._running()
         try:
             with owner_file_lock(self._lock_path, self._uid, self._timeout):
+                try:
+                    doc = self._read()
+                    revocations, connections, unreadable = len(doc["devices"]), len(doc["connections"]), None
+                except RevocationStoreError as exc:
+                    revocations = connections = None
+                    unreadable = str(exc)
                 replace_file(self.path, _dumps(empty))
                 for beside in (self._mark_path, self._count_path):
                     try:
                         os.unlink(beside)
                     except FileNotFoundError:
                         pass
+                line_error = self._line(revocations, connections, unreadable)
         except CredentialStoreError as exc:
             raise RevocationStoreError(f"{self.path}: the record of revoked phones could not be emptied ({exc}); "
                                        f"the folder must be writable by the daemon's user") from None
@@ -572,6 +706,9 @@ class FileRevocationStore:
             raise RevocationStoreError(f"{self._mark_path} or {self._count_path}: the record is empty but the mark or "
                                        f"the count beside it could not be removed ({type(exc).__name__}); remove "
                                        f"those files by hand") from None
+        finally:
+            os.close(live)
+        return Forgotten(revocations, connections, unreadable, line_error)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -584,14 +721,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", required=True, help="the daemon's state folder")
     parser.add_argument("command", choices=[COMMAND_FORGET])
     args = parser.parse_args(argv)
+    state = args.state_dir
+    if not os.path.isdir(state):
+        print(f"nothing was forgotten: there is no state folder at {state} (no folder was made); give the daemon's "
+              f"state folder as --state-dir", file=sys.stderr)
+        return 2
+    if not os.path.isdir(os.path.join(state, RELAY_STATE_DIR)):
+        print(f"nothing was forgotten: there is no record of revoked phones in {state} (it holds no folder "
+              f"{RELAY_STATE_DIR}, and none was made); give the daemon's state folder as --state-dir", file=sys.stderr)
+        return 2
     try:
-        store = FileRevocationStore(args.state_dir)
-        store.forget_every_revocation()
+        store = FileRevocationStore(state)
+        done = store.forget_every_revocation()
     except RevocationStoreError as exc:
         print(f"nothing was forgotten: {exc}", file=sys.stderr)
         return 1
-    print(f"the record of revoked phones in {store.path} is now empty: every phone revoked before may pair again; "
-          f"remove every paired phone and pair each one anew")
+    if done.unreadable is None:
+        count = (f"{done.revocations} revocations were forgotten, with {done.connections} records of revoked "
+                 f"connections")
+    else:
+        count = f"how many revocations were forgotten is not known: the record could not be read ({done.unreadable})"
+    print(f"the record of revoked phones in {store.path} is now empty: {count}; every phone revoked before may pair "
+          f"again; remove every paired phone and pair each one anew")
+    if done.line_error is None:
+        print(f"a line saying so was added to {store.forgotten_path}")
+    else:
+        print(f"the record is empty, but the line saying so could not be added: {done.line_error}", file=sys.stderr)
     return 0
 
 

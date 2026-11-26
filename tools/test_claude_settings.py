@@ -4,10 +4,29 @@ Claude Code's rule matcher cannot run here, so these checks pin the reviewed
 allow/ask lists, reject any rule that could publish, spend or reach the network,
 keep the SessionStart hook unchanged, and run the PreToolUse substitution guard
 against sample hook inputs.
+
+A new tools/test_*.py file needs no edit of .claude/settings.json. The gate rule
+"python -X utf8 -B tools/ci_gate.py --force" is already allowed and runs every
+tools/test_*.py file that tools/ci_gate.py does not exclude, so a new tools test
+runs without a prompt through the gate. An exact rule that runs ONE tools test
+file alone stays a founder's choice: each such rule must name a file that git
+tracks under tools/ with a name of the form test_[a-z0-9_]+.py, and a rule that
+names a missing, untracked or foreign file fails with words naming the line.
+
+The trade: before, this guard failed until a founder had added the two exact
+lines for every new tools test, so a founder read the name of each new test file
+before the change could pass. That forced look is given up. What is not given
+up: an agent still gets a prompt when it runs a tools test file alone, unless a
+founder has added that file's exact line, because no rule here covers every
+tools/test_*.py file. The exact lines guard a file's name only, never its
+content: an agent may already change an allowed test file and run it unprompted.
 """
 import json
+import os
+import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -27,22 +46,75 @@ def tool_test_rules(paths):
             for name in sorted(path.name for path in paths) for py in PYTHONS]
 
 
-def missing_rules_message(missing):
-    """Name the allow lines to add, as they appear in .claude/settings.json (CSL-380)."""
-    lines = "\n".join(f"      {json.dumps(rule)}," for rule in missing)
-    return ("Add these allow rules to .claude/settings.json for the new tools/test_*.py "
-            "files:\n" + lines + "\n.claude/settings.json is the agent permission policy, "
-            "so a founder approves these lines in the PR; the Claude fixer must not add them.")
+TOOL_TEST_NAME = re.compile(r"test_[a-z0-9_]+\.py")
+TOOL_TEST_RULE = re.compile(r"Bash\((?:python|python3) -X utf8 -B (?P<path>.*)\)")
+CODE_RULE_PREFIXES = tuple(f"Bash({py} -X utf8 -B " for py in PYTHONS)
+GIT_TIMEOUT = 30  # seconds per git call, the same bound as the guard call below
 
 
-# Script tests are allowed two exact rules each (python and python3); a new
-# tools/test_*.py fails this guard until its rules are added on purpose.
+def tracked_tool_files(root):
+    """The files git tracks under root/tools, as posix paths, or the reason git could not say."""
+    git = shutil.which("git")
+    if git is None:
+        return None, "git is not on PATH"
+    try:
+        result = subprocess.run([git, "-C", str(root), "ls-files", "-z", "--", "tools"],
+                                capture_output=True, timeout=GIT_TIMEOUT, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"git ls-files did not run ({exc})"
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
+        return None, "git ls-files failed" + (f" ({detail[-1]})" if detail else "")
+    return {path for path in result.stdout.decode("utf-8", "replace").split("\0") if path}, None
+
+
+def is_tool_test_rule(rule):
+    """A rule that runs one script with the tools-test command shape, outside the reviewed set."""
+    return rule.startswith(CODE_RULE_PREFIXES) and rule not in ALLOW
+
+
+def stale_tool_test_rules(allow, root):
+    """Each tools-test allow rule that names no tracked tools/test_[a-z0-9_]+.py file, with why."""
+    rules = [rule for rule in allow if is_tool_test_rule(rule)]
+    if not rules:
+        return []
+    tracked, why_not = tracked_tool_files(root)
+    stale = []
+    for rule in rules:
+        match = TOOL_TEST_RULE.fullmatch(rule)
+        path = match.group("path") if match else ""
+        name = path[len("tools/"):] if path.startswith("tools/") else ""
+        if not TOOL_TEST_NAME.fullmatch(name):
+            stale.append((rule, "it does not name a file tools/test_*.py whose name is "
+                                "test_ followed by lower-case letters, digits or underscores"))
+        elif not (Path(root) / "tools" / name).is_file():
+            stale.append((rule, f"{path} is not a file in this checkout"))
+        elif tracked is None:
+            stale.append((rule, f"{why_not}, so it cannot be told whether git tracks {path}; "
+                                "run this test in a git checkout"))
+        elif path not in tracked:
+            stale.append((rule, f"git does not track {path}; add the file to git or remove the line"))
+    return stale
+
+
+def stale_rules_message(stale):
+    """Name each stale tools-test allow line, as it appears in .claude/settings.json, and why."""
+    lines = "\n".join(f"      {json.dumps(rule)},\n        because {why}" for rule, why in stale)
+    return ("These allow rules in .claude/settings.json run a script that is not a tracked "
+            "tools test file:\n" + lines + "\n.claude/settings.json is the agent permission policy, "
+            "so a founder removes or corrects these lines in the PR; the Claude fixer must not "
+            "edit them. A new tools/test_*.py file needs no line here: the allowed gate rule "
+            "already runs it.")
+
+
+# A tools/test_*.py file may have two exact rules (python and python3) so that it
+# runs alone without a prompt; a founder adds them by choice. A new file needs
+# none: the allowed gate rule runs it. Each such rule must name a tracked file.
 TOOL_TEST_PATHS = tuple((ROOT / "tools").glob("test_*.py"))
 TOOL_TESTS = set(tool_test_rules(TOOL_TEST_PATHS))
 ALLOW = (
     {f"Bash({py} -X utf8 -B tools/ci_gate.py{arg})"
      for py in PYTHONS for arg in ("", " --force", " --paths-only")}
-    | TOOL_TESTS
     | {f"Bash({py} -m unittest)" for py in PYTHONS}
     | {"Bash(actionlint)"}
     | {f"Bash({cmd}{tail})" for cmd in GH_READ for tail in ("", " *")}
@@ -89,8 +161,22 @@ PLAIN = (
 )
 
 
-def settings():
-    return json.loads(SETTINGS.read_text(encoding="utf-8"))
+def settings(root=ROOT):
+    return json.loads((Path(root) / ".claude" / "settings.json").read_text(encoding="utf-8"))
+
+
+def check_policy(case, root):
+    """The reviewed allow and ask lists of root/.claude/settings.json; ROOT is this repository."""
+    permissions = settings(root)["permissions"]
+    allow, ask = permissions["allow"], permissions["ask"]
+    case.assertEqual(len(allow), len(set(allow)))
+    case.assertEqual(len(ask), len(set(ask)))
+    stale = stale_tool_test_rules(allow, root)
+    case.assertFalse(stale, stale_rules_message(stale))
+    case.assertEqual({rule for rule in allow if not is_tool_test_rule(rule)}, ALLOW)
+    case.assertEqual(set(ask), ASK)
+    case.assertNotIn("deny", permissions)
+    case.assertNotIn("defaultMode", permissions)
 
 
 def guard(raw):
@@ -108,27 +194,15 @@ def event(command):
 
 class PolicyTests(unittest.TestCase):
     def test_allow_and_ask_lists_match_the_reviewed_policy(self):
-        permissions = settings()["permissions"]
-        allow, ask = permissions["allow"], permissions["ask"]
-        self.assertEqual(len(allow), len(set(allow)))
-        self.assertEqual(len(ask), len(set(ask)))
-        missing = [rule for rule in tool_test_rules(TOOL_TEST_PATHS) if rule not in allow]
-        self.assertFalse(missing, missing_rules_message(missing))
-        self.assertEqual(set(allow), ALLOW)
-        self.assertEqual(set(ask), ASK)
-        self.assertNotIn("deny", permissions)
-        self.assertNotIn("defaultMode", permissions)
+        check_policy(self, ROOT)
 
-    def test_missing_tool_test_rules_are_named_for_a_founder(self):
-        # Only the synthetic file, so a real new tools test fails only the policy test above.
-        missing = tool_test_rules([ROOT / "tools" / "test_example.py"])
-        expected = ['      "Bash(python -X utf8 -B tools/test_example.py)",',
-                    '      "Bash(python3 -X utf8 -B tools/test_example.py)",']
-        self.assertEqual(len(missing), 2)
-        message = missing_rules_message(missing)
-        for line in expected:
-            self.assertIn(line, message)
-        self.assertIn("founder", message)
+    def test_stale_tool_test_rules_are_named_for_a_founder(self):
+        stale = [("Bash(python -X utf8 -B tools/test_gone.py)", "tools/test_gone.py is not a file")]
+        message = stale_rules_message(stale)
+        self.assertIn('      "Bash(python -X utf8 -B tools/test_gone.py)",', message)
+        self.assertIn("because tools/test_gone.py is not a file", message)
+        self.assertIn("a founder removes or corrects these lines", message)
+        self.assertIn("A new tools/test_*.py file needs no line here", message)
 
     def test_only_read_only_gh_rules_take_arguments(self):
         # Code-running commands are exact: a wildcard would also admit options
@@ -152,6 +226,103 @@ class PolicyTests(unittest.TestCase):
                     for hook in group["hooks"] if hook["type"] == "command"]
         self.assertEqual(commands, ['bash "$CLAUDE_PROJECT_DIR/.claude/hooks/guard-substitution.sh"'])
         self.assertTrue(GUARD.is_file())
+
+
+class CopyPolicyTests(unittest.TestCase):
+    """The policy check on a temporary copy of .claude and tools with a git index of its own."""
+
+    def setUp(self):
+        if shutil.which("git") is None:
+            raise unittest.SkipTest("git not on PATH")
+        self.root = self.copy_tree()
+        self.git("init", "-q")
+        self.git("add", "-A")
+        self.original = (self.root / ".claude" / "settings.json").read_bytes()
+
+    def copy_tree(self):
+        tmp = tempfile.TemporaryDirectory(prefix="claude-settings-", ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        for folder in (".claude", "tools"):
+            shutil.copytree(ROOT / folder, root / folder, ignore=shutil.ignore_patterns("__pycache__"))
+        return root
+
+    def git(self, *args):
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        subprocess.run([shutil.which("git"), "-C", str(self.root), *args], env=env,
+                       capture_output=True, timeout=GIT_TIMEOUT, check=True)
+
+    def write_tool(self, rel, track):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("import unittest\n", encoding="utf-8")
+        if track:
+            self.git("add", "--", rel)
+
+    def with_rules(self, *rules):
+        path = self.root / ".claude" / "settings.json"
+        data = json.loads(self.original.decode("utf-8"))
+        data["permissions"]["allow"].extend(rules)
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    def assert_named(self, rule, words):
+        with self.assertRaises(AssertionError) as caught:
+            check_policy(self, self.root)
+        message = str(caught.exception)
+        self.assertIn(json.dumps(rule), message)
+        self.assertIn(words, message)
+        self.assertIn("a founder removes or corrects these lines", message)
+
+    def test_this_repositorys_settings_pass_on_a_copy(self):
+        check_policy(self, self.root)
+
+    def test_a_new_untracked_tool_test_needs_no_settings_edit(self):
+        self.write_tool("tools/test_new_thing.py", track=False)
+        check_policy(self, self.root)
+        self.assertEqual((self.root / ".claude" / "settings.json").read_bytes(), SETTINGS.read_bytes())
+
+    def test_a_new_tracked_tool_test_needs_no_settings_edit(self):
+        self.write_tool("tools/test_new_thing.py", track=True)
+        check_policy(self, self.root)
+        self.assertEqual((self.root / ".claude" / "settings.json").read_bytes(), SETTINGS.read_bytes())
+
+    def test_a_rule_for_a_missing_or_untracked_file_is_named(self):
+        self.write_tool("tools/test_loose.py", track=False)
+        for rule, words in (("Bash(python -X utf8 -B tools/test_gone.py)",
+                             "tools/test_gone.py is not a file in this checkout"),
+                            ("Bash(python3 -X utf8 -B tools/test_loose.py)",
+                             "git does not track tools/test_loose.py")):
+            with self.subTest(rule=rule):
+                self.with_rules(rule)
+                self.assert_named(rule, words)
+
+    def test_a_rule_outside_the_name_rule_is_named(self):
+        self.write_tool("tools/test_X-Y.py", track=True)
+        self.write_tool("tools/sub/test_x.py", track=True)
+        for rule in ("Bash(python -X utf8 -B tools/test_X-Y.py)",
+                     "Bash(python3 -X utf8 -B tools/sub/test_x.py)",
+                     "Bash(python -X utf8 -B tools/../tools/test_ci_gate.py)",
+                     "Bash(python3 -X utf8 -B tools/test_ci_gate.py --pastebin)",
+                     "Bash(python -X utf8 -B scripts/test_x.py)"):
+            with self.subTest(rule=rule):
+                self.with_rules(rule)
+                self.assert_named(rule, "test_ followed by lower-case letters, digits or underscores")
+
+    def test_a_wildcard_rule_for_code_fails(self):
+        for rule in ("Bash(python -X utf8 -B tools/test_*.py)",
+                     "Bash(python3 -X utf8 -B tools/test_*.py)",
+                     "Bash(python3 -m unittest *)"):
+            with self.subTest(rule=rule):
+                self.with_rules(rule)
+                with self.assertRaises(AssertionError):
+                    check_policy(self, self.root)
+
+    def test_without_git_a_tools_test_rule_fails_with_words(self):
+        self.root = self.copy_tree()
+        message = stale_rules_message(stale_tool_test_rules(
+            ["Bash(python -X utf8 -B tools/test_ci_gate.py)"], self.root))
+        self.assertIn('"Bash(python -X utf8 -B tools/test_ci_gate.py)"', message)
+        self.assertIn("git", message)
 
 
 class GuardTests(unittest.TestCase):

@@ -44,6 +44,15 @@ nothing (``replace_file``), under the same lock; a folder without the mark whose
 start makes. While the mark is there, a missing file is refused like an unreadable one, so
 deleting the file never lets a revoked phone pair again. ``forget-every-revocation`` (``main``) empties the
 record and removes the mark, the one knowing way to start a new record.
+
+An OLDER copy of the file put back is refused too. Beside the mark the same step writes a count,
+``.revocations.json.count``: how many revoked devices the record held at its last write. A device's revocation
+is never taken out of the record but by the forget command, so a record that holds fewer devices than the count
+says is a copy from before the last revocation: a phone revoked after it would be let in again, so it is refused
+like an unreadable file, with words that say how many revocations are missing and the two ways on (put back the
+LATEST copy, or start knowingly with fewer by the forget command). The count is written after the record, so a
+stop between the two leaves a count that is lower, which is read and caught up at the next write; a folder
+written before the count existed gets it at the next write, which every start makes.
 """
 
 from __future__ import annotations
@@ -70,6 +79,14 @@ REVOCATIONS_LOCK_TIMEOUT_S: float = 10.0
 REVOCATIONS_MARK = f".{REVOCATIONS_FILE}.recorded"   # beside the file: revocations were written in it
 MARK_TEXT = (f"Revocations were recorded in {REVOCATIONS_FILE} of this folder. While this file is here, a missing "
              f"{REVOCATIONS_FILE} refuses every phone.\n").encode("utf-8")
+REVOCATIONS_COUNT = f".{REVOCATIONS_FILE}.count"   # beside the file: how many revocations it held at its last write
+
+
+def count_text(count: int) -> bytes:
+    """The bytes of the count beside the record: the count first, then what it means."""
+    return (f"{count} revocations were recorded in {REVOCATIONS_FILE} of this folder; a copy of it that holds fewer "
+            f"is refused.\n").encode("utf-8")
+
 COMMAND_FORGET = "forget-every-revocation"
 # The most digits of a connection id that is a whole number: a figure of the file's format, not a setting. It is
 # CPython's sys.int_info.str_digits_check_threshold, the lowest limit that sys.set_int_max_str_digits,
@@ -321,6 +338,7 @@ class FileRevocationStore:
         self.path = os.path.join(folder, REVOCATIONS_FILE)
         self._lock_path = os.path.join(folder, f".{REVOCATIONS_FILE}.lock")
         self._mark_path = os.path.join(folder, REVOCATIONS_MARK)
+        self._count_path = os.path.join(folder, REVOCATIONS_COUNT)
         self._state_dir = state_dir
         self._timeout = float(lock_timeout_s)
         self._uid = os.geteuid()
@@ -328,7 +346,8 @@ class FileRevocationStore:
     # -- reading ------------------------------------------------------------------------------------
     def _refused(self, why: str) -> RevocationStoreError:
         return RevocationStoreError(f"{self.path}: {why}; the file must be readable by the daemon's user, or be "
-                                    f"restored from a copy (deleting it lets no phone in: a missing record is "
+                                    f"restored from its LATEST copy (an older copy would let every phone revoked "
+                                    f"after it pair again; deleting it lets no phone in: a missing record is "
                                     f"refused too)")
 
     def _marked(self) -> bool:
@@ -345,19 +364,66 @@ class FileRevocationStore:
         command = f"python -m recursion_core.remote.revocation_store --state-dir {self._state_dir} {COMMAND_FORGET}"
         return RevocationStoreError(
             f"{self.path} is missing, but revocations were recorded in it ({self._mark_path} says so). Put the "
-            f"file back from a copy; or, to start a new record knowingly, stop the daemon, run `{command}` (it "
+            f"file back from a copy, the LATEST one: an older copy would let every phone revoked after it pair "
+            f"again; or, to start a new record knowingly, stop the daemon, run `{command}` (it "
             f"empties the record, so every phone revoked before may pair again), then remove every paired phone "
             f"and pair each one anew")
 
+    def _older(self, held: int, recorded: int) -> RevocationStoreError:
+        command = f"python -m recursion_core.remote.revocation_store --state-dir {self._state_dir} {COMMAND_FORGET}"
+        missing = recorded - held
+        return RevocationStoreError(
+            f"{self.path} is OLDER than the last revocation written in it: {missing} of the {recorded} revocations "
+            f"written in it {'is' if missing == 1 else 'are'} missing ({self._count_path} counts {recorded}, the "
+            f"file holds {held}). A phone revoked after that copy would be let in again, so no phone is let in. "
+            f"Next: put back the LATEST copy of the file; or, to start knowingly with fewer, stop the daemon, run "
+            f"`{command}` (it empties the record, so every phone revoked before may pair again), then remove every "
+            f"paired phone and pair each one anew")
+
+    def _recorded(self) -> int:
+        """How many revocations the count beside the record says were written: 0 when it is not there. Anything in
+        its place that cannot be read as a count is refused, like the record."""
+        where = f"the count beside it, {self._count_path},"
+        try:
+            fd = os.open(self._count_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+        except FileNotFoundError:
+            return 0
+        except OSError as exc:
+            raise self._refused(f"{where} cannot be opened ({type(exc).__name__})") from None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != self._uid or stat.S_IMODE(st.st_mode) & 0o077:
+                raise self._refused(f"{where} is not an owner-only file of the daemon's user")
+            with os.fdopen(fd, "rb") as handle:
+                fd = None
+                raw = handle.read(len(count_text(0)) + 64)
+        except OSError as exc:
+            raise self._refused(f"{where} cannot be read ({type(exc).__name__})") from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+        head = raw.split(b" ", 1)[0]
+        if not (head.isdigit() and head.isascii() and raw == count_text(int(head))):
+            raise self._refused(f"{where} does not hold a count of revocations")
+        return int(head)
+
+    def _counted(self, doc: dict) -> dict:
+        """``doc``, unless it holds fewer revoked devices than the count says were written: then refused."""
+        recorded = self._recorded()
+        if len(doc["devices"]) < recorded:
+            raise self._older(len(doc["devices"]), recorded)
+        return doc
+
     def _read(self) -> dict:
         """The file's document, checked. A missing file is an empty record only when no revocation was ever
-        written here (no mark); with the mark it is refused."""
+        written here (no mark); with the mark it is refused. A record that holds fewer revocations than the count
+        beside it is refused."""
         try:
             fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
         except FileNotFoundError:
             if self._marked():
                 raise self._missing() from None
-            return {"version": REVOCATIONS_VERSION, "boot": None, "devices": {}, "connections": []}
+            return self._counted({"version": REVOCATIONS_VERSION, "boot": None, "devices": {}, "connections": []})
         except OSError as exc:
             raise self._refused(f"it cannot be opened ({type(exc).__name__})") from None
         try:
@@ -373,9 +439,10 @@ class FileRevocationStore:
             if fd is not None:
                 os.close(fd)
         try:
-            return _document(raw)
+            doc = _document(raw)
         except _Unreadable as exc:
             raise self._refused(str(exc)) from None
+        return self._counted(doc)
 
     def load(self) -> Revocations:
         try:
@@ -440,6 +507,9 @@ class FileRevocationStore:
                     # After the record, so that a write of it is never undone by the mark's. A stop between
                     # the two leaves a record without its mark until the next start's write adds it.
                     replace_file(self._mark_path, MARK_TEXT)
+                if doc["devices"] and self._recorded() != len(doc["devices"]):
+                    # After the record too: a stop between the two leaves a lower count, caught up next time.
+                    replace_file(self._count_path, count_text(len(doc["devices"])))
                 if left_devices or left_connections:
                     raise RevocationPartlyWritten(self._partly(left_devices, left_connections),
                                                   frozenset(left_devices), frozenset(left_connections))
@@ -484,22 +554,24 @@ class FileRevocationStore:
         self._change(None, conn_ids)
 
     def forget_every_revocation(self) -> None:
-        """Empty the record and remove the mark, whatever the file holds or whether it is there: every phone
-        revoked before may then pair again. The one knowing way to start a new record."""
+        """Empty the record and remove the mark and the count, whatever the file holds or whether it is there:
+        every phone revoked before may then pair again. The one knowing way to start a new record."""
         empty = {"version": REVOCATIONS_VERSION, "boot": None, "devices": {}, "connections": []}
         try:
             with owner_file_lock(self._lock_path, self._uid, self._timeout):
                 replace_file(self.path, _dumps(empty))
-                try:
-                    os.unlink(self._mark_path)
-                except FileNotFoundError:
-                    pass
+                for beside in (self._mark_path, self._count_path):
+                    try:
+                        os.unlink(beside)
+                    except FileNotFoundError:
+                        pass
         except CredentialStoreError as exc:
             raise RevocationStoreError(f"{self.path}: the record of revoked phones could not be emptied ({exc}); "
                                        f"the folder must be writable by the daemon's user") from None
         except OSError as exc:
-            raise RevocationStoreError(f"{self._mark_path}: the record is empty but the mark could not be removed "
-                                       f"({type(exc).__name__}); remove that file by hand") from None
+            raise RevocationStoreError(f"{self._mark_path} or {self._count_path}: the record is empty but the mark or "
+                                       f"the count beside it could not be removed ({type(exc).__name__}); remove "
+                                       f"those files by hand") from None
 
 
 def main(argv: list[str] | None = None) -> int:

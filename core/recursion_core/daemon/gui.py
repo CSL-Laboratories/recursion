@@ -26,7 +26,7 @@ from collections.abc import Mapping
 import io
 import socket
 from socketserver import ThreadingMixIn
-from threading import Lock, Thread
+from threading import Condition, Lock, Thread
 import time
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer
 
@@ -98,6 +98,9 @@ class _Handler(WSGIRequestHandler):
 
     def parse_request(self):
         parsed = super().parse_request()
+        # Headers are in hand (or the read has ended). Eviction may replace this
+        # thread only after that: until then it may not be blocked in recv.
+        self.server._headers_in_hand(self.connection)
         if parsed and (len(self.headers.get_all("Content-Length", ())) > 1
                        or self.headers.get("Transfer-Encoding") is not None):
             # One Content-Length and no transfer coding: this server reads a body by its length only.
@@ -120,9 +123,16 @@ class _Server(ThreadingMixIn, WSGIServer):
 
     def __init__(self, *args):
         self._gate = Lock()
+        self._departed = Condition(self._gate)
         self._reading = {}    # connections still sending headers, oldest first
         self._working = {}    # connections whose request is being answered -> is it a Stop
+        self._headers_ready = set()  # header read has returned; the request is in this thread's hands
+        self._lingering = set()      # evicted before that, thread not finished
         super().__init__(*args)
+
+    def _headers_in_hand(self, request):
+        with self._gate:
+            self._headers_ready.add(request)
 
     def process_request(self, request, client_address):
         evicted = None
@@ -133,6 +143,10 @@ class _Server(ThreadingMixIn, WSGIServer):
             if full and self._reading:
                 evicted = next(iter(self._reading))
                 del self._reading[evicted]
+                # Still before the header read: shutdown does not mean the thread has
+                # left. Count it until it exits, and do not start the replacement early.
+                if evicted not in self._headers_ready:
+                    self._lingering.add(evicted)
                 full = False
             if not full:
                 self._reading[request] = None
@@ -141,6 +155,9 @@ class _Server(ThreadingMixIn, WSGIServer):
                 evicted.shutdown(socket.SHUT_RDWR)  # its thread sees the end of the read and leaves
             except OSError:
                 pass
+            with self._gate:
+                while evicted in self._lingering:
+                    self._departed.wait()
         if full:  # every thread is answering a request: refuse this one, never queue behind them
             self.shutdown_request(request)
             return
@@ -180,6 +197,9 @@ class _Server(ThreadingMixIn, WSGIServer):
         with self._gate:
             self._reading.pop(request, None)
             self._working.pop(request, None)
+            self._headers_ready.discard(request)
+            self._lingering.discard(request)
+            self._departed.notify_all()
 
 
 class LoopbackGUI:

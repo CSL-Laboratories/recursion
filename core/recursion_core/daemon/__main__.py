@@ -11,6 +11,7 @@ Operator plugins are never imported by name. The composition loads each installe
 with its finding and the daemon runs without it.
 """
 import argparse
+from collections.abc import Mapping
 import getpass
 import logging
 import os
@@ -23,10 +24,42 @@ from . import (Daemon, Registry, SystemdUserManager, UserLock, check_operator_li
                refuse_engine_user, require_free_threaded, require_posix)
 
 from .control_adapter import compose_control
-from .gui import LoopbackGUI
+from .gui import LoopbackGUI, _snapshot
 from .launcher import EngineUnitManager
 
 log = logging.getLogger('recursion_core.daemon')
+
+# Lists and tuples can be read again. Generators cannot: the first GUI build spends them.
+_REUSABLE = (list, tuple, str, bytes)
+
+
+def _one_shot(value):
+    return value is not None and not isinstance(value, _REUSABLE)
+
+
+def _plugin_needs_snapshot(plugin):
+    """True when a later bind would see panels or required subjects already spent."""
+    if not isinstance(plugin, Mapping):
+        return False
+    if _one_shot(plugin.get('panels')):
+        return True
+    required = plugin.get('required')
+    if isinstance(required, Mapping):
+        return any(_one_shot(subjects) for subjects in required.values())
+    return _one_shot(required)
+
+
+def _plugins_for_bind(plugins):
+    """One tuple of registries, passed again on every GUI bind attempt.
+
+    ``LoopbackGUI`` reads one-shot panels and required subjects while it is built.
+    A failed bind discards that object, so the retry must not be given the spent
+    generators. Registries that can be read again are left untouched.
+    """
+    plugins = tuple(plugins)
+    if not any(_plugin_needs_snapshot(plugin) for plugin in plugins):
+        return plugins
+    return tuple(_snapshot(plugin) if isinstance(plugin, Mapping) else plugin for plugin in plugins)
 
 
 def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep_seconds=5):
@@ -62,6 +95,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
                 plugins = (*plugins, *composed.plugins.registries)
                 composed.control.reconcile()
                 log.info('control API on %s', composed.server.path)
+            plugins = _plugins_for_bind(plugins)
             gui = _start_gui(client, door, plugins, port, announced=False)
             announced = gui is None
             while not stopped.wait(sweep_seconds):

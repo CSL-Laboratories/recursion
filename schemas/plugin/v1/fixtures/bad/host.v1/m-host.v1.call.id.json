@@ -1,0 +1,9 @@
+{
+  "type": "call",
+  "name": "operator",
+  "args": {
+    "command": {
+      "command": "status"
+    }
+  }
+}

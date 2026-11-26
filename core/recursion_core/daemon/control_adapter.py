@@ -25,7 +25,8 @@ surface is a client of the same control API); a list that fits is answered as it
 Reads beyond the run records: ``route.list`` is the route inventory (the engines this daemon
 has adapters for, with what ``routes.json`` configured, the breaker's view of each connection,
 the surfaces it serves and the plugin rows), and ``plugin.list`` is the plugin registry as
-``plugins.PluginHost`` loaded it. The GUI's ``GET /v1/routes`` and ``POST /v1/operator`` are
+``plugins.PluginHost`` loaded it. ``plugin.status`` is one row of that registry, including the
+registry label the install recorded for that manifest. The GUI's ``GET /v1/routes`` and ``POST /v1/operator`` are
 those reads and the loaded operator plugin's O7 reads. A read with no source answers
 ``unavailable: <reason>``, never an empty or invented answer.
 
@@ -833,6 +834,11 @@ class DaemonControl:
             if self.plugins is None:
                 return {'code': 'unavailable', 'detail': 'no plugin host is composed'}
             return {'code': 'ok', **self.plugins.inventory()}
+        if method == 'plugin.status':
+            if self.plugins is None:
+                return {'code': 'unavailable', 'detail': 'no plugin host is composed'}
+            body = params if isinstance(params, dict) else {}
+            return self.plugins.status(body.get('plugin_id'))
         if method != 'run.start':
             answer = self.api.call(method, dict(params or {}))
         else:

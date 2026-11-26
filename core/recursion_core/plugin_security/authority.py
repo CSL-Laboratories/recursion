@@ -233,10 +233,13 @@ class Authority:
         """Charge one effect against the profile. Refuses before writing anything if any check fails.
 
         ``commit_guard``, when given, is a context manager entered once the ledger's write
-        transaction has begun, after the signature and every check of this call that needs no
-        ledger read, and held until that transaction has committed or rolled back. If entering it
-        raises, or anything raises before ``COMMIT``, the transaction rolls back and nothing is
-        written. Its exit runs after ``COMMIT`` or ``ROLLBACK``: if it raises after a ``COMMIT``,
+        transaction has begun, after the signature and the shape checks, with the ledger reads
+        and the window re-read inside it, and held until that transaction has committed or
+        rolled back. It must not call ``charge`` on this Authority: the ledger lock is not
+        re-entrant, so that call would wait forever. Anything that is not a context manager
+        raises ``TypeError`` after the transaction has begun, and the transaction is rolled
+        back. If entering it raises, or anything raises before ``COMMIT``, the transaction rolls
+        back and nothing is written. Its exit runs after ``COMMIT`` or ``ROLLBACK``: if it raises after a ``COMMIT``,
         the charge stands and the error reaches the caller, and a retry with the same idempotency
         key is refused ``effect_replayed``, never charged twice. If its exit raises on the way out
         of a refusal or an error, its error reaches the caller in their place, with the refusal or
@@ -285,6 +288,21 @@ class Authority:
                 if self._db.execute("SELECT 1 FROM charges WHERE idempotency_key=?",
                                     (idempotency_key,)).fetchone():
                     raise Refused("effect_replayed")
+                # The signed window is read again here, under the ledger's lock, its write transaction
+                # and the commit guard, so a profile that expired (or a clock that moved) while the
+                # charge waited for any of them refuses and writes nothing. The read before the lock
+                # stays: it refuses early, before the lock is waited for (PS2). A clock that raises
+                # on this re-read is the same typed refusal as a clock that is not an int.
+                try:
+                    now = self._clock()
+                except Exception:
+                    raise Refused("clock_invalid") from None
+                if type(now) is not int:
+                    raise Refused("clock_invalid")
+                if now < profile["not_before"]:
+                    raise Refused("profile_not_yet_valid")
+                if now >= profile["expires_at"]:
+                    raise Refused("profile_expired")
                 spent = self._db.execute("SELECT COALESCE(SUM(amount_minor), 0) FROM charges"
                                          " WHERE profile_id=?", (profile["profile_id"],)).fetchone()[0]
                 if spent + amount_minor > profile["budgets"]["total_minor"]:

@@ -476,9 +476,14 @@
       "shows": "The user turned 'order' back on after the signing key was revoked."
     },
     {
+      "file": "good/install.v1/h05-registry-labels-for-two-manifests.json",
+      "schema": "install.v1.json",
+      "shows": "The installer recorded verified for one manifest's bytes and non_verified for another's. The label is not a grant."
+    },
+    {
       "file": "bad/install.v1/b01-a-field-the-reader-does-not-know.json",
       "schema": "install.v1.json",
-      "rule": "Today's reader refuses a top-level field it does not know, so version 1 adds none.",
+      "rule": "Today's reader refuses a top-level field it does not know. registry_labels is a field it knows; any other new field is still refused.",
       "expect": {
         "keyword": "additionalProperties",
         "at": ""
@@ -548,6 +553,24 @@
       }
     },
     {
+      "file": "bad/install.v1/b10-a-label-the-reader-does-not-know.json",
+      "schema": "install.v1.json",
+      "rule": "A registry label is verified or non_verified. Any other value is refused, and the label is not a grant.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/registry_labels/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "file": "bad/install.v1/b09-a-developer-key-that-is-not-a-key-id.json",
+      "schema": "install.v1.json",
+      "rule": "A developer key on a grant is 'ed25519:' and 32 lower-case hex digits, or null.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/grants/0/developer_key_id"
+      }
+    },
+    {
       "file": "bad/install.v1/m-install.v1.grant.permissions.json",
       "schema": "install.v1.json",
       "rule": "The object described at install.v1.json#/$defs/grant always carries 'permissions'.",
@@ -588,6 +611,11 @@
       "file": "good/manifest.v1/h03-the-version-1-permissions.json",
       "schema": "manifest.v1.json",
       "shows": "A plugin that asks for the five permissions that are new, and provisional, in version 1."
+    },
+    {
+      "file": "good/manifest.v1/h04-a-sandboxed-runtime.json",
+      "schema": "manifest.v1.json",
+      "shows": "A plugin that names 'python-sandboxed/1', the runtime of the host that follows; in this build it runs in the daemon's own process, as 'python-inprocess/1' does."
     },
     {
       "file": "bad/manifest.v1/b01-the-old-schema-name.json",
@@ -655,7 +683,7 @@
     {
       "file": "bad/manifest.v1/b08-a-runtime-nobody-defined.json",
       "schema": "manifest.v1.json",
-      "rule": "The only runtime in this draft is 'python-inprocess/1'.",
+      "rule": "A runtime nobody defined is refused; runtimes are only ever appended to the list in the schema.",
       "expect": {
         "keyword": "enum",
         "at": "/runtime"
@@ -686,6 +714,33 @@
       "expect": {
         "keyword": "additionalProperties",
         "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b12-a-reserved-runtime.json",
+      "schema": "manifest.v1.json",
+      "rule": "'wasm-component/1' is held for a later release: the parser refuses it 'runtime_reserved', with its own text.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/runtime"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b13-the-reserved-data-runtime.json",
+      "schema": "manifest.v1.json",
+      "rule": "'data/1' is held for a later release: the parser refuses it 'runtime_reserved', with its own text, and not as an unknown runtime.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/runtime"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b14-a-reserved-permission.json",
+      "schema": "manifest.v1.json",
+      "rule": "'memory' is held for a later release: the parser refuses it 'permission_reserved', with its own text, and the schema refuses it as a name its list of permissions does not hold.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/permissions/1"
       }
     },
     {

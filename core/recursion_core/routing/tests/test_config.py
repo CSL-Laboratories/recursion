@@ -3,7 +3,7 @@
 Ported from the vault prototype's SchemaTests and VendorIdentityTests (20261107-csl729-routing-config-q45-01,
 section 8.3), with the route contract's engine ids and the catalog the daemon already has (the key store's
 metadata and routes.json's sign-ins) in place of the prototype's fixture catalog. The prototype's table that
-kept every subscription on its own vendor's engines is not ported (it predates Lucas's Nov 8 answer); only
+kept every subscription on its own vendor's engines is not ported (it predates the owner's 2026-11-08 answer); only
 the Claude rule is kept, and ``test_engine_vendor_compatibility`` checks exactly that.
 """
 
@@ -388,7 +388,7 @@ class VendorIdentityTests(unittest.TestCase):
         for eng in ("codex", "pi", "hermes", "opencode"):
             self.assertRefused("claude_subscription_outside_claude_code", lambda c, e=eng: c["logins"][0]["engines"].append(e))
         # ... and the prototype's table keeping every other subscription on its own vendor's engines is gone
-        # (Lucas, Nov 8: a subscription may run through another harness's sign-in; subscription_routes
+        # (the owner, 2026-11-08: a subscription may run through another harness's sign-in; subscription_routes
         # decides which). An OpenAI subscription bound to Codex and to OpenCode loads.
         routes = copy.deepcopy(ROUTES)
         routes["opencode"]["route"]["connection"] = {"kind": "subscription", "id": "chatgpt-main"}

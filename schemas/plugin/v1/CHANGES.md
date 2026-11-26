@@ -4,6 +4,49 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## Loader admission
+
+A plugin that requests permissions with an unbound manual grant is refused `grant_unbound`
+before its code runs, whether its manifest is signed or not. An `order_after_revoked_key` that is
+not a developer key ID binds nothing and is refused where a grant is read. A signed version 1 load
+is refused `package_file_missing` when a file listed in the manifest is absent. The refusal names
+the first missing path in manifest path order. When the package folder itself is missing, is a
+symbolic link or is not a folder, the refusal says that instead.
+
+## `manifest.v1.json` is `1.0-draft.2` (2026-11-18)
+
+`runtime` takes `python-sandboxed/1` (the name for a plugin run by a host outside the daemon; in this
+build no plugin is contained yet, and a `python-sandboxed/1` load gives the warning `runtime_not_yet_contained`)
+beside `python-inprocess/1`, which retires: it is read as `python-sandboxed/1` in every 1.0.x release,
+with the finding `runtime_inprocess_retiring`. A new `$defs/reserved` holds the names kept for a later
+release, each with a sentence on what it is for: the runtimes `wasm-component/1` and `data/1`, the
+permissions `schedule`, `memory` and `computer`, and the record kinds `trigger.v1`, `agent.v1`,
+`memory.lesson.v1`, `work.packet.v1` and `node.v1`. The parser refuses a reserved runtime
+`runtime_reserved` and a reserved permission `permission_reserved`, each with its own text; any other
+runtime is refused `manifest_runtime` with a text that names what this release runs. What it breaks:
+nothing that loads today. Every manifest draft 1 accepted is still accepted; a manifest that names a
+reserved name was refused before and is refused now, under its own code. One good fixture (`h04`) and
+three bad ones (`b12`, `b13`, `b14`) hold it.
+
+## `install.v1.json` is `1.0-draft.4` (2026-11-17)
+
+The install file may carry `registry_labels`: a map from the SHA-256 of one installed manifest's bytes
+to `verified` or `non_verified`. Draft 3 had no place for that label, and the reader refused any
+top-level field it did not know, so a label the installer had seen could not be stored and every plugin
+was shown unlisted. What it breaks: a label other than those two, and a key that is not 64 lower-case
+hex digits. An omitted map and an empty map are still no label. The label decides nothing: it is not a
+permission and not a grant. One good fixture (`h05`) and one bad fixture (`b10`) hold the new list of
+values. A label whose key is not the bytes of the manifest now installed is the reader's rule, and a
+schema cannot see that file (`README.md`). The developer-key bump stays `1.0-draft.3`; this is the next bump.
+
+## `install.v1.json` is `1.0-draft.3` (2026-11-17)
+
+A grant may name `developer_key_id` as null or as a key id (`ed25519:` and 32 lower-case hex digits). Draft 2
+allowed the member and the reader refused it as an unknown grant field, so a file of the schema was not read.
+The reader now takes that shape and refuses any other. What it breaks: a `developer_key_id` that is not null
+and not a key id. A file that omits the member is unchanged. No rule here ties `developer_key_id` to
+`signer_key_id`. The reader checks the shape and does not store the id on the grant.
+
 ## `revoked-keys.v1.json` is `1.0-draft.2` (Nov 15, 2026)
 
 Its `timestamp` (a list's `issued_at` and `expires_at`, and each key's `revoked_at`) is now the control

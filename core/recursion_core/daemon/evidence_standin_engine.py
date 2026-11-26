@@ -12,6 +12,8 @@ SIGINT (so a Stop has to end the tree, not just the engine; ``helper=0`` in the 
 then print one ``assistant`` line every half second (``fast=1``: every 50 ms). ``ticks=N`` in the
 prompt ends the run with a ``result`` line after N ticks; without it the engine runs until it is
 stopped. SIGINT prints a ``stand_in_sigint`` line and exits. With no user message it exits at once.
+Prompt text that is not a string is bad input (``stand_in_bad_input``) and is not used; with no
+string prompt the process exits 2.
 ``limit=1`` in the prompt ends the run at once with a STAND-IN typed limit result (``error:
 "rate_limit"`` on an error ``result`` line, one of the typed fields the adapter reads), so the
 connection breaker can be tripped without any vendor: no real limit was hit.
@@ -46,8 +48,12 @@ def main():
     for line in sys.stdin:
         try:
             message = json.loads(line)
-            prompt = message['message']['content'][0]['text']
-        except (ValueError, KeyError, IndexError, TypeError):
+            text = message['message']['content'][0]['text']
+            # A number (or any other non-string) is bad input, not a prompt to search.
+            if not isinstance(text, str):
+                raise TypeError
+            prompt = text
+        except (ValueError, KeyError, IndexError, TypeError, RecursionError):
             emit(type='system', subtype='stand_in_bad_input')
     emit(type='system', subtype='stand_in_stdin_eof', note='stdin closed; not treated as cancellation')
     if prompt is None:  # started by hand or by a probe: do nothing, start nothing

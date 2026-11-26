@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import threading
+import types
 import unittest
 from pathlib import Path
 
@@ -119,6 +120,26 @@ class FirstProofTests(unittest.TestCase):
         self.assertEqual(self.driver.answers, ["approved"])
         self.assertEqual(self.queue.wait(self.driver.approval_id, timeout=0)["state"], "consumed")
         self.assertEqual(self._sequence("approved"), [("approval.requested", "pending"), ("approval.answered", "approved")])
+
+    def test_no_answer_by_the_deadline_the_started_worker_denies_and_the_tool_does_not_run(self) -> None:
+        """The deadline case with the queue's own deadline worker started: nothing sweeps by hand here."""
+        self.clock.now += 15 * 60  # the call setUp made is ended by hand first, as the case above does
+        self.queue.sweep()
+        self.call.join(30)
+        queue = ApprovalQueue(clock=self.clock, deadlines={"engine_tool": 1, "plugin_effect": 1})
+        queue.attach(self.store, declare_tables=False)
+        queue.start(types.SimpleNamespace(store=self.store))  # started before the request: recovery ends nothing
+        self.addCleanup(queue.stop)
+        driver = FakeDriver(queue, self.effect)
+        started = threading.Event()
+        call = threading.Thread(target=driver.tool_call, args=(started,))
+        call.start()
+        self.addCleanup(call.join, 30)
+        self.assertTrue(started.wait(30))
+        self.clock.now += 1  # its deadline: the started worker wakes within a second and denies it
+        call.join(30)
+        self.assertFalse(call.is_alive())
+        self.assertEqual((driver.ran, driver.answers), ([], ["expired"]))
 
 
 if __name__ == "__main__":

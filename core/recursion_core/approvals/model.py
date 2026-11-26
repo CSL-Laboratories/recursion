@@ -1,7 +1,8 @@
 """What can happen to one approval request, one happening at a time, as pure transitions over its record.
 
 Every function takes a record and returns a NEW record (and, for a client's call, the answer); none
-changes what it was given, and a refusal changes nothing. The store applies them inside the event
+changes what it was given, and a refusal changes nothing, except an expiry that was already due (a pending
+request answered at or after its deadline comes back ``expired``, and the store keeps that). The store applies them inside the event
 store's transaction; the method handlers wrap them; the published lifecycle vectors (#368,
 ``vectors/approval.lifecycle``) drive them directly. The rules are ``approval.v1``'s, as SPINE's
 ``conformance/rules.py`` states them (``ApprovalModel``):
@@ -41,7 +42,8 @@ _NEEDS = {"approval.open": ("command_id", "approval_id", "surface"),
 
 
 class ApprovalRefused(Exception):
-    """The core's own refusal of a happening; ``code`` is one plain word. It changes nothing."""
+    """The core's own refusal of a happening; ``code`` is one plain word. It changes nothing, except an expiry
+    that was already due (``store.consume_in`` writes an approved record past its deadline ``expired``)."""
 
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -156,7 +158,9 @@ def expire_if_due(record: dict, at: str):
 
 
 def answer_prompt(record: dict, principal: dict, params: dict, at: str) -> tuple:
-    """approval.answer: the first valid answer wins; every refusal is typed and changes nothing."""
+    """approval.answer: the first valid answer wins; every refusal is typed and changes nothing, except an
+    expiry that was already due: a pending record answered at or after ``expires_at`` comes back ``expired`` (the
+    queue writes it, with ``approval.answered``) and the answer is ``conflict``/``already_resolved``."""
     _at(at)
     _require_shape(record)
     record = restored(record)

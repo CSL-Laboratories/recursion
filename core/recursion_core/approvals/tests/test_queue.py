@@ -205,6 +205,13 @@ class QueueTests(unittest.TestCase):
         states = {s["approval_id"]: s["state"] for s in restarted.list_page({})["approvals"]}
         self.assertEqual(states, {approval_id: "denied", other: "pending"})
 
+    def test_a_request_is_drawn_only_once_its_transaction_has_ended(self) -> None:
+        seen: list = []
+        self.queue.subscribe_requested(lambda record: seen.append(
+            (self.store.open_transactions, [event["payload"]["approval_id"] for event in self.store.events])))
+        approval_id = self._engine_request()
+        self.assertEqual(seen, [(0, [approval_id])])  # no transaction open, and the request already committed
+
 
 if __name__ == "__main__":
     unittest.main()

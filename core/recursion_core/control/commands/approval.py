@@ -3,8 +3,10 @@
 * ``approval list [--session LOG] [--state STATE] [--after ID]``: summaries, as JSON, 100 to a page. This shows
   no prompt. An answer with more after it carries ``next_after``: the ``--after`` of the next page.
 * ``approval open APPROVAL_ID``: prints the request's rendered lines, in full and in order, as the core drew
-  them (``trusted`` lines as they are, ``untrusted`` ones after a marker), then its revision and digest; this
-  is what records that the command line showed it.
+  them (``trusted`` lines as they are, ``untrusted`` ones after a marker), then its revision and digest. The
+  opening is recorded when the command asks the core to open the request, before its lines are written: an
+  opening is kept even when the lines then cannot be written (a closed pipe), and an answer from the command
+  line is then taken for it.
 * ``approval answer APPROVAL_ID approve|deny --revision N --digest DIGEST``: answers what ``open`` showed.
   The revision and the digest are the ones ``open`` printed; an answer for any other is refused.
 
@@ -30,7 +32,7 @@ def parser(family) -> None:
     listing.add_argument("--state", default=None,
                          choices=("pending", "approved", "denied", "expired", "consumed", "vetoed"))
     listing.add_argument("--after", default=None, help="the next_after a list printed: the page after it")
-    opening = actions.add_parser("open", help="show one request's lines (records that it was shown)")
+    opening = actions.add_parser("open", help="show one request's lines (the opening is recorded when it is asked for, before they print)")
     opening.add_argument("approval_id")
     answering = actions.add_parser("answer", help="answer a request that 'open' showed")
     answering.add_argument("approval_id")

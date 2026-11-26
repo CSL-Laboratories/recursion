@@ -195,7 +195,13 @@ def check_call(call) -> None:
 
 
 def read_call(tool: object, input_text: object, cwd: object) -> dict:
-    """What an engine supplied for one tool call, read strictly: ``{"cwd", "input", "tool"}``."""
+    """What an engine supplied for one tool call, read strictly: ``{"cwd", "input", "tool"}``.
+
+    The cap ``CALL_MAX`` is measured twice: on the raw input text, in UTF-8 bytes, before anything is parsed
+    (whitespace and escapes count, so no input over the cap is ever parsed), and on the call as it is kept."""
+    if isinstance(input_text, str) and (len(input_text) > CALL_MAX
+                                        or len(input_text.encode("utf-8", "surrogatepass")) > CALL_MAX):
+        raise EffectRefused("too_large")
     value = read_json_strict(input_text)
     if type(value) is not dict:
         raise EffectRefused("input_not_an_object")

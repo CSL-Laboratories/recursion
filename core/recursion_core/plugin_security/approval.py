@@ -59,8 +59,9 @@ Without a store, approvals live only in memory, as before: a restart drops every
 or unused approval, so a restart can only ask again, never approve, and it forgets every
 veto.
 
-``run_state(run_id)`` says where a run that met an approval stands: ``waiting_approval``
-while its newest approval is unanswered, and ``stalled`` once that approval is still
+``run_state(run_id)`` says where a run that met an approval stands (its newest approval is the
+one requested last; two requested in the same second go by the order they were made, with a
+store or without one): ``waiting_approval`` while its newest approval is unanswered, and ``stalled`` once that approval is still
 unanswered at its stall time (by default the deadline). An approval ends at the earlier
 of its deadline and its stall time: from then on it can be neither answered nor taken,
 so a stalled run never proceeds. With a store, both are the gate's own figures when the record is read: a
@@ -123,6 +124,9 @@ OPERATOR_PRINCIPAL = {"kind": "owner", "id": OPERATOR}
 APPROVAL_DEADLINE_SECONDS = 300  # how long an approval can be answered and then taken; the approval queue reads it too
 TOMBSTONES_KEPT = 4096  # without a store: how many used, vetoed or expired approvals are remembered
 STALL_SECONDS = None  # how long a run waits on an unanswered approval before it stalls and the approval ends; None: the deadline
+# The shortest stall time the gate takes. Not a choice a person makes: the gate's clock counts whole seconds, and a
+# record must end after it was asked for, so a stall below one second would end every approval at once.
+_STALL_SECONDS_LEAST = 1
 
 # Every sentence a person reads from the gate: what happened, and the one thing they can do.
 _MALFORMED = "The plugin described this action in a form that is not accepted, so nothing was done. " \
@@ -231,8 +235,10 @@ class ApprovalGate:
                  store=None, stall_seconds: int | None = STALL_SECONDS, declare_tables: bool = True) -> None:
         if type(max_retained) is not int or max_retained < 1:
             raise ValueError("max_retained must be a positive int")
-        if stall_seconds is not None and (type(stall_seconds) is not int or stall_seconds < 0):
-            raise ValueError("stall_seconds must be None or an int of zero or more")
+        if stall_seconds is not None and (type(stall_seconds) is not int or stall_seconds < _STALL_SECONDS_LEAST):
+            raise ValueError("stall_seconds was %r, and the gate takes None (the deadline) or a whole number of at "
+                             "least one second: its clock counts whole seconds, so a shorter stall would end every "
+                             "approval the moment it is asked. Give None or one second or more." % (stall_seconds,))
         self._store = store
         self._stall = ttl_seconds if stall_seconds is None else stall_seconds
         # An approval ends at the earlier of its deadline and its stall time: a run shown stalled never
@@ -591,7 +597,9 @@ class ApprovalGate:
         return digest
 
     def _newest_kept(self, run_id: object, now: int):
-        """``(requested_at seconds, approval_id, state)`` of the run's newest plugin approval, or ``None``."""
+        """``(requested_at seconds, approval_id, state)`` of the run's newest plugin approval, or ``None``. Two
+        requested in the same second (the gate's clock counts whole seconds) go by the order the store kept their
+        rows, which is the order they were made, as the gate without a store goes by insertion; never by id."""
         _, _, _, milliseconds, _ = _durable()
         if type(run_id) is not str:
             return None
@@ -599,7 +607,7 @@ class ApprovalGate:
         def work(tx):
             newest = None
             found = tx.execute("SELECT approval_id FROM approvals_records WHERE source = 'plugin_effect' "
-                               "AND log_id = ? ORDER BY approval_id", ("run:" + run_id,))
+                               "AND log_id = ? ORDER BY rowid", ("run:" + run_id,))
             for (approval_id,) in found:
                 try:
                     held = self._load(tx, approval_id, now)

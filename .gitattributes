@@ -16,3 +16,6 @@ scripts/resolve-engine.py text eol=lf
 scripts/provider-egress-profiles.json text eol=lf
 scripts/capacity-pools.json text eol=lf
 scripts/engines/*.json text eol=lf
+
+# Dev-set task archives: their bytes are pinned by sha256 in eval/devset/suite.json, so no CRLF checkout.
+eval/**/*.txtar text eol=lf

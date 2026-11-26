@@ -17,6 +17,8 @@ import os
 from pathlib import Path
 import signal
 import threading
+
+from recursion_core import settings
 from . import (Daemon, Registry, SystemdUserManager, UserLock, check_operator_linger,
                refuse_engine_user, require_free_threaded, require_posix)
 
@@ -32,7 +34,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
     are installed plugin directories, which only the composed daemon loads, through the loader."""
     require_posix()  # Windows: typed PlatformUnsupported before any lock, state, socket or GUI
     require_free_threaded()
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(process)d] %(levelname)s %(name)s: %(message)s')
     refuse_engine_user(os.environ)
     check_operator_linger(getpass.getuser())
     runtime = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
@@ -41,6 +43,13 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
     signal.signal(signal.SIGTERM, lambda *_: stopped.set())
     signal.signal(signal.SIGINT, lambda *_: stopped.set())
     with UserLock(runtime):
+        # Read at daemon start in this build; a later reload may call settings.load again. Nothing at this
+        # head uses the values before the lock, so they are read and recorded only by the daemon that holds
+        # it: a start refused with AlreadyRunning leaves no record of a file no running daemon holds.
+        loaded = settings.load(os.environ)
+        log.info('settings file: %s', loaded.path or 'none')
+        for line in settings.lines(loaded):
+            (log.warning if line.startswith(settings.WARNED) else log.info)('settings: %s', line)
         injected = client is not None or door is not None
         daemon = Daemon(Registry(state), SystemdUserManager() if injected else EngineUnitManager())
         gui = composed = None

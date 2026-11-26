@@ -38,6 +38,7 @@ from recursion_core.child_env import build_child_env, spawn
 from recursion_core.child_env.policy import (
     BASE_NAMES, VALUE_ALL_PROXY, VALUE_URLS, _ALL_PROXY_SCHEMES, _unsafe_proxy,
 )
+from recursion_core.shown_address import holds_sign_in, shown_address
 
 __all__ = [
     "COPILOT_TOKEN_ENV",
@@ -137,6 +138,15 @@ class OwnLoopDecision:
     warnings: tuple[str, ...] = field(default_factory=tuple)
     model: str = ""  # checked here; "" means the engine's default
 
+    def __repr__(self) -> str:
+        # The child's names only, never a value; the address only as shown_address builds it, with no path.
+        # base_url itself keeps the address as given, the value the run works with, and is never shown.
+        names = ",".join(sorted(str(k) for k in self.child_env)) if isinstance(self.child_env, Mapping) else "?"
+        shown = shown_address(self.base_url, schemes=_NOUS_SCHEMES) if self.base_url else ""
+        return (f"OwnLoopDecision(engine={self.engine!r}, method={self.method!r}, child_env=<{names}>, "
+                f"removed_env={self.removed_env!r}, base_url={shown!r}, adapters={self.adapters!r}, "
+                f"warnings={self.warnings!r}, model={self.model!r})")
+
 
 def _norm(value: object) -> str:
     if not isinstance(value, str):
@@ -193,29 +203,57 @@ def check_copilot_own_loop(
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
 
-def _loopback_url(base_url: object) -> str:
-    if not isinstance(base_url, str) or not base_url.strip():
-        raise OwnLoopRouteRefused("nous", "proxy_address_missing")
+_SIGN_IN_WORDS = ("credentials in proxy URL: a user name or password stands before the host; give the proxy's "
+                  "address with no user name or password, since the proxy holds the sign-in")
+
+
+def _parsed(text: str):
+    """``text`` as the URL library reads it, or None when it does not read or its port is not a number. The
+    library's error is not kept: on some interpreters its text carries the whole authority."""
+
     try:
-        parts = urlsplit(base_url.strip())
-        host = parts.hostname
+        parts = urlsplit(text)
         parts.port  # noqa: B018 - raises on a bad port
-    except ValueError as exc:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", str(exc)) from None
-    if parts.scheme not in _NOUS_SCHEMES or not host:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", base_url)
-    if parts.username or parts.password:
-        raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", "credentials in proxy URL")
+    except ValueError:
+        return None
+    return parts
+
+
+def _ip(host: str):
+    """The IP address ``host`` names (an IPv4-mapped IPv6 address as its IPv4 address), or None for a name."""
+
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
+        return None
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return addr if mapped is None else mapped
+
+
+def _loopback_url(base_url: object) -> str:
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise OwnLoopRouteRefused("nous", "proxy_address_missing")
+    text = base_url.strip()
+    # A user name or a password in the authority is looked for first, on the text as given, so such an
+    # address is always refused for that. The route takes and refuses the same addresses as before: an at
+    # sign in the path, the query or the fragment, or an empty user, is no sign-in. Every refusal shows the
+    # address only as shown_address builds it, and none is raised while an error whose text can carry the
+    # address is being handled, so no such error rides along on the refusal.
+    if holds_sign_in(text):
+        raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", _SIGN_IN_WORDS)
+    parts = _parsed(text)
+    if parts is None or parts.scheme not in _NOUS_SCHEMES or not parts.hostname:
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", shown_address(text, schemes=_NOUS_SCHEMES))
+    if parts.username or parts.password:  # read after the library, as before (a control character in front)
+        raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", _SIGN_IN_WORDS)
+    addr = _ip(parts.hostname)
+    if addr is None:
         # A name (even "localhost") is not resolved here; only a loopback literal is provably local.
-        raise OwnLoopRouteRefused("nous", "proxy_not_loopback", f"{host}: use 127.0.0.1 or ::1") from None
-    if getattr(addr, "ipv4_mapped", None) is not None:
-        addr = addr.ipv4_mapped
+        raise OwnLoopRouteRefused("nous", "proxy_not_loopback",
+                                  f"{shown_address(text, schemes=_NOUS_SCHEMES)}: use 127.0.0.1 or ::1 as the host")
     if not addr.is_loopback:
-        raise OwnLoopRouteRefused("nous", "proxy_not_loopback", host)
-    return base_url.strip()
+        raise OwnLoopRouteRefused("nous", "proxy_not_loopback", shown_address(text, schemes=_NOUS_SCHEMES))
+    return text
 
 
 def _adapters(value: object) -> tuple[str, ...]:
@@ -248,7 +286,10 @@ def nous_proxy_doctor(
 ) -> dict:
     """Doctor line for the Hermes proxy: report the address, refuse non-loopback, warn on shared hosts.
 
-    Never raises; returns ``{"ok", "address", "cause", "warnings"}``. ``interactive_users`` is the
+    Never raises; returns ``{"ok", "address", "cause", "warnings"}``. ``address`` is the address checked in
+    its shown form (``recursion_core.shown_address``): no sign-in; on success a plain path is shown, this
+    being the one place that shows a path; on a refusal no path. "" when none was given.
+    ``interactive_users`` is the
     caller's list of interactive accounts on this host; nothing is probed here. Without it the doctor
     warns that the host's users are unknown rather than reporting a clean host.
     """
@@ -257,9 +298,12 @@ def nous_proxy_doctor(
     try:
         url = _loopback_url(base_url)
     except OwnLoopRouteRefused as exc:
-        return {"ok": False, "address": base_url if isinstance(base_url, str) else "", "cause": exc.cause,
-                "warnings": warnings}
-    return {"ok": True, "address": url, "cause": "", "warnings": warnings}
+        return {"ok": False,
+                "address": (shown_address(base_url, schemes=_NOUS_SCHEMES)
+                            if isinstance(base_url, str) and base_url.strip() else ""),
+                "cause": exc.cause, "warnings": warnings}
+    shown = shown_address(url, schemes=_NOUS_SCHEMES, plain_path=True)  # the one place that shows a path
+    return {"ok": True, "address": shown, "cause": "", "warnings": warnings}
 
 
 def _shared_host_warning(current_user: str | None, interactive_users: Iterable[str] | None) -> tuple[str, ...]:

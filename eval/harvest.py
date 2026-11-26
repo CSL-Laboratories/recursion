@@ -28,6 +28,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import os
 import re
 import shutil
 import sys
@@ -45,18 +47,102 @@ HARVEST_FILES = ("__init__.py", "harvest.py", "validate.py", "tasks.py", "txtar.
                  "arms.py", "record.py", "heldout.py", "suite.py")
 # What one candidate's own files can raise while its task is written, loaded and validated: its stored form
 # refused (TaskError: a bad path, a start-tree entry that is not a file), its start archive unreadable
-# (TarError), git refusing its work copy's files (GitError; git itself already ran before the first
-# candidate), and a path that cannot be laid out as its tree says (a file where a folder must be, or the
-# reverse). Not a plain ValueError, a RuntimeError or any other OSError (a full disk, a permission, a
-# missing folder): those are the caller's or the machine's and end the run.
-CANDIDATE_FAULTS = (task_mod.TaskError, tarfile.TarError, gitutil.GitError, FileExistsError, IsADirectoryError,
-                    NotADirectoryError)
+# (TarError), and a path that cannot be laid out as its tree says (a file where a folder must be, or the
+# reverse). Not a GitError (git failing on a fresh scratch copy is the machine's: a permission, a full disk,
+# a broken object store), not a plain ValueError, a RuntimeError or any other OSError: those are the
+# caller's or the machine's and end the run. A candidate's paths that git or the task form cannot hold,
+# including a source working-tree-encoding other than UTF-8, are refused before this point, in
+# build_candidate (tree_files), as that candidate's rejection.
+CANDIDATE_FAULTS = (task_mod.TaskError, tarfile.TarError, FileExistsError, IsADirectoryError, NotADirectoryError)
+GRADING_FIELDS = ("test_command", "timeout_s", "grading_timeout_s")
 TRAILER = re.compile(r"^[A-Za-z][A-Za-z0-9-]*: .+$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class HarvestError(ValueError):
     pass
+
+
+def _nonempty_str(value) -> bool:
+    return isinstance(value, str) and bool(value) and "\0" not in value
+
+
+def _refuse_repository_shape(path: Path, repo: dict) -> None:
+    """Name, path, branch and test_globs are the caller's. A wrong type is refused here, before any
+    output, not as a traceback once a candidate is built. A string of globs would be read one character
+    at a time and then look like a repository that changed no test."""
+    name = repo.get("name")
+    if not _nonempty_str(name):
+        raise HarvestError(f"{path}: repository name must be a non-empty string, got {name!r}")
+    for key in ("path", "branch"):
+        if not _nonempty_str(repo.get(key)):
+            raise HarvestError(f"{path}: repository {name!r}: {key} must be a non-empty string")
+    globs = repo.get("test_globs")
+    if not isinstance(globs, list) or not globs or not all(_nonempty_str(item) for item in globs):
+        raise HarvestError(
+            f"{path}: repository {name!r}: test_globs must be a non-empty list of non-empty strings")
+
+
+def _refuse_caller_limits(path: Path, repo: dict) -> None:
+    """A timeout must be a finite positive number, and a command argument must be passable to a process.
+
+    NaN and Infinity pass a ``<= 0`` check (NaN compares false; Infinity is not ``<= 0``) and then
+    publish a document no strict reader accepts, or wait with no deadline. An integer that does not
+    fit in a float raises OverflowError while the task is built. A NUL in an argument cannot be executed.
+    """
+    name = repo["name"]
+    command = repo.get("test_command")
+    if isinstance(command, list) and any(isinstance(part, str) and "\0" in part for part in command):
+        raise HarvestError(f"{path}: repository {name!r}: test_command must not contain a NUL byte")
+    for key in ("timeout_s", "grading_timeout_s"):
+        if key not in repo or repo[key] is None:
+            continue
+        value = repo[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue  # the shared task rule reports a wrong type; this only adds the finite check
+        try:
+            number = float(value)
+        except OverflowError:
+            raise HarvestError(
+                f"{path}: repository {name!r}: {key} must be a finite positive number") from None
+        if not math.isfinite(number) or number <= 0:
+            raise HarvestError(f"{path}: repository {name!r}: {key} must be a finite positive number")
+
+
+def _refuse_unwritable_path(commit: str, name: str) -> None:
+    """A path git stored as UTF-8 can still be unwritable where the filesystem encoding is not UTF-8
+    (``LC_ALL=C`` and UTF-8 mode off). That is this candidate's refusal, the same one a non-UTF-8
+    byte path already gets, not the end of the harvest."""
+    try:
+        encoded = os.fsencode(name)
+    except UnicodeEncodeError:
+        encoded = None
+    if encoded is None or os.fsdecode(encoded) != name:
+        raise HarvestError(
+            f"{commit[:12]}: the path {ascii(name)} cannot be written with this filesystem encoding; "
+            "a task's paths are UTF-8 text")
+
+
+def _refuse_worktree_encoding(commit: str, files: dict) -> None:
+    """A source ``working-tree-encoding`` other than UTF-8 makes a later scratch ``git add`` fail on a
+    healthy machine: git stored a UTF-8 blob and the attribute asks for another encoding. That is the
+    candidate's own refusal. UTF-8 itself is the encoding the harness already writes."""
+    marker = "working-tree-encoding="
+    for path, (data, _mode) in files.items():
+        if path != ".gitattributes" and not path.endswith("/.gitattributes"):
+            continue
+        for raw in data.splitlines():
+            line = raw.decode("utf-8", "replace").strip()
+            if not line or line.startswith("#"):
+                continue
+            for attr in line.split()[1:]:
+                if not attr.startswith(marker):
+                    continue
+                value = attr[len(marker):].strip().strip('"').strip("'")
+                if value.lower() not in ("utf-8", "utf8"):
+                    raise HarvestError(
+                        f"{commit[:12]}: unsupported working-tree-encoding {value!r} in {path}; "
+                        "that source transformation is this candidate's refusal, not a machine failure")
 
 
 def harvest_sha256() -> str:
@@ -96,12 +182,20 @@ def load_repos(path: Path) -> tuple:
         raise HarvestError(f"{path}: repos must be a non-empty list")
     names = set()
     for repo in repos:
+        if not isinstance(repo, dict):
+            raise HarvestError(f"{path}: a repository entry must be an object")
         for key in ("name", "path", "branch", "test_globs", "test_command"):
             if key not in repo:
                 raise HarvestError(f"{path}: a repository entry lacks {key!r}")
+        _refuse_repository_shape(path, repo)
         if not task_mod.TASK_ID.match(repo["name"]) or repo["name"] in names:
             raise HarvestError(f"{path}: bad or duplicate repository name {repo['name']!r}")
         names.add(repo["name"])
+        try:   # the same rules a task's own task.json is held to (eval/tasks.py), checked once, here
+            task_mod._meta(repo["name"], {"id": repo["name"], **{k: repo[k] for k in GRADING_FIELDS if k in repo}})
+        except task_mod.TaskError as exc:
+            raise HarvestError(f"{path}: repository {repo['name']!r}: {exc}") from None
+        _refuse_caller_limits(path, repo)
         if not Path(repo["path"]).is_absolute():
             raise HarvestError(f"{path}: repository path must be absolute: {repo['path']!r}")
     return repos, hashlib.sha256(raw).hexdigest()
@@ -146,9 +240,17 @@ def tree_files(repo: Path, commit: str) -> dict:
         mode, kind, sha = meta.decode().split()
         if kind != "blob" or mode not in ("100644", "100755"):
             raise HarvestError(f"{commit[:12]}: {path.decode('utf-8', 'replace')} is a {kind} with mode {mode}")
-        entries.append((path.decode("utf-8", "surrogateescape"), sha, int(mode[-3:], 8)))
+        try:
+            name = path.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HarvestError(f"{commit[:12]}: the path {path.decode('utf-8', 'replace')!r} is not UTF-8; "
+                               "a task's paths are UTF-8 text") from None
+        _refuse_unwritable_path(commit, name)
+        entries.append((name, sha, int(mode[-3:], 8)))
     blobs = _cat_blobs(repo, [sha for _, sha, _ in entries])
-    return {path: (blobs[sha], mode) for path, sha, mode in entries}
+    files = {path: (blobs[sha], mode) for path, sha, mode in entries}
+    _refuse_worktree_encoding(commit, files)
+    return files
 
 
 def _cat_blobs(repo: Path, shas: list) -> dict:
@@ -262,9 +364,9 @@ def harvest(repos_path: Path, not_before: str, out: Path, *, suite_id: str, vers
     heldout.check_path(out, must_exist=False)  # absolute, and never inside the repository
     if out.exists() and any(out.iterdir()):
         raise HarvestError(f"{out} is not empty: a harvest writes a new folder")
+    repos, repos_sha = load_repos(repos_path)   # every repository's settings, before anything is written
     out.mkdir(parents=True, exist_ok=True)
     heldout.check_path(out)
-    repos, repos_sha = load_repos(repos_path)
     issues = json.loads(Path(issues_path).read_text(encoding="utf-8")) if issues_path else {}
     staging = out / ".staging"
     entries, rejects, heads = [], [], []

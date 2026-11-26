@@ -6,17 +6,22 @@ Rust core would be driven, not through Python internals.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
 import threading
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from recursion_core.plugin_security import (
-    PROTOCOL, ApprovalGate, ConnectionBreaker, CoreHealth, CoreService, Grant, PluginLoader, Refused,
-    ReservedEffects, TrustStore, canonical, create_breaker_store, parse_manifest,
+    PROTOCOL, ApprovalGate, Authority, ConnectionBreaker, CoreHealth, CoreService, Grant, PluginLoader, Refused,
+    ReservedEffects, TrustStore, canonical, create_breaker_store, create_ledger, parse_manifest,
 )
+from recursion_core.plugin_security import authority as authority_module
+from recursion_core.plugin_security.authority import PROFILE_SCHEMA
 from recursion_core.plugin_security.protocol import CommitFence
 from recursion_core.plugin_security.tests.support import (
     AGENT_TOKEN, OPERATOR_TOKEN, PLUGIN_SOURCE, PLUGIN_TOKEN, Clock, FakeGilProbe, World, authenticate, effect,
@@ -1041,6 +1046,76 @@ class CommitFenceTests(unittest.TestCase):
                 self.assertFalse(real.in_transaction)
                 self.assertEqual(_charges(w), 1 if raised is Refused else 0)
 
+    def test_a_rollback_that_fails_leaves_no_transaction_for_the_next_charge(self) -> None:
+        # Review 3 of #378 (DeepSeek N2): a ROLLBACK that raised left the connection inside the transaction,
+        # and every later charge failed to begin its own. Now the connection is closed, which discards what
+        # the transaction wrote, and the ledger is opened again.
+        for guard in (None, _SwallowingGuard()):
+            with self.subTest(guard=type(guard).__name__):
+                w = World(self)
+                w.load()
+                env = profile(w.installer, profile_id="prof-new", total=10_000, max_effect=1_000)
+                failing = _FailingInsertAndRollback(w.authority._db)
+                w.authority._db = failing
+                expected = sqlite3.OperationalError
+                with self.assertRaises(expected) as raised:
+                    w.authority.charge(env, **_charge_args(w, "fails"), commit_guard=guard)
+                # Without a guard the rollback's error reaches the caller; a swallowing guard leaves the first.
+                self.assertIn("rollback" if guard is None else "insert", str(raised.exception))
+                self.assertIsNot(w.authority._db, failing)
+                self.assertFalse(w.authority._db.in_transaction)
+                db = sqlite3.connect(w.ledger)
+                try:  # the profile the failed charge wrote inside its transaction was discarded
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0], 0)
+                finally:
+                    db.close()
+                self.assertEqual(_charges(w), 0)
+                self.assertEqual(w.authority.charge(env, **_charge_args(w, "after"))["spent_minor"], 1_000)
+                self.assertEqual(_charges(w), 1)
+
+    def test_a_charge_after_a_rollback_and_a_shutdown_that_both_raise_is_refused_at_once(self) -> None:
+        # Review 1 of #426 (DeepSeek F1), through charge: the connection that may still hold the transaction is
+        # kept, nothing is opened beside it, and the next charge is refused ledger_invalid at once.
+        w = World(self)
+        w.load()
+        env = profile(w.installer, profile_id="prof-new", total=10_000, max_effect=1_000)
+        real = w.authority._db
+        failing = _FailingRollback(real, close_fails=True)
+        w.authority._db = failing
+        self.addCleanup(real.close)
+        self.addCleanup(real.rollback)
+        self.addCleanup(setattr, w.authority, "_db", real)
+        with self.assertRaises(sqlite3.OperationalError):
+            w.authority.charge(env, **_charge_args(w, "fails"), commit_guard=_RefusingGuard())
+        self.assertIs(w.authority._db, failing, "a connection was opened beside the one holding the transaction")
+        started = time.monotonic()
+        with self.assertRaises(Refused) as refused:
+            w.authority.charge(env, **_charge_args(w, "after"))
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+        self.assertLess(time.monotonic() - started, 5.0, "the refusal waited for the ledger's lock")
+
+    def test_recovery_keeps_spend_and_replay_on_the_ledger_a_relative_path_named(self) -> None:
+        # Review 1 of #426 (astra R1, sol R1), signed: a relative path, a later change of directory, and a failed
+        # rollback; the recovery stays on the first ledger, so its spend and its replays still count.
+        w = World(self)
+        w.load()
+        env = profile(w.installer, profile_id="prof-new", total=10_000, max_effect=1_000)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(os.path.dirname(w.ledger))
+        auth = Authority(w.installer.public, os.path.basename(w.ledger), w.clock)
+        self.addCleanup(auth.close)
+        auth.charge(env, **_charge_args(w, "prior"))
+        elsewhere = temp_dir(self)
+        create_ledger(os.path.join(elsewhere, os.path.basename(w.ledger)), w.installer.public)
+        os.chdir(elsewhere)
+        auth._db = _FailingInsertAndRollback(auth._db)
+        with self.assertRaises(sqlite3.OperationalError):
+            auth.charge(env, **_charge_args(w, "fails"))
+        with self.assertRaises(Refused) as refused:
+            auth.charge(env, **_charge_args(w, "prior"))
+        self.assertEqual(refused.exception.code, "effect_replayed")
+        self.assertEqual(auth.charge(env, **_charge_args(w, "after"))["spent_minor"], 2_000)
+
     def test_a_guard_whose_exit_raises_on_a_refusal_reports_its_error_with_the_refusal_as_context(self) -> None:
         # Review 2 of #378 (DeepSeek, section 6): the guard's error takes the refusal's place, with the
         # refusal as its context, and nothing is written. Either way the call is not authorized.
@@ -1054,6 +1129,27 @@ class CommitFenceTests(unittest.TestCase):
         self.assertEqual(caught.exception.__context__.code, "budget_total_exceeded")
         self.assertFalse(w.authority._db.in_transaction)
         self.assertEqual(_charges(w), 1)
+
+
+class _FailingInsertAndRollback:
+    """The ledger's connection, failing the charge's INSERT and then the ROLLBACK, which rolls nothing back."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._real.in_transaction
+
+    def execute(self, sql, params=()):
+        if sql.startswith("INSERT INTO charges"):
+            raise sqlite3.OperationalError("injected insert failure")
+        if sql == "ROLLBACK":
+            raise sqlite3.OperationalError("injected rollback failure")
+        return self._real.execute(sql, params)
+
+    def close(self) -> None:
+        self._real.close()
 
 
 class _Interrupt(BaseException):
@@ -1181,6 +1277,748 @@ def _light_core(test: unittest.TestCase, **overrides) -> CoreService:
     return CoreService(**args)
 
 
+_ANCHOR = "ab" * 32  # a public key in its hex form: the ledger's open and checks need no signature
+
+
+class _FailingRollback:
+    """The ledger's connection, failing its ROLLBACK (which rolls nothing back) and, if asked, its close."""
+
+    def __init__(self, real, *, close_fails: bool = False, error: BaseException | None = None) -> None:
+        self._real, self._close_fails, self._error = real, close_fails, error
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._real.in_transaction
+
+    def execute(self, sql, params=()):
+        if sql == "ROLLBACK":
+            raise self._error or sqlite3.OperationalError("injected rollback failure")
+        return self._real.execute(sql, params)
+
+    def close(self) -> None:
+        if self._close_fails:
+            raise sqlite3.OperationalError("injected close failure")
+        self._real.close()
+
+
+class _FailingRollbackThenReplaced(_FailingRollback):
+    """``_FailingRollback`` whose close, once done, runs ``after``: a file put in the ledger's place in the window
+    between the shutdown and the reopen, when the old file's inode is free."""
+
+    def __init__(self, real, after) -> None:
+        super().__init__(real)
+        self._after = after
+
+    def close(self) -> None:
+        super().close()
+        after, self._after = self._after, None
+        if after is not None:
+            after()
+
+
+def _observed_connect(opened: list):
+    """``sqlite3.connect``, recording each connection it makes in ``opened``."""
+    connect = sqlite3.connect
+
+    def observe(*args, **kwargs):
+        db = connect(*args, **kwargs)
+        opened.append(db)
+        return db
+
+    return observe
+
+
+def _ledger_rows(path: str, table: str) -> int:
+    db = sqlite3.connect(path, timeout=5)
+    try:
+        return db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
+    finally:
+        db.close()
+
+
+class LedgerRepairTests(unittest.TestCase):
+    """The repair of a failed ROLLBACK and its own failure branches, on a real ledger and with no signing, so on
+    both interpreters (review 1 of #426, DeepSeek F1, F2, F4 and F6)."""
+
+    def setUp(self) -> None:
+        self.path = os.path.join(temp_dir(self), "ledger.db")
+        create_ledger(self.path, _ANCHOR)
+        self.auth = Authority(_ANCHOR, self.path, lambda: 0)
+        self.addCleanup(self.auth.close)
+
+    def _fail_the_rollback(self, *, close_fails: bool = False, before=None):
+        """A write inside the ledger's transaction, then a ROLLBACK that raises; returns (real, stand-in)."""
+        real = self.auth._db
+        real.execute("BEGIN IMMEDIATE")
+        real.execute("INSERT INTO charges VALUES ('written', 'prof', 1000)")
+        failing = _FailingRollback(real, close_fails=close_fails)
+        self.auth._db = failing
+        if before is not None:
+            before()
+        with self.assertRaises(sqlite3.OperationalError) as raised:
+            self.auth._roll_back()
+        self.assertIn("rollback", str(raised.exception), "another error took the rollback's place")
+        return real, failing
+
+    def _assert_pragmas(self, db) -> None:
+        self.assertEqual(db.execute("PRAGMA synchronous").fetchone()[0], 2, "not synchronous=FULL")
+        self.assertEqual(db.execute("PRAGMA busy_timeout").fetchone()[0], 30000)
+        self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+
+    def _assert_out_of_use(self) -> None:
+        started = time.monotonic()
+        with self.assertRaises(Refused) as refused:
+            self.auth._require_usable()
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+        self.assertLess(time.monotonic() - started, 5.0, "the refusal waited for the ledger's lock")
+
+    def test_the_first_open_is_synchronous_full_with_a_busy_timeout_and_the_index(self) -> None:  # F6
+        self._assert_pragmas(self.auth._db)
+        self.auth.close()
+        db = sqlite3.connect(self.path)
+        try:  # a ledger made before the index gains it at the open
+            db.execute("DROP INDEX charges_by_profile")
+        finally:
+            db.close()
+        auth = Authority(_ANCHOR, self.path, lambda: 0)
+        self.addCleanup(auth.close)
+        self.assertEqual(auth._db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='index'"
+                                          " AND name='charges_by_profile'").fetchone()[0], 1)
+
+    def test_a_failed_rollback_opens_the_ledger_again_with_nothing_written(self) -> None:  # N2, F4, F6
+        real, failing = self._fail_the_rollback()
+        self.assertIsNot(self.auth._db, failing)
+        self.assertFalse(self.auth._db.in_transaction)
+        self.assertEqual(_ledger_rows(self.path, "charges"), 0)  # closing discarded what it wrote
+        self.auth._require_usable()
+        self._assert_pragmas(self.auth._db)  # the reopen makes every check and setting of the first open
+        self.auth._db.execute("BEGIN IMMEDIATE")
+        self.auth._db.execute("INSERT INTO charges VALUES ('later', 'prof', 1000)")
+        self.auth._db.execute("COMMIT")
+        self.assertEqual(_ledger_rows(self.path, "charges"), 1)
+
+    def test_a_shutdown_that_raises_opens_nothing_beside_the_transaction_and_refuses_at_once(self) -> None:  # F1
+        real, failing = self._fail_the_rollback(close_fails=True)
+        self.addCleanup(real.close)
+        self.addCleanup(real.rollback)
+        self.addCleanup(setattr, self.auth, "_db", real)  # first: the authority's own close must not raise
+        self.assertIs(self.auth._db, failing, "a connection was opened beside the one holding the transaction")
+        self.assertTrue(real.in_transaction)
+        self._assert_out_of_use()
+
+    @unittest.skipIf(os.name == "nt", "a ledger open in this process cannot be removed on Windows")
+    def test_a_ledger_removed_is_not_created_again_and_refuses_with_a_code(self) -> None:  # F2, F5
+        real, failing = self._fail_the_rollback(before=lambda: os.unlink(self.path))
+        self.assertFalse(os.path.exists(self.path), "the reopen created an empty ledger")
+        with self.assertRaises(sqlite3.ProgrammingError):  # the old handle was closed all the same
+            real.execute("SELECT 1")
+        self._assert_out_of_use()
+        with self.assertRaises(Refused) as refused:
+            Authority(_ANCHOR, self.path, lambda: 0)
+        self.assertEqual(refused.exception.code, "ledger_missing")
+        self.assertFalse(os.path.exists(self.path))
+
+    @unittest.skipIf(os.name == "nt", "a ledger open in this process cannot be replaced on Windows")
+    def test_a_ledger_replaced_by_another_anchors_is_refused_on_the_reopen(self) -> None:  # F5
+        def replace() -> None:
+            os.unlink(self.path)
+            create_ledger(self.path, "cd" * 32)
+
+        self._fail_the_rollback(before=replace)
+        self._assert_out_of_use()
+        self.assertEqual(_ledger_rows(self.path, "charges"), 0)  # the other anchor's ledger is untouched
+
+    @unittest.skipIf(os.name == "nt", "a ledger open in this process cannot be replaced on Windows")
+    def test_a_ledger_replaced_by_another_stores_magic_is_refused_on_the_reopen(self) -> None:  # astra R2.4
+        def replace() -> None:
+            os.unlink(self.path)
+            create_ledger(self.path, _ANCHOR)
+            db = sqlite3.connect(self.path)
+            try:
+                db.execute("UPDATE meta SET v = 'another-store/v0' WHERE k = 'magic'")
+                db.commit()
+            finally:
+                db.close()
+
+        self._fail_the_rollback(before=replace)
+        self._assert_out_of_use()
+
+    def test_an_interruption_in_the_rollback_still_opens_the_ledger_again(self) -> None:  # astra R2.1
+        real = self.auth._db
+        real.execute("BEGIN IMMEDIATE")
+        real.execute("INSERT INTO charges VALUES ('written', 'prof', 1000)")
+        self.auth._db = _FailingRollback(real, error=KeyboardInterrupt("synthetic interruption in ROLLBACK"))
+        with self.assertRaises(KeyboardInterrupt):
+            self.auth._roll_back()
+        self.assertFalse(self.auth._db.in_transaction)
+        self.assertEqual(_ledger_rows(self.path, "charges"), 0)
+        self.auth._require_usable()
+
+    def test_recovery_stays_on_the_ledger_a_relative_path_named_at_construction(self) -> None:  # astra, sol R1
+        self.addCleanup(os.chdir, os.getcwd())
+        first, second = os.path.dirname(self.path), temp_dir(self)
+        create_ledger(os.path.join(second, "ledger.db"), _ANCHOR)  # the same anchor, another directory
+        os.chdir(first)
+        auth = Authority(_ANCHOR, "ledger.db", lambda: 0)
+        self.addCleanup(auth.close)
+        os.chdir(second)
+        real = auth._db
+        real.execute("BEGIN IMMEDIATE")
+        auth._db = _FailingRollback(real)
+        with self.assertRaises(sqlite3.OperationalError):
+            auth._roll_back()
+        auth._require_usable()
+        self.assertTrue(os.path.samefile(auth._db.execute("PRAGMA database_list").fetchone()[2], self.path))
+        auth._db.execute("INSERT INTO charges VALUES ('after', 'prof', 1000)")
+        self.assertEqual((_ledger_rows(self.path, "charges"), _ledger_rows(os.path.join(second, "ledger.db"),
+                                                                           "charges")), (1, 0))
+
+    def test_a_bytes_or_path_like_name_opens_and_recovers_the_same_ledger(self) -> None:  # review 2, DeepSeek F8
+        for name in (os.fsencode(self.path), Path(self.path)):
+            with self.subTest(name=type(name).__name__):
+                auth = Authority(_ANCHOR, name, lambda: 0)
+                self.addCleanup(auth.close)
+                real = auth._db
+                real.execute("BEGIN IMMEDIATE")
+                auth._db = _FailingRollback(real)
+                with self.assertRaises(sqlite3.OperationalError):
+                    auth._roll_back()
+                auth._require_usable()
+                self.assertTrue(os.path.samefile(auth._db.execute("PRAGMA database_list").fetchone()[2], self.path))
+
+    @unittest.skipIf(os.name == "nt", "links are a POSIX matter here")
+    def test_recovery_stays_on_the_file_a_link_named_at_construction(self) -> None:  # review 2, DeepSeek F10
+        root = temp_dir(self)
+        one, two, current = (os.path.join(root, name) for name in ("one", "two", "current"))
+        for folder in (one, two):
+            os.mkdir(folder)
+            create_ledger(os.path.join(folder, "ledger.db"), _ANCHOR)  # the same anchor in both
+        os.symlink(one, current)
+        auth = Authority(_ANCHOR, os.path.join(current, "ledger.db"), lambda: 0)
+        self.addCleanup(auth.close)
+        auth._db.execute("INSERT INTO charges VALUES ('prior', 'prof', 1000)")
+        os.unlink(current)
+        os.symlink(two, current)  # the link now names another ledger of the same anchor
+        real = auth._db
+        real.execute("BEGIN IMMEDIATE")
+        auth._db = _FailingRollback(real)
+        with self.assertRaises(sqlite3.OperationalError):
+            auth._roll_back()
+        auth._require_usable()
+        self.assertTrue(os.path.samefile(auth._db.execute("PRAGMA database_list").fetchone()[2],
+                                         os.path.join(one, "ledger.db")))
+        self.assertEqual(auth._db.execute("SELECT COUNT(*) FROM charges").fetchone()[0], 1)  # its spend still counts
+
+    @unittest.skipIf(os.name == "nt", "a ledger open in this process cannot be replaced on Windows")
+    def test_a_ledger_of_the_same_anchor_put_in_its_place_is_refused_on_the_reopen(self) -> None:  # DeepSeek F10
+        def replace() -> None:
+            os.unlink(self.path)
+            create_ledger(self.path, _ANCHOR)  # the same anchor: only the file's identity tells it apart
+
+        self._fail_the_rollback(before=replace)
+        self._assert_out_of_use()
+        self.assertEqual(_ledger_rows(self.path, "charges"), 0)
+
+    def test_the_first_open_refuses_another_stores_magic_and_another_anchors_ledger(self) -> None:
+        # Review 2 of #426: the reopen's identity check now refuses any other file first, so the magic and anchor
+        # checks of _connect are pinned at the first open, on both interpreters.
+        other_store, other_anchor = (os.path.join(temp_dir(self), name) for name in ("store.db", "anchor.db"))
+        create_ledger(other_store, _ANCHOR)
+        with contextlib.closing(sqlite3.connect(other_store)) as db:
+            db.execute("UPDATE meta SET v = 'another-store/v0' WHERE k = 'magic'")
+            db.commit()
+        create_ledger(other_anchor, "cd" * 32)
+        for path in (other_store, other_anchor):
+            with self.subTest(path=os.path.basename(path)):
+                with self.assertRaises(Refused) as refused:
+                    Authority(_ANCHOR, path, lambda: 0)
+                self.assertEqual(refused.exception.code, "ledger_anchor_mismatch")
+
+    def test_a_reopen_that_fails_other_than_with_a_refusal_raises_its_error_and_stays_out_of_use(self) -> None:
+        real = self.auth._db  # review 2, DeepSeek F11: as the docstring now says
+        real.execute("BEGIN IMMEDIATE")
+        self.auth._db = _FailingRollback(real)
+        with mock.patch.object(self.auth, "_connect", side_effect=OSError("synthetic: the reopen could not run")):
+            with self.assertRaises(OSError):
+                self.auth._roll_back()
+        self._assert_out_of_use()
+
+    def test_a_name_with_a_nul_in_it_is_ledger_missing(self) -> None:  # review 3 of #426: DeepSeek F1, sol 2
+        class Name:
+            def __init__(self, raw) -> None:
+                self.raw = raw
+
+            def __fspath__(self):
+                return self.raw
+
+        for name in ("\0", self.path + "\0tail", os.fsencode(self.path) + b"\0tail", Name("ledger\0.db"),
+                     Name(b"ledger\0.db")):
+            with self.subTest(name=repr(getattr(name, "raw", name))):
+                with self.assertRaises(Refused) as refused:
+                    Authority(_ANCHOR, name, lambda: 0)
+                self.assertEqual(refused.exception.code, "ledger_missing")
+
+    @unittest.skipIf(os.name == "nt", "a ledger open in this process cannot be replaced on Windows")
+    def test_the_reopen_writes_nothing_to_a_file_it_refuses(self) -> None:  # review 3 of #426: DeepSeek F4
+        def replace() -> None:
+            os.unlink(self.path)
+            create_ledger(self.path, _ANCHOR)
+            with contextlib.closing(sqlite3.connect(self.path)) as db:
+                db.execute("DROP INDEX charges_by_profile")
+                db.commit()
+
+        self._fail_the_rollback(before=replace)
+        self._assert_out_of_use()
+        with contextlib.closing(sqlite3.connect(self.path)) as db:
+            self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name = 'charges_by_profile'")
+                              .fetchone(), "the refused reopen added the index to another file")
+
+    def test_a_stat_that_fails_at_the_reopen_refuses_and_shuts_what_it_opened(self) -> None:
+        # Review 3 of #426 (sol's probe; DeepSeek's surviving R08 and R10): a stat that cannot run is not the same
+        # file, and the connection the reopen made is shut.
+        opened: list = []
+        real = self.auth._db
+        real.execute("BEGIN IMMEDIATE")
+        self.auth._db = _FailingRollback(real)
+        with mock.patch.object(authority_module.sqlite3, "connect", side_effect=_observed_connect(opened)), \
+                mock.patch.object(authority_module, "_file_identity", side_effect=OSError("synthetic: no stat")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.auth._roll_back()
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):  # shut
+            opened[0].execute("SELECT 1")
+        self._assert_out_of_use()
+
+    def test_a_stat_or_a_read_that_fails_at_construction_refuses_and_shuts_what_it_opened(self) -> None:
+        # Review 3 of #426 (sol's probe; DeepSeek's surviving R03 and R09), and the read of the last charge. What
+        # fails is the call made once the ledger is open: the stat before the open (review 4) is not under test.
+        for name, error, code in (("_file_identity", OSError("synthetic: no stat"), "ledger_missing"),
+                                  ("_last_charge", sqlite3.OperationalError("synthetic: no read"), "ledger_invalid")):
+            with self.subTest(failing=name):
+                opened: list = []
+
+                def fail_once_open(*args, real=getattr(authority_module, name), error=error, opened=opened):
+                    if not opened:
+                        return real(*args)
+                    raise error
+
+                with mock.patch.object(authority_module.sqlite3, "connect", side_effect=_observed_connect(opened)), \
+                        mock.patch.object(authority_module, name, side_effect=fail_once_open):
+                    with self.assertRaises(Refused) as refused:
+                        Authority(_ANCHOR, self.path, lambda: 0)
+                self.assertEqual(refused.exception.code, code)
+                self.assertEqual(len(opened), 1)
+                with self.assertRaises(sqlite3.ProgrammingError):  # shut
+                    opened[0].execute("SELECT 1")
+
+    @unittest.skipIf(os.name == "nt", "a ledger open in this process cannot be replaced on Windows")
+    def test_a_file_put_in_the_place_as_the_ledger_opens_is_refused_at_construction(self) -> None:
+        # Review 4 of #426 (DeepSeek F8): the open reaches the ledger, and the path names another file by the time
+        # it is stat'ed; the identity kept would be the other file's, and so is refused.
+        other = self.path + ".other"
+        create_ledger(other, _ANCHOR)
+        opened: list = []
+        connect = sqlite3.connect
+
+        def open_then_replace(*args, **kwargs):
+            db = connect(*args, **kwargs)
+            opened.append(db)
+            os.replace(other, self.path)
+            return db
+
+        with mock.patch.object(authority_module.sqlite3, "connect", side_effect=open_then_replace):
+            with self.assertRaises(Refused) as refused:
+                Authority(_ANCHOR, self.path, lambda: 0)
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):  # shut
+            opened[0].execute("SELECT 1")
+
+    def test_a_ledger_swapped_in_before_the_open_gains_no_index(self) -> None:
+        # Opus finding 2 (review 5, R1): the stat before the open and the stat after it refuse a different file,
+        # but the open writes the charges index first, and that write commits at once. A same-anchor ledger that
+        # lacks the index, put in the place after the first stat and before connect, is refused with the index
+        # still absent and the connection shut.
+        folder = temp_dir(self)
+        path, bare = (os.path.join(folder, name) for name in ("ledger.db", "bare.db"))
+        for target in (path, bare):
+            create_ledger(target, _ANCHOR)
+        with contextlib.closing(sqlite3.connect(bare)) as db:
+            db.execute("DROP INDEX charges_by_profile")
+            db.commit()
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        for target in (path, bare):
+            with contextlib.closing(sqlite3.connect(target)) as db:
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            for suffix in ("-wal", "-shm"):
+                sidecar = target + suffix
+                if os.path.exists(sidecar):
+                    os.remove(sidecar)
+        with contextlib.closing(sqlite3.connect(bare)) as db:
+            self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name = 'charges_by_profile'")
+                              .fetchone(), "the stand-in ledger already had the index")
+        opened: list = []
+        connect = sqlite3.connect
+
+        def replace_then_open(*args, **kwargs):
+            for suffix in ("-wal", "-shm"):
+                sidecar = path + suffix
+                if os.path.exists(sidecar):
+                    os.remove(sidecar)
+            os.replace(bare, path)
+            db = connect(*args, **kwargs)
+            opened.append(db)
+            return db
+
+        with mock.patch.object(authority_module.sqlite3, "connect", side_effect=replace_then_open):
+            with self.assertRaises(Refused) as refused:
+                Authority(_ANCHOR, path, lambda: 0)
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):  # shut
+            opened[0].execute("SELECT 1")
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name = 'charges_by_profile'")
+                              .fetchone(), "the refused open wrote the charges index")
+
+    def test_a_ledger_removed_after_the_check_is_not_created_by_the_open(self) -> None:  # F2: the open never creates
+        missing = os.path.join(temp_dir(self), "gone.db")  # removed after the stat before the open (review 4) too
+        with mock.patch("recursion_core.plugin_security.authority.os.path.isfile", return_value=True), \
+                mock.patch.object(authority_module, "_file_identity", return_value=(0, 0)):
+            with self.assertRaises(Refused) as refused:
+                Authority(_ANCHOR, missing, lambda: 0)
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+        self.assertFalse(os.path.exists(missing), "the open created an empty ledger")
+
+    def test_a_directory_in_the_ledgers_place_is_missing_and_nothing_is_opened(self) -> None:
+        # Review 4 of #426: the stat before the open finds a directory as it finds a file, so the open is kept from
+        # it by the check that the path names a file: ledger_missing, with nothing opened.
+        folder = os.path.join(temp_dir(self), "ledger-dir")
+        os.mkdir(folder)
+        opened: list = []
+        with mock.patch.object(authority_module.sqlite3, "connect", side_effect=_observed_connect(opened)):
+            with self.assertRaises(Refused) as refused:
+                Authority(_ANCHOR, folder, lambda: 0)
+        self.assertEqual(refused.exception.code, "ledger_missing")
+        self.assertEqual(opened, [])
+
+    def test_a_charge_once_the_authority_is_shut_down_is_refused_with_a_code(self) -> None:  # DeepSeek's consumer table
+        self.auth.close()
+        self._assert_out_of_use()
+
+
+class _FailingShutdown:
+    """The ledger's connection, whose own close raises."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+
+    def execute(self, *args):
+        return self._real.execute(*args)
+
+    def close(self) -> None:
+        raise sqlite3.OperationalError("synthetic shutdown failure")
+
+
+class ChargeBoundaryTests(unittest.TestCase):
+    """Review 2 of #426 (astra's C1, DeepSeek F13): the recovery through the public ``charge``, with only the
+    signature's verdict stubbed, so on both interpreters (taken from astra's proposed-coverage.patch)."""
+
+    def setUp(self) -> None:
+        self.path = os.path.join(temp_dir(self), "ledger.db")
+        create_ledger(self.path, _ANCHOR)
+        self.auth = self._authority()
+        scope = dict(account="paper", venue="paper", contract_family="fixture", adapter="fixture",
+                     environment="paper")
+        self.envelope = dict(signature="synthetic-test-verdict", profile=dict(
+            schema=PROFILE_SCHEMA, profile_id="profile", issuer="installer", permission="order",
+            plugin_id="fixture.plugin", artifact_sha256="0" * 64, scope=scope, provider="fixture",
+            model_version="fixture", actions=["order.submit"], not_before=0, expires_at=10,
+            budgets=dict(currency="USD", max_effect_minor=100, total_minor=300)))
+        self.args = dict(plugin_id="fixture.plugin", artifact_sha256="0" * 64, scope=scope, kind="order.submit",
+                         provider="fixture", model_version="fixture", currency="USD", amount_minor=100)
+
+    def _authority(self) -> Authority:
+        auth = Authority(_ANCHOR, self.path, lambda: 1)
+        self.addCleanup(auth.close)
+        verdict = mock.patch.object(auth, "_verify", return_value=True)  # the signature's verdict only
+        verdict.start()
+        self.addCleanup(verdict.stop)
+        return auth
+
+    def _charge(self, key: str) -> dict:
+        return self.auth.charge(self.envelope, **self.args, idempotency_key=key)
+
+    @staticmethod
+    def _deny_the_end(action, name, *_):
+        """An SQLite authorizer refusing COMMIT and ROLLBACK: the transaction cannot end."""
+        return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_TRANSACTION and name in ("COMMIT", "ROLLBACK") \
+            else sqlite3.SQLITE_OK
+
+    def test_a_failed_commit_and_rollback_through_charge_keeps_spend_and_replay(self) -> None:
+        self.assertEqual(self._charge("prior")["spent_minor"], 100)
+        real = self.auth._db
+        real.set_authorizer(self._deny_the_end)
+        with self.assertRaises(sqlite3.DatabaseError):
+            self._charge("failed")
+        with self.assertRaises(sqlite3.ProgrammingError):  # the old connection was shut by the repair
+            real.execute("SELECT 1")
+        self.assertEqual(self._charge("failed")["spent_minor"], 200)
+        with self.assertRaises(Refused) as refused:
+            self._charge("prior")
+        self.assertEqual(refused.exception.code, "effect_replayed")
+        with contextlib.closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*), SUM(amount_minor) FROM charges").fetchone(), (2, 200))
+
+    def _fail_through_charge_and_replace(self, replace) -> None:
+        """A charge whose COMMIT and ROLLBACK fail, and ``replace`` run in the window after the shutdown, with the
+        path's identity made the recorded one: as when the file system gives the replacement the freed inode back,
+        so only the last charge tells the files apart."""
+        real = self.auth._db
+        real.set_authorizer(self._deny_the_end)
+        self.auth._db = _FailingRollbackThenReplaced(real, replace)
+        with mock.patch.object(authority_module, "_file_identity", return_value=self.auth._identity):
+            with self.assertRaises(sqlite3.DatabaseError):
+                self._charge("failed")
+
+    def _fresh_ledger(self) -> None:
+        os.unlink(self.path)
+        create_ledger(self.path, _ANCHOR)
+
+    def test_a_replacement_given_the_recorded_identity_is_refused_by_the_last_charge(self) -> None:
+        # Review 3 of #426 (DeepSeek F2, sol 1), on any file system: a fresh ledger of the same anchor, and one
+        # whose charges cannot be read, in the place of the ledger.
+        def without_charges() -> None:
+            self._fresh_ledger()
+            with contextlib.closing(sqlite3.connect(self.path)) as db:
+                db.execute("DROP TABLE charges")
+                db.commit()
+
+        for replace in (self._fresh_ledger, without_charges):
+            with self.subTest(replacement=replace.__name__):
+                self.path = os.path.join(temp_dir(self), "ledger.db")
+                create_ledger(self.path, _ANCHOR)
+                self.auth = self._authority()
+                self.assertEqual(self._charge("prior")["spent_minor"], 100)
+                self._fail_through_charge_and_replace(replace)
+                with self.assertRaises(Refused) as refused:
+                    self._charge("prior")
+                self.assertEqual(refused.exception.code, "ledger_invalid")
+
+    def test_a_charge_another_writer_committed_is_one_the_reopen_must_find(self) -> None:  # review 3 of #426, F2
+        with contextlib.closing(sqlite3.connect(self.path, timeout=5)) as other:  # after this authority opened
+            other.execute("INSERT INTO charges VALUES ('elsewhere', 'another-profile', 100)")
+            other.commit()
+        self._fail_through_charge_and_replace(self._fresh_ledger)
+        with self.assertRaises(Refused) as refused:
+            self._charge("failed")
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+
+    def test_a_charge_the_ledger_held_at_the_open_is_one_the_reopen_must_find(self) -> None:  # review 3, F2
+        self.assertEqual(self._charge("prior")["spent_minor"], 100)
+        self.auth.close()
+        self.auth = self._authority()  # a new authority, over a ledger that holds a charge already
+        real = self.auth._db
+        real.execute("BEGIN IMMEDIATE")
+        self.auth._db = _FailingRollbackThenReplaced(real, self._fresh_ledger)
+        with mock.patch.object(authority_module, "_file_identity", return_value=self.auth._identity):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.auth._roll_back()
+        with self.assertRaises(Refused) as refused:
+            self._charge("prior")
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+
+    @unittest.skipIf(os.name == "nt", "the reuse of a freed inode is a POSIX file system's matter here")
+    def test_a_ledger_given_the_freed_inode_back_after_the_shutdown_is_refused(self) -> None:
+        # Review 3 of #426: sol's red test (required 1) and DeepSeek F2's measurement, on the file system itself;
+        # it is skipped where no replacement gets the freed inode back in 32 tries.
+        self.assertEqual(self._charge("prior")["spent_minor"], 100)
+        recorded, reused = self.auth._identity, []
+
+        def replace() -> None:
+            for attempt in range(32):
+                self._fresh_ledger()
+                status = os.stat(self.path)
+                if (status.st_dev, status.st_ino) == recorded:
+                    reused.append(attempt + 1)
+                    return
+
+        real = self.auth._db
+        real.execute("BEGIN IMMEDIATE")
+        self.auth._db = _FailingRollbackThenReplaced(real, replace)
+        with self.assertRaises(sqlite3.OperationalError):
+            self.auth._roll_back()
+        if not reused:
+            self.skipTest("no replacement got the freed inode back in 32 tries")
+        with self.assertRaises(Refused) as refused:
+            self._charge("prior")
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+
+    @unittest.skipIf(os.name == "nt", "a ledger open in this process cannot be renamed on Windows")
+    def test_a_file_swapped_in_for_the_open_and_back_out_before_the_stat_is_refused(self) -> None:
+        # Review 3 of #426: sol's red test (required 1). The path names the ledger again by the time it is
+        # stat'ed; only the connection opened tells.
+        self.assertEqual(self._charge("prior")["spent_minor"], 100)
+        other, held, aside = (self.path + suffix for suffix in (".other", ".held", ".aside"))
+        create_ledger(other, _ANCHOR)
+        connect, seen = sqlite3.connect, []
+
+        def swapped_open(*args, **kwargs):
+            os.rename(self.path, held)
+            os.rename(other, self.path)
+            try:
+                db = connect(*args, **kwargs)
+                seen.append(db.execute("SELECT COUNT(*) FROM charges").fetchone()[0])  # the other file's
+                return db
+            finally:
+                os.rename(self.path, aside)
+                os.rename(held, self.path)
+
+        real = self.auth._db
+        real.execute("BEGIN IMMEDIATE")
+        self.auth._db = _FailingRollback(real)
+        with mock.patch.object(authority_module.sqlite3, "connect", side_effect=swapped_open):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.auth._roll_back()
+        self.assertEqual(seen, [0])
+        with self.assertRaises(Refused) as refused:
+            self._charge("prior")
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+
+    def test_a_charge_whose_guard_refuses_at_entry_still_reads_the_last_charge(self) -> None:
+        # Review 4 of #426 (DeepSeek F7): the core's commit section can refuse as it is entered (a tripped
+        # connection); a charge another writer committed is still one the reopen must find.
+        with contextlib.closing(sqlite3.connect(self.path, timeout=5)) as other:  # after this authority opened
+            other.execute("INSERT INTO charges VALUES ('elsewhere', 'another-profile', 100)")
+            other.commit()
+
+        class RefusingGuard:
+            def __enter__(self):
+                raise Refused("connection_tripped")
+
+            def __exit__(self, *exc_info):
+                return False
+
+        self.auth._db = _FailingRollbackThenReplaced(self.auth._db, self._fresh_ledger)
+        with mock.patch.object(authority_module, "_file_identity", return_value=self.auth._identity):
+            with self.assertRaises(sqlite3.OperationalError):  # the rollback's error, in the refusal's place
+                self.auth.charge(self.envelope, **self.args, idempotency_key="tripped", commit_guard=RefusingGuard())
+        with self.assertRaises(Refused) as refused:
+            self._charge("after")
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+
+    def test_a_failed_last_charge_read_and_a_failed_rollback_stays_out_of_use(self) -> None:
+        # Opus finding 1 (review 5, R2): an empty authority, a charge another connection commits, a last-charge
+        # read that raises, and a ROLLBACK that raises. A fresh ledger is put in the place and the path's
+        # identity is the recorded one. The witness was never updated, so the reopen must not put that ledger
+        # back in use: the next charge is ledger_invalid.
+        with contextlib.closing(sqlite3.connect(self.path, timeout=5)) as other:
+            other.execute("INSERT INTO charges VALUES ('elsewhere', 'another-profile', 100)")
+            other.commit()
+
+        def fail_the_read(_db):
+            raise sqlite3.OperationalError("synthetic: no read")
+
+        self.auth._db = _FailingRollbackThenReplaced(self.auth._db, self._fresh_ledger)
+        with mock.patch.object(authority_module, "_last_charge", side_effect=fail_the_read), \
+                mock.patch.object(authority_module, "_file_identity", return_value=self.auth._identity):
+            with self.assertRaises(sqlite3.OperationalError):
+                self._charge("failed")
+        with self.assertRaises(Refused) as refused:
+            self._charge("after")
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+        self.assertTrue(self.auth._unusable)
+
+    def test_a_failed_last_charge_read_whose_rollback_succeeds_still_charges(self) -> None:
+        # The read's own error still reaches the caller when ROLLBACK succeeds (the store error is not turned
+        # into a refusal), including when the read is interrupted. The transaction is not left open, and the
+        # next charge runs.
+        for name, error in (("a store error", sqlite3.OperationalError("synthetic: no read")),
+                            ("an interruption", KeyboardInterrupt())):
+            with self.subTest(read=name):
+                self.path = os.path.join(temp_dir(self), "ledger.db")
+                create_ledger(self.path, _ANCHOR)
+                self.auth = self._authority()
+
+                def fail_the_read(_db, error=error):
+                    raise error
+
+                with mock.patch.object(authority_module, "_last_charge", side_effect=fail_the_read):
+                    with self.assertRaises(type(error)) as raised:
+                        self._charge("failed")
+                self.assertIsInstance(raised.exception, type(error))
+                if isinstance(error, sqlite3.OperationalError):
+                    self.assertIn("no read", str(raised.exception))
+                self.assertFalse(self.auth._db.in_transaction)
+                self.assertFalse(self.auth._unusable)
+                self.assertEqual(self._charge("next")["spent_minor"], 100)
+
+    def test_a_write_during_the_last_charge_read_cannot_drop_the_witness(self) -> None:
+        # Opus finding 3 (review 5, R3): the last-charge read sits after BEGIN IMMEDIATE and before the guard.
+        # Another connection deletes the charge the ledger holds during that read. The write cannot land while
+        # the write transaction is held, so the witness stays that charge and a fresh ledger given the recorded
+        # identity is ledger_invalid. Above BEGIN IMMEDIATE the write lands, the witness comes back empty, and
+        # the fresh ledger is taken.
+        with contextlib.closing(sqlite3.connect(self.path, timeout=5)) as other:
+            other.execute("INSERT INTO charges VALUES ('prior', 'another-profile', 100)")
+            other.commit()
+        real_last = authority_module._last_charge
+
+        def read_while_another_writes(db):
+            other = sqlite3.connect(self.path, timeout=0.4)
+            try:
+                other.execute("DELETE FROM charges")
+                other.commit()
+            except sqlite3.Error:
+                pass
+            finally:
+                other.close()
+            return real_last(db)
+
+        class RefusingGuard:
+            def __enter__(self):
+                raise Refused("connection_tripped")
+
+            def __exit__(self, *exc_info):
+                return False
+
+        self.auth._db = _FailingRollbackThenReplaced(self.auth._db, self._fresh_ledger)
+        with mock.patch.object(authority_module, "_last_charge", side_effect=read_while_another_writes), \
+                mock.patch.object(authority_module, "_file_identity", return_value=self.auth._identity):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.auth.charge(self.envelope, **self.args, idempotency_key="tripped",
+                                 commit_guard=RefusingGuard())
+        with self.assertRaises(Refused) as refused:
+            self._charge("after")
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+
+    def test_charge_is_refused_after_a_failed_shutdown_a_refused_reopen_and_its_own_shutdown(self) -> None:
+        for scenario in ("a shutdown that raises", "a refused reopen", "the authority shut down"):
+            with self.subTest(scenario=scenario):
+                self.auth = self._authority()
+                real = self.auth._db
+                self.addCleanup(setattr, self.auth, "_db", real)
+                if scenario == "the authority shut down":
+                    self.auth.close()
+                else:
+                    real.set_authorizer(self._deny_the_end)
+                    if scenario == "a shutdown that raises":
+                        self.auth._db = _FailingShutdown(real)
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            self._charge("failed")
+                    else:
+                        with mock.patch.object(self.auth, "_connect", side_effect=Refused("ledger_missing")):
+                            with self.assertRaises(sqlite3.DatabaseError):
+                                self._charge("failed")
+                try:
+                    with self.assertRaises(Refused) as refused:
+                        self._charge("after")
+                    self.assertEqual(refused.exception.code, "ledger_invalid")
+                finally:
+                    self.auth._db = real
+                    real.close()
+
+
 class CommitFencePrimitiveTests(unittest.TestCase):
     """The fence's own rules, with no plugin and no signature, so they run on every interpreter."""
 
@@ -1274,6 +2112,27 @@ class CommitFencePrimitiveTests(unittest.TestCase):
         self.assertFalse(any(worker.is_alive() for worker in workers))
         self.assertEqual(fence.position(), threads * marks)
         self.assertEqual(unseen, [])
+
+    def test_the_marks_are_read_under_the_marks_lock(self) -> None:
+        # Review 3 of #378 (DeepSeek N1): the writer's lock is pinned by the concurrent marks; this pins the
+        # two readers. While the marks lock is held, neither position() nor trip_changed_since() answers.
+        fence = CommitFence()
+        fence.mark_trip_change("conn-a")
+        for name, read, expected in (("position", fence.position, 1),
+                                     ("trip_changed_since", lambda: fence.trip_changed_since("conn-a", 0), True)):
+            with self.subTest(read=name):
+                done = threading.Event()
+                answer: list = []
+                def reading(answer=answer, read=read, done=done) -> None:  # this round's, even after a join that timed out
+                    answer.append(read())
+                    done.set()
+
+                reader = threading.Thread(target=reading, daemon=True)
+                with fence._marks_lock:
+                    reader.start()
+                    self.assertFalse(done.wait(0.3), name + " answered while the marks lock was held")
+                reader.join(10.0)
+                self.assertEqual(answer, [expected])
 
     def test_a_thread_waiting_to_enter_does_not_take_the_holders_place(self) -> None:
         # Review 2 of #378 (DeepSeek F3): the holder's slot is set only once the fence is taken. Set

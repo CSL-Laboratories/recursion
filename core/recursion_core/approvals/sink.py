@@ -10,8 +10,10 @@ charge.
   name another run. A request that cannot be bound whole is refused and nothing is written.
 * ``carry(approval_id, effect)`` charges, then consumes, once. The charge runs only while the approval is
   still approved and the effect is the one that was bound, run included. The approval becomes consumed
-  only after the charge returns. A charge that refuses, raises or is interrupted leaves the approval
-  unconsumed. A second carry is refused and does not charge again.
+  only after the charge returns, or inside the charge's own commit when the charge consumes it (the
+  plugin host's charge does, so that no failure leaves it charged and still approved). A charge that
+  refuses, raises or is interrupted before that leaves the approval unconsumed. A second carry is
+  refused and does not charge again.
 
 One sink, or two sinks on the same queue, share one gate, so two callers spend once. The charge callable
 must not call back into the sink (that is refused). It must also be idempotent on the approval id: the
@@ -125,5 +127,10 @@ class PluginEffectSink:
             # Still approved: the consumption below is reached only if this call returns.
             receipt = self._charge(copy.deepcopy(record["effect"]), approval_id)
             self._gate.spent[approval_id] = receipt
-        consumed = self._queue.consume(approval_id, record["revision"], record["digest"], None)
+        try:
+            consumed = self._queue.consume(approval_id, record["revision"], record["digest"], None)
+        except ApprovalRefused as refused:
+            if refused.code != "already_consumed":
+                raise
+            consumed = self._held(approval_id)  # the charge consumed it inside its own commit
         return {"approval": consumed, "charge": self._gate.spent[approval_id]}

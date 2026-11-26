@@ -10,6 +10,7 @@ that refusal names the file, how many approvals hold it and the row to change.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import unittest
@@ -72,15 +73,20 @@ class NotesKeptTests(_HostCase):
         plugins.NOTES_NEEDED_SIZE_LIMIT_BYTES = size
         self.addCleanup(setattr, plugins, "NOTES_NEEDED_SIZE_LIMIT_BYTES", old)
 
-    def hold_consume(self, host):
-        queue = host._approval_queue  # noqa: SLF001 - the composed queue; the stand-in holds its consume step
-        real = queue.consume
+    def hold_receipts(self, host):
+        """A stand-in for a disk with no room for some receipt notes: a notes write that would put on file the
+        receipt of an approval in the returned set fails as a full disk does. Returns the set and the release."""
+        held = set()
+        notes = host._approver._notes  # noqa: SLF001 - the composed approver's notes; the stand-in holds its writes
+        real = notes._write
 
-        def held(*_args, **_kwargs):
-            raise ApprovalRefused("store_busy")
+        def write(data, **options):
+            if held & set(data["receipts"]):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(data, **options)
 
-        queue.consume = held
-        return lambda: setattr(queue, "consume", real)
+        notes._write = write
+        return held, lambda: setattr(notes, "_write", real)
 
     def test_more_approvals_than_fit_are_all_charged_and_the_file_stays_under_the_figure(self):
         host = self.composed()
@@ -97,21 +103,24 @@ class NotesKeptTests(_HostCase):
     def test_notes_still_needed_for_a_carry_are_never_pruned_and_replay_after_a_restart(self):
         host = self.composed()
         self.figures(size=10 ** 7, keep_for=0, keep_at_most=0)
-        release = self.hold_consume(host)
+        held, release = self.hold_receipts(host)
         waiting = []
         for number in range(3):
             effect = _effect(amount=AMOUNT, payload={"note": "w%d" % number})
             approval_id = host.request_plugin_effect(effect)
-            with self.assertRaises(ApprovalRefused):
-                host.answer_plugin_effect(self.owner(), approval_id, effect, authority=self.envelope())
-            self.assertEqual(self.record(host, approval_id)["state"], "approved")
+            held.add(approval_id)
+            carried = host.answer_plugin_effect(self.owner(), approval_id, effect, authority=self.envelope())
+            self.assertIn("the charge was made", carried["notice"])
+            self.assertEqual(self.record(host, approval_id)["state"], "consumed")
             waiting.append((approval_id, effect))
-        release()
         finished = [self.carry(host, "f%d" % number)[0] for number in range(2)]
         self.assertEqual(self.held_ids(), {approval_id for approval_id, _ in waiting})
         rows = len(self.charge_rows())
         host._approver._receipts._memory.clear()  # noqa: SLF001 - what a new process reads is the file
         host._approver._envelopes.clear()
+        host._approver._unwritten.clear()
+        release()
+        host._approver.recover_receipts()  # what a start does: the notes lost with the process, from the ledger
         for approval_id, effect in waiting:
             receipt = host._approver.charge(effect, approval_id)
             self.assertEqual(receipt["profile_id"], "prof-1")
@@ -122,15 +131,14 @@ class NotesKeptTests(_HostCase):
         host = self.composed()
         self.figures(size=2500, keep_for=0, keep_at_most=0)
         self.needed_row(2500)
-        self.hold_consume(host)
+        held, _release = self.hold_receipts(host)
         refused = None
         for number in range(20):
             effect = _effect(amount=AMOUNT, payload={"note": "h%d" % number})
             approval_id = host.request_plugin_effect(effect)
+            held.add(approval_id)
             try:
-                host.answer_plugin_effect(self.owner(), approval_id, effect, authority=self.envelope())
-            except ApprovalRefused:
-                continue  # charged, consume held: its notes are still needed
+                carried = host.answer_plugin_effect(self.owner(), approval_id, effect, authority=self.envelope())
             except Refused as exc:
                 self.assertEqual(exc.code, "approval_notes_full")
                 if approval_id in {key for key, _ in self.charge_rows()}:
@@ -139,6 +147,8 @@ class NotesKeptTests(_HostCase):
                     continue
                 refused = exc
                 break
+            else:
+                self.assertIn("the charge was made", carried["notice"])  # its receipt note held: still needed
         self.assertIsNotNone(refused, "the needed notes never filled the figure")
         self.assertIn(str(self.notes.with_name(plugins.EFFECT_NOTES_NEEDED)), refused.detail)
         self.assertIn("%d approval(s)" % (len(self.held_ids()) + 1), refused.detail)  # the waiting ones and this one

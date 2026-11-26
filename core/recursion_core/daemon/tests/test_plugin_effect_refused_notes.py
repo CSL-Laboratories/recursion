@@ -101,13 +101,15 @@ class RefusedChargeNotesTests(kept.NotesKeptTests):
     def test_needed_notes_past_the_size_figure_never_refuse_an_approval(self):
         host = self.composed()
         self.figures(size=2500, keep_for=0, keep_at_most=0)
-        release = self.hold_consume(host)
+        held, release = self.hold_receipts(host)
         waiting = []
         for number in range(20):
             effect = _effect(amount=AMOUNT, payload={"note": "h%d" % number})
             approval_id = host.request_plugin_effect(effect)
-            with self.assertRaises(ApprovalRefused):  # charged; its consume step held: its notes are needed
-                host.answer_plugin_effect(self.owner(), approval_id, effect, authority=self.envelope())
+            held.add(approval_id)
+            carried = host.answer_plugin_effect(self.owner(), approval_id, effect, authority=self.envelope())
+            self.assertIn("the charge was made", carried["notice"])  # its receipt note held: its notes are needed
+            self.assertEqual(self.record(host, approval_id)["state"], "consumed")
             waiting.append(approval_id)
         self.assertEqual(len(self.charge_rows()), 20)
         self.assertEqual(self.held_ids(), set(waiting))
@@ -115,6 +117,7 @@ class RefusedChargeNotesTests(kept.NotesKeptTests):
         release()
         host._approver._receipts._memory.clear()  # noqa: SLF001 - what a new process reads is the files
         host._approver._envelopes.clear()
+        host._approver._unwritten.clear()
         receipt = host._approver.charge(_effect(amount=AMOUNT, payload={"note": "h0"}), waiting[0])
         self.assertEqual(receipt["profile_id"], "prof-1")
         self.assertEqual(len(self.charge_rows()), 20)
@@ -126,15 +129,14 @@ class RefusedChargeNotesTests(kept.NotesKeptTests):
         self.assertIsNone(had, "the needed file's size row ships as 'no limit'")
         plugins.NOTES_NEEDED_SIZE_LIMIT_BYTES = 1500
         self.addCleanup(setattr, plugins, "NOTES_NEEDED_SIZE_LIMIT_BYTES", None)
-        self.hold_consume(host)
+        held, _release = self.hold_receipts(host)
         stopped = None
         for number in range(20):
             effect = _effect(amount=AMOUNT, payload={"note": "q%d" % number})
             approval_id = host.request_plugin_effect(effect)
+            held.add(approval_id)
             try:
-                host.answer_plugin_effect(self.owner(), approval_id, effect, authority=self.envelope())
-            except ApprovalRefused:
-                continue
+                carried = host.answer_plugin_effect(self.owner(), approval_id, effect, authority=self.envelope())
             except Refused as exc:
                 self.assertEqual(exc.code, "approval_notes_full")
                 if approval_id in {key for key, _ in self.charge_rows()}:
@@ -142,6 +144,8 @@ class RefusedChargeNotesTests(kept.NotesKeptTests):
                     continue
                 stopped = exc
                 break
+            else:
+                self.assertIn("the charge was made", carried["notice"])
         self.assertIsNotNone(stopped, "the needed notes never reached the row")
         row = plugins.NOTES_ROWS["NOTES_NEEDED_SIZE_LIMIT_BYTES"]
         self.assertIn(str(_needed_path(self.notes)), stopped.detail)

@@ -256,7 +256,9 @@ class CoreService:
         ``caller`` is the plugin asking (``effect.authorize``), or None where no plugin is the caller
         (the owner or a device answering through the approval queue); every other check is for the
         effect's own plugin. ``approval`` is the caller's approval object (module text). A refusal of
-        any check is raised as itself and nothing is charged.
+        any check is raised as itself and nothing is charged. An approval object with a ``seal`` (the
+        approval queue's record) is consumed by it inside the ledger's own transaction, after the charge
+        row and before its commit, so no failure leaves a charge made with its approval still approved.
         """
         started = self.commit_fence.position()  # before any check: from here the call is in flight
         permission, run = self._check_plugin_effect(caller, effect)
@@ -264,9 +266,11 @@ class CoreService:
             raise Refused("approval_required")
         digest = approval.take(approval_id, effect)
         commit = self._commit_section(caller, effect, approval, started)
+        seal = getattr(approval, "seal", None)
         if permission not in self._authority_required:
             with commit:
-                pass  # nothing is charged: the end of this section is the commit; the answer follows
+                if seal is not None:  # nothing is charged: the end of this section is the commit
+                    seal()
             return {"authorized": True, "digest": digest, "charge": None}
         if self._authority is None:
             raise Refused("authority_unconfigured")
@@ -275,7 +279,7 @@ class CoreService:
             authority, plugin_id=plugin_id, artifact_sha256=self._loader.artifact(plugin_id),
             scope=effect["scope"], kind=effect["kind"], provider=run["provider"],
             model_version=run["model_version"], currency=effect["currency"], amount_minor=effect["amount_minor"],
-            idempotency_key=approval_id, commit_guard=commit)
+            idempotency_key=approval_id, commit_guard=commit, **({} if seal is None else {"before_commit": seal}))
         return {"authorized": True, "digest": digest, "charge": charge}
 
     @contextlib.contextmanager

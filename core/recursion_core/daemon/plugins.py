@@ -26,7 +26,11 @@ Install layout, all operator-owned and not group- or other-writable::
                  "permissions": ["read", "panel"]}],
      "reserved": {"hosts": [], "credential_prefixes": []},
      "authority_anchor": "<64 hex installer public key>" or null,
-     "registry_labels": {"<sha256 of manifest.json bytes>": "verified" or "non_verified"}}
+     "registry_labels": {"<sha256 of manifest.json bytes>": "verified" or "non_verified"},
+     "pins": {"<plugin id>": {"signer_key_id": "ed25519:...", "version": "..."}}}
+
+``pins`` is the installer's: the key each plugin was installed signed by. The daemon takes an
+object there and does not read it; nothing here loads or refuses a plugin by its pin.
 
 ``registry_labels`` is the label the installer saw for that manifest. The key is the SHA-256 of
 the manifest file's bytes. A missing key, or a key that is not the manifest now installed, is
@@ -89,7 +93,7 @@ VERIFICATION_UNAVAILABLE = 'plugin_verification_unavailable'
 CRYPTOGRAPHY_MISSING = 'cryptography missing; install recipe in plugin_security/README.md'
 EFFECT_PERMISSIONS = {'order': 'order'}
 AUTHORITY_REQUIRED = frozenset({'order'})
-_INSTALL_KEYS = frozenset({'trusted_keys', 'grants', 'reserved', 'authority_anchor', 'registry_labels'})
+_INSTALL_KEYS = frozenset({'trusted_keys', 'grants', 'reserved', 'authority_anchor', 'registry_labels', 'pins'})
 _LABELS = frozenset({'verified', 'non_verified'})
 _SHA256 = re.compile(r'[0-9a-f]{64}')
 _GRANT_KEYS = frozenset({'plugin_id', 'artifact_sha256', 'signer_key_id', 'permissions', 'unsigned_order_acknowledged',
@@ -249,6 +253,8 @@ def read_install(directory):
     anchor = data.get('authority_anchor')
     if not (anchor is None or isinstance(anchor, str)):
         raise PluginRefused('plugin_install_config_invalid', 'authority_anchor')
+    if not isinstance(data.get('pins', {}), dict):
+        raise PluginRefused('plugin_install_config_invalid', 'pins')
     return {'trusted_keys': keys, 'grants': grants,
             'reserved': ReservedEffects(frozenset(hosts), tuple(prefixes)), 'authority_anchor': anchor,
             'registry_labels': _registry_labels(data.get('registry_labels', {}))}

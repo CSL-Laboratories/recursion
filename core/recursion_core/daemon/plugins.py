@@ -69,9 +69,10 @@ import time
 from recursion_core.gui.client import ACTIONS, READS
 from recursion_core.gui.panels import panel_registry
 from recursion_core.plugin_security import (ApprovalGate, Authority, CoreHealth, CoreService, GilProbe, Grant,
-                                            PERMISSIONS, PluginLoader, Refused, ReservedEffects, TrustStore,
+                                            PluginLoader, Refused, ReservedEffects, TrustStore,
                                             create_revocation_store)
 from recursion_core.plugin_security.limits import ARTIFACT, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES
+from recursion_core.plugin_security.manifest import PERMISSIONS_V1, developer_key_id_ok
 from recursion_core.plugin_security.signing import backend_available
 
 from .breaker import STORE_DIR
@@ -95,9 +96,6 @@ _LABELS = frozenset({'verified', 'non_verified'})
 _SHA256 = re.compile(r'[0-9a-f]{64}')
 _GRANT_KEYS = frozenset({'plugin_id', 'artifact_sha256', 'signer_key_id', 'permissions', 'unsigned_order_acknowledged',
                          'order_after_revoked_key', 'order_after_revocation_generation', 'developer_key_id'})
-# The schema's key id: "ed25519:" and 32 lower-case hex digits. fullmatch, not a trailing "$": a "$" matches
-# before a newline, and a value that is not this whole text is refused.
-_INSTALL_KEY_ID = re.compile(r'ed25519:[0-9a-f]{32}')
 _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
 # O7 reads (ADV2-3). Uncalibrated defaults: a plugin call that has not answered by its deadline is
 # answered 504 and the plugin is marked degraded; a read that finds another one running waits this
@@ -198,9 +196,10 @@ def _registry_labels(value):
 def read_install(directory):
     """Parse ``install.json``. With no file: no trusted key, no grant and no label.
 
-    A grant may name ``developer_key_id`` as null or as ``ed25519:`` and 32 lower-case hex digits. Any other
-    shape is refused. The id is checked here and is not copied onto the grant, and it is not a second binding:
-    the grant stays bound to the artifact digest and ``signer_key_id``.
+    ``developer_key_id`` and ``order_after_revoked_key`` are each null or ``ed25519:`` plus 32 lower-case hex; a grant
+    may name the five version-1 permissions.
+    A manual grant is bound to that developer key, as ``plugin_security.manifest`` binds it: an unbound manual
+    grant that asks for permissions is refused ``grant_unbound`` before plugin code runs.
     """
     raw = _read_owned(Path(directory) / INSTALL_FILE, MAX_INSTALL_BYTES, missing_ok=True)
     if raw is None:
@@ -225,21 +224,19 @@ def read_install(directory):
             raise PluginRefused('plugin_install_config_invalid', 'grant fields')
         perms, signer = item['permissions'], item.get('signer_key_id')
         generation = item.get('order_after_revocation_generation')
-        developer_key_id = item.get('developer_key_id')
-        developer_key_ok = developer_key_id is None or (
-            type(developer_key_id) is str and _INSTALL_KEY_ID.fullmatch(developer_key_id) is not None)
         if (not isinstance(item['plugin_id'], str) or not isinstance(item['artifact_sha256'], str)
-                or not isinstance(perms, list) or any(p not in PERMISSIONS for p in perms)
+                or not isinstance(perms, list) or any(p not in PERMISSIONS_V1 for p in perms)
                 or not (signer is None or isinstance(signer, str))
                 or type(item.get('unsigned_order_acknowledged', False)) is not bool
-                or not (item.get('order_after_revoked_key') is None or isinstance(item['order_after_revoked_key'], str))
+                or not developer_key_id_ok(item.get('order_after_revoked_key'))
                 or not (generation is None or type(generation) is int)
-                or not developer_key_ok
+                or not developer_key_id_ok(item.get('developer_key_id'))
                 or item['plugin_id'] in grants):
             raise PluginRefused('plugin_install_config_invalid', 'grant value')
         grants[item['plugin_id']] = Grant(item['plugin_id'], item['artifact_sha256'], signer, tuple(perms),
                                           item.get('unsigned_order_acknowledged', False),
-                                          item.get('order_after_revoked_key'), generation)
+                                          item.get('order_after_revoked_key'), generation,
+                                          developer_key_id=item.get('developer_key_id'))
     reserved = data.get('reserved', {})
     hosts = reserved.get('hosts', []) if isinstance(reserved, dict) else None
     prefixes = reserved.get('credential_prefixes', []) if isinstance(reserved, dict) else None
@@ -363,12 +360,12 @@ class PluginHost:
                 raise PluginRefused('plugin_directory_untrusted',
                                     'must be an operator-owned directory, not group/other writable')
             manifest = _read_owned(source / MANIFEST, MAX_MANIFEST_BYTES)
-            artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES)
+            artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES, missing_ok=True)
             signature = _read_owned(source / SIGNATURE, 4096, missing_ok=True)
             signature = None if signature is None else signature.decode('ascii', 'replace').strip()
             # The label is for these manifest bytes. Any other digest is not this manifest's label.
             label = self._labels.get(hashlib.sha256(manifest).hexdigest())
-            loaded = self.loader.load(manifest, signature, artifact, registry_label=label)
+            loaded = self.loader.load(manifest, signature, artifact, registry_label=label, package_dir=source)
         except (PluginRefused, Refused) as exc:
             findings = list(self.loader.last_findings) if isinstance(exc, Refused) else []
             record.update(code=exc.code, detail=exc.detail,

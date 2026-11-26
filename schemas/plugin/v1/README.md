@@ -45,6 +45,19 @@ Install file:
   A key for any other bytes is not this manifest's label, and the daemon shows the plugin unlisted.
   The label is not a permission and not a grant.
 
+## Loader admission
+
+To bind a hand-made grant, set `developer_key_id` in its `install.json` grant entry.
+A manual grant with no developer key binding is refused before plugin code runs if the
+manifest requests permissions, whether the manifest is signed or not. A plugin that asks for no
+permissions can still load. `order_after_revoked_key` is null or a developer key ID, the same shape
+as `developer_key_id`; any other value is refused.
+
+For a signed version 1 load, every listed path must name a file in the package. The package
+folder itself and every folder on a listed path must be a real folder: no symbolic link is
+followed. The loader checks file presence and the entry digest. The other file digests are
+reserved for a future content check.
+
 ## What is not decided
 
 - **Recommended, not decided:** that the plugin contract is frozen as version 1 now (as a draft
@@ -52,8 +65,15 @@ Install file:
 - **Recommended, not decided:** the five permission names that are new in version 1 (`surface`,
   `command`, `subscribe`, `tool`, `run`) and their order. An existing name never changes its place:
   permissions are only appended, so the signed bytes for an existing set never change.
-- `runtime` has one value, `python-inprocess/1`: ordinary Python in the daemon's own process and
-  user. That is not a containment boundary.
+- **Decided:** `runtime` is `python-sandboxed/1`, the name for Python run by a host in a process of its
+  own outside the daemon; a plugin author writes the same `plugin.py` as before. In this build a plugin
+  of either runtime runs in the daemon's own process and nothing is contained yet; the name
+  python-sandboxed/1 is accepted so that manifests can be written for the host that follows.
+  `python-inprocess/1` retires: every 1.0.x release accepts it and runs it the same way as
+  `python-sandboxed/1`, with the finding `runtime_inprocess_retiring`, and from 1.1.0 on it is
+  refused `runtime_retired`. Runtimes are only ever appended. Names held for a later release (two
+  runtimes, three permissions, five record kinds) are listed under `$defs/reserved` in
+  `manifest.v1.json`; each is refused with its own text, and reserved is not frozen.
 - **Not decided:** what an install does with a revoked-key list that has expired or cannot be
   fetched. Until that is answered, the last accepted list stays in force, and the absence of a list
   never means that nothing is revoked.

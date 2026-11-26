@@ -1076,6 +1076,11 @@
       "shows": "A plugin that asks for the five permissions that are new, and provisional, in version 1."
     },
     {
+      "file": "good/manifest.v1/h04-a-sandboxed-runtime.json",
+      "schema": "manifest.v1.json",
+      "shows": "A plugin that names 'python-sandboxed/1', the runtime of the host that follows; in this build it runs in the daemon's own process, as 'python-inprocess/1' does."
+    },
+    {
       "file": "bad/manifest.v1/b01-the-old-schema-name.json",
       "schema": "manifest.v1.json",
       "rule": "This is the schema of 'csl-plugin-manifest/1'; a vNext manifest is read by the old parser.",
@@ -1141,7 +1146,7 @@
     {
       "file": "bad/manifest.v1/b08-a-runtime-nobody-defined.json",
       "schema": "manifest.v1.json",
-      "rule": "The only runtime in this draft is 'python-inprocess/1'.",
+      "rule": "A runtime nobody defined is refused; runtimes are only ever appended to the list in the schema.",
       "expect": {
         "keyword": "enum",
         "at": "/runtime"
@@ -1172,6 +1177,33 @@
       "expect": {
         "keyword": "additionalProperties",
         "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b12-a-reserved-runtime.json",
+      "schema": "manifest.v1.json",
+      "rule": "'wasm-component/1' is held for a later release: the parser refuses it 'runtime_reserved', with its own text.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/runtime"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b13-the-reserved-data-runtime.json",
+      "schema": "manifest.v1.json",
+      "rule": "'data/1' is held for a later release: the parser refuses it 'runtime_reserved', with its own text, and not as an unknown runtime.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/runtime"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b14-a-reserved-permission.json",
+      "schema": "manifest.v1.json",
+      "rule": "'memory' is held for a later release: the parser refuses it 'permission_reserved', with its own text, and the schema refuses it as a name its list of permissions does not hold.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/permissions/1"
       }
     },
     {

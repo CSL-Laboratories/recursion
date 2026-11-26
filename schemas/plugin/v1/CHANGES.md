@@ -53,6 +53,30 @@ daemon sets it from the channel. What it breaks: nothing; no schema before it na
 Forty-nine fixtures prove its rules; `plugin_security/host_channel.py` is its code side and
 `plugin_security/tests/test_host_channel.py` holds the two equal.
 
+## Loader admission
+
+A plugin that requests permissions with an unbound manual grant is refused `grant_unbound`
+before its code runs, whether its manifest is signed or not. An `order_after_revoked_key` that is
+not a developer key ID binds nothing and is refused where a grant is read. A signed version 1 load
+is refused `package_file_missing` when a file listed in the manifest is absent. The refusal names
+the first missing path in manifest path order. When the package folder itself is missing, is a
+symbolic link or is not a folder, the refusal says that instead.
+
+## `manifest.v1.json` is `1.0-draft.2` (2026-11-18)
+
+`runtime` takes `python-sandboxed/1` (the name for a plugin run by a host outside the daemon; in this
+build no plugin is contained yet, and a `python-sandboxed/1` load gives the warning `runtime_not_yet_contained`)
+beside `python-inprocess/1`, which retires: it is read as `python-sandboxed/1` in every 1.0.x release,
+with the finding `runtime_inprocess_retiring`. A new `$defs/reserved` holds the names kept for a later
+release, each with a sentence on what it is for: the runtimes `wasm-component/1` and `data/1`, the
+permissions `schedule`, `memory` and `computer`, and the record kinds `trigger.v1`, `agent.v1`,
+`memory.lesson.v1`, `work.packet.v1` and `node.v1`. The parser refuses a reserved runtime
+`runtime_reserved` and a reserved permission `permission_reserved`, each with its own text; any other
+runtime is refused `manifest_runtime` with a text that names what this release runs. What it breaks:
+nothing that loads today. Every manifest draft 1 accepted is still accepted; a manifest that names a
+reserved name was refused before and is refused now, under its own code. One good fixture (`h04`) and
+three bad ones (`b12`, `b13`, `b14`) hold it.
+
 ## `install.v1.json` is `1.0-draft.4` (2026-11-17)
 
 The install file may carry `registry_labels`: a map from the SHA-256 of one installed manifest's bytes

@@ -14,17 +14,38 @@ running the engine.
 """
 import json
 import os
+import select
 import sys
+import time
 
 MAX_ENV_BYTES = 60000  # under the 64 KiB a Linux FIFO buffers, so the daemon's write never blocks
+ENV_WAIT_S = 30.0  # the whole wait for the daemon's write; the launcher gives up long before
+
+
+def _read(fd, size, deadline):
+    """``os.read`` that waits for the daemon's end only until ``deadline``.
+
+    The FIFO is opened without blocking. The daemon holds its end open (read and write) from before the unit
+    starts until the environment is taken, so a FIFO with no writer at all means the daemon is gone: the read
+    returns EOF and the launch is refused, where a blocking open would wait for a writer that never comes (E33).
+    """
+    while True:
+        try:
+            return os.read(fd, size)
+        except BlockingIOError:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError('environment not written') from None
+            select.select([fd], [], [], left)
 
 
 def read_env(path):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    deadline = time.monotonic() + ENV_WAIT_S
     try:
         header = b''
         while not header.endswith(b'\n'):
-            byte = os.read(fd, 1)
+            byte = _read(fd, 1, deadline)
             if not byte or len(header) > 8:
                 raise ValueError('environment header')
             header += byte
@@ -33,7 +54,7 @@ def read_env(path):
             raise ValueError('environment size')
         body = b''
         while len(body) < size:
-            chunk = os.read(fd, size - len(body))
+            chunk = _read(fd, size - len(body), deadline)
             if not chunk:
                 raise ValueError('environment truncated')
             body += chunk

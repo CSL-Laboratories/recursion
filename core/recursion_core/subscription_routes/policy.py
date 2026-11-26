@@ -276,6 +276,7 @@ def check_route(
     route_home: str,
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
+    allow_inside_operator_home: bool = False,
     wrapper: WrapperInstall | None = None,
     requirements: RouteRequirements | None = None,
     full_access_acknowledged: bool = False,
@@ -291,6 +292,15 @@ def check_route(
     launcher script and installed package files must match that pin, and the decision is then beta.
     ``requirements`` and ``full_access_acknowledged`` are the configured inputs (``RouteRequirements``);
     full access lets a package link leave the install root and relaxes nothing else here.
+    ``allow_inside_operator_home`` carries lane INSTALL's containment setting as a bool (its value
+    ``inside_operator_home`` is True, ``outside_operator_home`` False). Nothing in this tree reads the setting
+    or translates it, and the launcher keeps its own home: a caller passes the bool. False, the default here,
+    refuses a route home inside the operator's home (``route_home_is_operator_home``, detail
+    ``inside_operator_home``). True accepts there only the engine's own home where the launcher keeps it,
+    ``<state>/recursion/homes/<engine>`` with ``<state>`` the parent's ``XDG_STATE_HOME`` when set, else
+    ``<operator home>/.local/state``, and no link below ``<state>``; any other folder inside the operator's
+    home refuses (detail ``not_the_engine_home``). The operator's home itself refuses whatever the setting
+    (detail ``operator_home``).
     """
 
     spec = ENGINES.get(engine) if isinstance(engine, str) else None
@@ -318,7 +328,8 @@ def check_route(
         engine_config = ((HERMES_ADOPT_EXTERNAL_LOGINS, False),)
     if isinstance(profile.get("auth"), str) and _norm(profile["auth"]) == "subscription":
         return _check_subscription(engine, spec, profile, child_env, route_home, parent_env, operator_home,
-                                   engine_config, wrapper, checked)
+                                   engine_config, wrapper, checked,
+                                   allow_inside_operator_home=allow_inside_operator_home)
     if "method" in profile:
         raise SubscriptionRouteRefused(engine, "method_without_subscription")
     provider, auth, credential = profile.get("provider"), profile.get("auth"), profile.get("credential_env")
@@ -369,7 +380,8 @@ def check_route(
     if extra:  # fail closed: the records do not establish which other names an engine reads to pick a login
         raise SubscriptionRouteRefused(engine, "child_env_not_allowed", ",".join(extra))
 
-    _check_home(engine, env, route_home, parent_env, operator_home)
+    _check_home(engine, env, route_home, parent_env, operator_home,
+                allow_inside_operator_home=allow_inside_operator_home)
     _check_hermes_home(engine, route_home, checked)
     flags = tuple(f"parent_env_has:{name}" for name in CLAUDE_SUBSCRIPTION_ENV if name in (parent_env or {}))
     return _finish(engine, provider, credential, flags, "api_key", "", engine_config, stored_model, env, wrapper,
@@ -434,6 +446,8 @@ def _check_subscription(
     engine_config: tuple[tuple[str, object], ...],
     wrapper: WrapperInstall | None,
     checked: _Checked,
+    *,
+    allow_inside_operator_home: bool,
 ) -> RouteDecision:
     """A subscription sign-in: allowed only for a (provider, method) pair on ``SUBSCRIPTION_SIGN_INS``."""
 
@@ -483,7 +497,8 @@ def _check_subscription(
         raise SubscriptionRouteRefused(engine, "child_env_not_allowed", ",".join(extra))
 
     own = OWN_STORE_ENTRIES[engine]
-    _check_home(engine, env, route_home, parent_env, operator_home, own=own)
+    _check_home(engine, env, route_home, parent_env, operator_home, own=own,
+                allow_inside_operator_home=allow_inside_operator_home)
     _check_hermes_home(engine, route_home, checked)
     flags = tuple(f"parent_env_has:{name}" for name in CLAUDE_SUBSCRIPTION_ENV if name in (parent_env or {}))
     # The engine's own store was allowed by presence only; whether it holds an adopted Claude or Codex
@@ -506,6 +521,7 @@ def guard_then_spawn(
     route_home: str,
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
+    allow_inside_operator_home: bool = False,
     wrapper: WrapperInstall | None = None,
     requirements: RouteRequirements | None = None,
     full_access_acknowledged: bool = False,
@@ -533,6 +549,7 @@ def guard_then_spawn(
     decision = check_route(
         engine, profile, child_env, route_home=route_home, parent_env=parent_env,
         operator_home=operator_home, wrapper=wrapper, requirements=requirements,
+        allow_inside_operator_home=allow_inside_operator_home,
         full_access_acknowledged=full_access_acknowledged,
     )
     pinned = (wrapper.launcher_path,) if decision.beta and wrapper is not None else ()
@@ -552,6 +569,8 @@ def _check_home(
     parent_env: Mapping[str, str] | None,
     operator_home: str | None,
     own: tuple[str, ...] = (),
+    *,
+    allow_inside_operator_home: bool,
 ) -> None:
     """The child's home is route-owned, private, not the operator's, and holds no store or engine state entry.
 
@@ -564,12 +583,23 @@ def _check_home(
         raise SubscriptionRouteRefused(engine, "route_home_missing")
     if env.get("HOME") != route_home:
         raise SubscriptionRouteRefused(engine, "child_home_not_route_home")
-    real = os.path.realpath(route_home)
+    try:
+        real = os.path.realpath(route_home)
+    except OSError:  # a real path that cannot be read is a home that cannot be checked
+        raise SubscriptionRouteRefused(engine, "route_home_missing") from None
     operator = {os.path.realpath(path) for path in _operator_homes(parent_env, operator_home)}
+    if real in operator:  # the operator's home itself, whatever the containment setting
+        raise SubscriptionRouteRefused(engine, "route_home_is_operator_home", "operator_home")
     # A home of "/" must not use the prefix "/": that matches every absolute path, so a
     # container whose passwd home is missing (HOME=/) could launch no route.
+    # Inside the operator's home the containment setting decides: anything but True refuses; True accepts
+    # only the engine's own home where the launcher keeps it, never another folder (the operator's .ssh, a
+    # login store), since the route home becomes the child's HOME.
     if any(_operator_contains(real, home) for home in operator):
-        raise SubscriptionRouteRefused(engine, "route_home_is_operator_home")
+        if allow_inside_operator_home is not True:
+            raise SubscriptionRouteRefused(engine, "route_home_is_operator_home", "inside_operator_home")
+        if real not in _engine_homes(engine, parent_env, operator):
+            raise SubscriptionRouteRefused(engine, "route_home_is_operator_home", "not_the_engine_home")
     try:
         st = os.lstat(route_home)
     except OSError:
@@ -670,6 +700,17 @@ def _operator_contains(real: str, home: str) -> bool:
         return real == "/"
     base = home.rstrip("/")
     return real == base or real.startswith(base + "/")
+
+
+def _engine_homes(engine: str, parent_env: Mapping[str, str] | None, operator: set[str]) -> set[str]:
+    """Where the launcher keeps ``engine``'s home: ``<state>/recursion/homes/<engine>``, ``<state>`` being the
+    parent's ``XDG_STATE_HOME`` when it is a non-empty string, else each operator home's ``.local/state``, as
+    ``daemon/__main__.py`` and ``daemon/launcher.py`` derive it. Only ``<state>`` is resolved, so a link at
+    ``recursion``, ``homes`` or the engine's folder gives the route home another real path, which refuses."""
+
+    state = (parent_env or {}).get("XDG_STATE_HOME")
+    bases = [state] if isinstance(state, str) and state else [os.path.join(home, ".local", "state") for home in operator]
+    return {os.path.join(os.path.realpath(base), "recursion", "homes", engine) for base in bases}
 
 
 def _within(real: str, root: str) -> bool:
@@ -1028,6 +1069,8 @@ def _checked_baseline(
     route_home: str,
     parent_env: Mapping[str, str] | None,
     operator_home: str | None,
+    *,
+    allow_inside_operator_home: bool,
 ) -> tuple[tuple[str, str], ...]:
     """Safe child env only: no Claude subscription name and no credential. Then the home rules."""
 
@@ -1041,7 +1084,8 @@ def _checked_baseline(
     extra = sorted(name for name in env if name not in SAFE_ENV)
     if extra:
         raise SubscriptionRouteRefused(engine, "child_env_not_allowed", ",".join(extra))
-    _check_home(engine, env, route_home, parent_env, operator_home)
+    _check_home(engine, env, route_home, parent_env, operator_home,
+                allow_inside_operator_home=allow_inside_operator_home)
     return tuple(sorted(env.items()))
 
 
@@ -1052,6 +1096,7 @@ def check_cursor_route(
     wrapper: WrapperInstall,
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
+    allow_inside_operator_home: bool = False,
     requirements: RouteRequirements | None = None,
     full_access_acknowledged: bool = False,
 ) -> RouteDecision:
@@ -1065,7 +1110,8 @@ def check_cursor_route(
     checked = _checked_requirements(engine, requirements, full_access_acknowledged)
     if wrapper is None:
         raise SubscriptionRouteRefused(engine, "wrapper_pin_missing")
-    frozen = _checked_baseline(engine, child_env, route_home, parent_env, operator_home)
+    frozen = _checked_baseline(engine, child_env, route_home, parent_env, operator_home,
+                               allow_inside_operator_home=allow_inside_operator_home)
     _verify_wrapper(engine, wrapper, checked)
     return RouteDecision(engine, "", "", checked.flags, "wrapper", "", (), "", True, frozen)
 
@@ -1079,6 +1125,7 @@ def guard_cursor_then_spawn(
     wrapper: WrapperInstall,
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
+    allow_inside_operator_home: bool = False,
     requirements: RouteRequirements | None = None,
     full_access_acknowledged: bool = False,
     **launch_kwargs: object,
@@ -1092,6 +1139,7 @@ def guard_cursor_then_spawn(
     forward = _reject_launch_shape("cursor", argv, launch_kwargs, requirements, full_access_acknowledged)
     decision = check_cursor_route(
         child_env, route_home=route_home, wrapper=wrapper, parent_env=parent_env, operator_home=operator_home,
+        allow_inside_operator_home=allow_inside_operator_home,
         requirements=requirements, full_access_acknowledged=full_access_acknowledged,
     )
     return _launch_checked(launcher, list(argv), decision, route_home, (wrapper.launcher_path,), forward)
@@ -1107,6 +1155,7 @@ def check_antigravity_route(
     route_home: str,
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
+    allow_inside_operator_home: bool = False,
     requirements: RouteRequirements | None = None,
     full_access_acknowledged: bool = False,
 ) -> RouteDecision:
@@ -1119,7 +1168,8 @@ def check_antigravity_route(
 
     engine = "antigravity"
     checked = _checked_requirements(engine, requirements, full_access_acknowledged)
-    frozen = _checked_baseline(engine, child_env, route_home, parent_env, operator_home)
+    frozen = _checked_baseline(engine, child_env, route_home, parent_env, operator_home,
+                               allow_inside_operator_home=allow_inside_operator_home)
     try:
         measured = verify_antigravity_pin(version, binary_path, launcher_path, pin)
     except WrapperPinRefused as exc:
@@ -1140,6 +1190,7 @@ def guard_antigravity_then_spawn(
     route_home: str,
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
+    allow_inside_operator_home: bool = False,
     requirements: RouteRequirements | None = None,
     full_access_acknowledged: bool = False,
     **launch_kwargs: object,
@@ -1154,6 +1205,7 @@ def guard_antigravity_then_spawn(
     decision = check_antigravity_route(
         child_env, version=version, binary_path=binary_path, launcher_path=launcher_path, pin=pin,
         route_home=route_home, parent_env=parent_env, operator_home=operator_home,
+        allow_inside_operator_home=allow_inside_operator_home,
         requirements=requirements, full_access_acknowledged=full_access_acknowledged,
     )
     return _launch_checked(launcher, list(argv), decision, route_home, (binary_path, launcher_path), forward)

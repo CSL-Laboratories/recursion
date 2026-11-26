@@ -52,10 +52,11 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
 - Never shown, under any cap and under `"none"`, not in part and not by its length: the value and the
   default of a setting the core declares to hold a secret, a sign-in or an address, which show only
   `<set; hidden by its declaration>` or `<not set>`, whatever `status.shown_names` says (no shipped setting
-  declares one yet; one note still counts: the note for a file that is not TOML gives the TOML reader's
-  line and column and nothing else of the line, and on a declared setting's line that column counts the
-  characters before it; its line, and the line of the note for a file that is not UTF-8, counts the lines
-  before it); the value of a setting
+  declares one yet; two notes still count lines: the note for a file that is not UTF-8 and the note for a
+  file that is not TOML name only the line of the first place the file cannot be read (or that the TOML
+  reader met the end of the document), never its column, and nothing else of that line; the line counts the
+  lines before that place, so for a declared value written over several lines it tells how many of its lines
+  came before it, and the note's words tell which kind of fault it met); the value of a setting
   whose name holds a word of `status.hidden_names` (the first net: by name, whatever the value looks like);
   a text that looks like a key or a password; and a sign-in, by one rule on each run of text (the sign-in
   rule). A run is what stands between two white-space characters as Python counts them (a space, a tab, a

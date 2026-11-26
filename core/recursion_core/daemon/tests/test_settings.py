@@ -59,7 +59,7 @@ UNKNOWN = {
     "a mistyped table": ("version = 1\n[plugin_hosts]\ngil_check = false\nmore = 1\n", "plugin_host"),
     "a key with no close name": ("version = 1\n[plugin_host]\nlater_row = 3\n", None),
 }
-# A file that cannot be read as a whole, and what its warning must hold (None: the reader's line and column).
+# A file that cannot be read as a whole, and what its warning must hold (None: the reader's line).
 BROKEN = {
     "not TOML": ("version = 1\n[plugin_host\n", None),
     "a duplicate key": (OFF + "gil_check = true\n", None),
@@ -398,12 +398,12 @@ class OwnerOnlyAndWrongFiles(_Folder):
         for case, (text, expect) in BROKEN.items():
             with self.subTest(case=self.put_broken(case)):
                 detail = settings.load(self.environ).notes[0].detail
-                if expect is None:  # the line and the column exactly as the TOML reader reports them
+                if expect is None:  # the line exactly as the TOML reader reports it
                     with self.assertRaises(settings.tomllib.TOMLDecodeError) as raised:
                         settings.tomllib.loads(text)
-                    place = re.search(r"\(at line \d+, column \d+\)", str(raised.exception))
+                    place = re.search(r"\(at line (\d+), column \d+\)", str(raised.exception))
                     self.assertIsNotNone(place, str(raised.exception))
-                    self.assertIn(place.group(0), detail)
+                    self.assertIn(f"(at line {place.group(1)})", detail)
                     self.assertIn("correct the file there", detail)
                 else:
                     self.assertIn(expect, detail)

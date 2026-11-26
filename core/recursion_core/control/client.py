@@ -30,6 +30,7 @@ from recursion_core.control_transport import (FrameError, PeerNotAdmitted, Platf
 from recursion_core.control_transport.framing import encode_frame
 
 SOCKET_DIR = "recursion"  # $XDG_RUNTIME_DIR/recursion/control.sock
+STATE_DIR = "recursion"  # $XDG_STATE_HOME/recursion
 UNAVAILABLE = "control_api_unavailable"
 # A Stop waits for the #916 procedure (about 2 s of SIGINT grace, then SIGKILL) and its confirmation;
 # a start waits for the unit to launch. The reply deadline has to cover both.
@@ -48,6 +49,23 @@ def socket_directory(environ=None) -> str:
 
 def socket_path(environ=None) -> str:
     return str(Path(socket_directory(environ)) / "control.sock")
+
+
+def state_directory(environ=None) -> str:
+    """The daemon's state folder: ``$XDG_STATE_HOME/recursion``, else ``~/.local/state/recursion``.
+
+    The one place this rule is written (the daemon and the relay both read it). With ``environ`` given,
+    ``HOME`` is read from it too, and a mapping with neither ``XDG_STATE_HOME`` nor ``HOME`` is refused
+    (``ValueError``): nothing then falls back to the home folder of the process.
+    """
+    if environ is None:
+        base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
+    else:
+        base = environ.get("XDG_STATE_HOME") or (str(Path(environ["HOME"]) / ".local/state")
+                                                 if environ.get("HOME") else None)
+        if base is None:
+            raise ValueError("no state folder: neither XDG_STATE_HOME nor HOME is set")
+    return str(Path(base) / STATE_DIR)
 
 
 class SocketAPI:

@@ -51,6 +51,24 @@ PACKAGE_FILE_MISSING_TEXT = ("%s is listed in the signed manifest but is not a r
 PACKAGE_FOLDER_NOT_A_FOLDER_TEXT = ("the plugin's folder is missing, is a symbolic link or is not a folder, and the loader "
                                     "follows no link in a package, so the plugin was not loaded and none of its code ran: "
                                     "give the folder itself, or install the package again from its source.")
+PACKAGE_FILE_DIGEST_MISMATCH_TEXT = ("%s is listed in the signed manifest, but its SHA-256 is not the one the manifest "
+                                     "names, so the plugin was not loaded and none of its code ran: install the package "
+                                     "again from its source, or ask its developer for a package that matches its manifest.")
+PACKAGE_FILE_UNTRUSTED_TEXT = ("%s is not owned by the user the daemon runs as, or a group or other users can write to "
+                               "it, so the plugin was not loaded and none of its code ran: make it yours and writable "
+                               "by you alone (chmod go-w), then load the plugin again.")
+PACKAGE_FOLDER_UNREADABLE_TEXT = ("%s could not be read (%s), so the loader could not see that every file there is "
+                                  "listed and checked; the plugin was not loaded and none of its code ran: make the "
+                                  "folder readable by the user the daemon runs as, then load the plugin again.")
+PACKAGE_FILE_UNLISTED_TEXT = ("%s is in the plugin's folder but the signed manifest does not list it, and Python could "
+                              "import it in place of a listed file, so the plugin was not loaded and none of its code "
+                              "ran: remove it (a __pycache__ folder of compiled files too), or install the package "
+                              "again from its source.")
+# The package's own names that a manifest cannot list: the signature's envelope, at the top of the folder only.
+# The entry (plugin.py) is listed in every version 1 manifest, so it needs no exemption. Nothing else is exempt:
+# not a dot-file (a listed path never starts with a dot) and not __pycache__, whose compiled files Python would
+# import in place of the checked source.
+PACKAGE_ENVELOPE = ("manifest.json", "manifest.sig")
 GRANT_UNBOUND_TEXT = ("The grant for this plugin in install.json names no developer key ID (developer_key_id), so the "
                       "plugin was not loaded and none of its code ran. Make the grant again with developer_key_id set "
                       "to this plugin's developer key ID, then load the plugin again.")
@@ -88,6 +106,9 @@ class LoadedPlugin:
     module: types.ModuleType
     findings: tuple
     developer_key_id: str | None = None
+    # True when, before any plugin code ran, every file the signed version 1 manifest lists was read and matched
+    # its SHA-256 and nothing unlisted stood in the package folder (``_verify_package``).
+    package_verified: bool = False
 
 
 def _finding(stage: str, code: str, severity: str, detail: str = "") -> dict:
@@ -148,6 +169,177 @@ def _package_file_present_by_fd(directory: Path, parents: list, name: str) -> bo
     finally:
         for fd in opened:
             os.close(fd)
+
+
+# Listing a held folder by its descriptor as well: then the content and the unlisted checks below read the
+# same folders the presence check walked, and a folder swapped for a link between two steps is not followed.
+_LIST_BY_FD = _WALK_BY_FD and os.listdir in os.supports_fd
+_DIR_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+              | getattr(os, "O_NONBLOCK", 0))
+# O_NONBLOCK: a FIFO put in the place of a listed file opens at once and is then refused as not a regular file.
+_FILE_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+               | getattr(os, "O_BINARY", 0))
+
+
+def _owned_by_operator(info: os.stat_result) -> bool:
+    """Owned by the user the loader runs as and not writable by a group or other users.
+
+    Where the system has no POSIX owner (no ``os.geteuid``: Windows) there is nothing to compare, and this is
+    True; the daemon itself refuses that system before it reads a plugin file.
+    """
+    if not hasattr(os, "geteuid"):
+        return True
+    return info.st_uid == os.geteuid() and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+
+def _named(rel: str) -> str:
+    """A folder as a refusal names it: its path with a slash, or the package folder itself."""
+    return rel + "/" if rel else "the plugin's folder"
+
+
+class _FolderTree:
+    """The package folder read one held folder at a time, following no link (see ``_package_file_present``)."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._fds: dict[str, int] = {}
+
+    def folder(self, rel: str) -> int:
+        fd = self._fds.get(rel)
+        if fd is None:
+            parent, _, name = rel.rpartition("/")
+            if rel:
+                fd = os.open(name, _DIR_FLAGS, dir_fd=self.folder(parent))
+            else:
+                fd = os.open(self._root, _DIR_FLAGS)
+            self._fds[rel] = fd
+        return fd
+
+    def folder_info(self, rel: str) -> os.stat_result:
+        return os.fstat(self.folder(rel))
+
+    def names(self, rel: str) -> list:
+        return sorted(os.listdir(self.folder(rel)))
+
+    def is_folder(self, rel: str) -> bool:
+        parent, _, name = rel.rpartition("/")
+        return stat.S_ISDIR(os.stat(name, dir_fd=self.folder(parent), follow_symlinks=False).st_mode)
+
+    def open_file(self, rel: str) -> int:
+        parent, _, name = rel.rpartition("/")
+        return os.open(name, _FILE_FLAGS, dir_fd=self.folder(parent))
+
+    def close(self) -> None:
+        for fd in self._fds.values():
+            os.close(fd)
+        self._fds.clear()
+
+
+class _PathTree:
+    """The same reads by path where a folder cannot be held by its descriptor: each step is an ``lstat``, a
+    link is never followed, and a file is read only when the opened file is the one ``lstat`` saw."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def _path(self, rel: str) -> Path:
+        return self._root / rel if rel else self._root
+
+    def folder_info(self, rel: str) -> os.stat_result:
+        info = os.lstat(self._path(rel))
+        if not stat.S_ISDIR(info.st_mode):
+            raise NotADirectoryError(rel)
+        return info
+
+    def names(self, rel: str) -> list:
+        self.folder_info(rel)
+        return sorted(os.listdir(self._path(rel)))
+
+    def is_folder(self, rel: str) -> bool:
+        return stat.S_ISDIR(os.lstat(self._path(rel)).st_mode)
+
+    def open_file(self, rel: str) -> int:
+        seen = os.lstat(self._path(rel))
+        if not stat.S_ISREG(seen.st_mode):
+            raise FileNotFoundError(rel)
+        fd = os.open(self._path(rel), _FILE_FLAGS)
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino):
+            os.close(fd)
+            raise FileNotFoundError(rel)
+        return fd
+
+    def close(self) -> None:
+        pass
+
+
+def _verify_package(directory: Path, files: tuple) -> None:
+    """Refuse a signed version 1 package unless its folder holds exactly what the manifest lists, unchanged.
+
+    Runs after the presence check and before any plugin code. Every listed file is read through a walk that
+    follows no link; it and every folder on its path must be owned by the user the loader runs as and not
+    writable by a group or other users (``package_file_untrusted``), and its SHA-256 must be the manifest's
+    (``package_file_digest_mismatch``). Then every name in the package folder and in the folders on a listed
+    path must be a listed file, a folder on a listed path, or at the top one of ``PACKAGE_ENVELOPE``
+    (``package_file_unlisted``, which names the first such name in sorted order). Each refusal names the path.
+
+    What this does not hold: the files are read again by Python when the plugin imports them itself, after
+    this check. Only a writer with the daemon user's own rights can change them in between (the files and
+    their folders are that user's alone), and that writer is not contained in any case.
+    """
+    listed = dict(files)
+    folders = {"/".join(path.split("/")[:depth]) for path in listed for depth in range(1, path.count("/") + 1)}
+    tree = _FolderTree(directory) if _LIST_BY_FD else _PathTree(directory)
+    try:
+        for path, digest in files:
+            parts = path.split("/")
+            for depth in range(len(parts)):
+                rel = "/".join(parts[:depth])
+                try:
+                    info = tree.folder_info(rel)
+                except OSError:
+                    raise Refused("package_file_missing", PACKAGE_FILE_MISSING_TEXT % path) from None
+                if not _owned_by_operator(info):
+                    raise Refused("package_file_untrusted", PACKAGE_FILE_UNTRUSTED_TEXT % _named(rel))
+            try:
+                fd = tree.open_file(path)
+            except OSError:
+                raise Refused("package_file_missing", PACKAGE_FILE_MISSING_TEXT % path) from None
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode):
+                    raise Refused("package_file_missing", PACKAGE_FILE_MISSING_TEXT % path)
+                if not _owned_by_operator(info):
+                    raise Refused("package_file_untrusted", PACKAGE_FILE_UNTRUSTED_TEXT % path)
+                with open(fd, "rb", closefd=False) as handle:
+                    actual = hashlib.file_digest(handle, "sha256").hexdigest()
+            finally:
+                os.close(fd)
+            if actual != digest:
+                raise Refused("package_file_digest_mismatch", PACKAGE_FILE_DIGEST_MISMATCH_TEXT % path)
+        pending = [""]
+        while pending:
+            rel = pending.pop(0)
+            try:
+                names = tree.names(rel)
+            except OSError as exc:
+                raise Refused("package_file_untrusted",
+                              PACKAGE_FOLDER_UNREADABLE_TEXT % (_named(rel), type(exc).__name__)) from None
+            for name in names:
+                child = rel + "/" + name if rel else name
+                if child in listed or (not rel and name in PACKAGE_ENVELOPE):
+                    continue
+                try:
+                    is_folder = tree.is_folder(child)
+                except OSError:
+                    is_folder = False
+                if child in folders and is_folder:
+                    pending.append(child)
+                    continue
+                shown = child + "/" if is_folder else child
+                raise Refused("package_file_unlisted", PACKAGE_FILE_UNLISTED_TEXT % shown)
+    finally:
+        tree.close()
 
 
 class PluginLoader:
@@ -222,6 +414,7 @@ class PluginLoader:
     def _verify_admit(self, manifest_bytes, signature, artifact, registry_label, findings, package_dir):
         if isinstance(package_dir, (str, os.PathLike)):
             package_dir = Path(package_dir)
+        package_verified = False
         # The daemon can supply None for a missing entry so a signed manifest can name it.
         if type(artifact) is not bytes and (artifact is not None or package_dir is None):
             raise Refused("artifact_not_bytes")
@@ -253,6 +446,11 @@ class PluginLoader:
                     present = (path != ENTRY_FILE or artifact is not None) and _package_file_present(package_dir, path)
                 if not present:
                     raise Refused("package_file_missing", PACKAGE_FILE_MISSING_TEXT % path)
+            # Presence first, as before, so a missing file is still named first; then the content of every
+            # listed file and nothing unlisted, all before any plugin code runs.
+            if package_dir is not None and manifest.names_every_file:
+                _verify_package(package_dir, manifest.files)
+                package_verified = True
         if artifact is None:
             raise Refused("plugin_file_missing", ENTRY_FILE)
         label = registry_label if registry_label in ("verified", "non_verified") else "unlisted"
@@ -285,20 +483,24 @@ class PluginLoader:
         if manifest.dependency_lock_sha256 is None:
             findings.append(_finding("admit", "no_dependency_lock", "warn"))
         findings.append(_finding("admit", "effective_permissions", "info", ",".join(perms)))
-        return manifest, trust, kid, label, perms
+        return manifest, trust, kid, label, perms, package_verified
 
     def load(self, manifest_bytes: bytes, signature: object, artifact: bytes | None,
              registry_label: str | None = None, *, package_dir: Path | None = None) -> LoadedPlugin:
         """Load an entry artifact and check signed manifests' listed files in package_dir.
 
         Entry bytes supply the entry file when no directory is given. package_dir itself must be
-        a folder, not a symbolic link, and no link inside it is followed.
+        a folder, not a symbolic link, and no link inside it is followed. For a signed version 1
+        manifest every listed file must be there, unchanged and the operator's alone, and nothing
+        unlisted may stand in the folder (``_verify_package``). With a package folder the
+        interpreter writes no compiled file from then on (``sys.dont_write_bytecode``), so the
+        plugin's own imports leave no ``__pycache__`` in its package.
         """
         with self._lock:
             self._health.require_healthy()
             findings: list[dict] = []
             try:
-                manifest, trust, kid, label, perms = self._verify_admit(
+                manifest, trust, kid, label, perms, package_verified = self._verify_admit(
                     manifest_bytes, signature, artifact, registry_label, findings, package_dir)
                 if manifest.plugin_id in self._active:
                     raise Refused("plugin_already_active", manifest.plugin_id)
@@ -312,7 +514,12 @@ class PluginLoader:
                 if isinstance(exc, Refused):
                     raise
                 raise Refused("plugin_compile_failed", type(exc).__name__) from None
-            return self._activate(manifest, trust, kid, label, perms, code, findings)
+            if package_dir is not None:
+                # A compiled file written into the package would be unlisted at the next load, and Python
+                # would import it in place of the checked source. The setting is the interpreter's own and
+                # stays on for the process: the plugin's later imports are its own, outside this call.
+                sys.dont_write_bytecode = True
+            return self._activate(manifest, trust, kid, label, perms, code, findings, package_verified)
 
     def _gil_gate(self, name: str, findings: list) -> bool:
         """Read the GIL; if it is on, poison the core and drop every active plugin."""
@@ -324,7 +531,8 @@ class PluginLoader:
         self.last_findings = tuple(findings)
         return True
 
-    def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings) -> LoadedPlugin:
+    def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings,
+                  package_verified: bool = False) -> LoadedPlugin:
         before = set(sys.modules)
         module = types.ModuleType("csl_plugin_" + manifest.plugin_id.replace(".", "_").replace("-", "_"))
         failure: BaseException | None = None
@@ -347,7 +555,7 @@ class PluginLoader:
             raise Refused("plugin_import_failed", type(failure).__name__) from None
         findings.append(_finding("active", "active", "info", "in_process_not_contained"))
         loaded = LoadedPlugin(manifest.plugin_id, manifest.artifact_sha256, trust, kid, label,
-                              perms, module, tuple(findings), key_id(manifest.developer_key))
+                              perms, module, tuple(findings), key_id(manifest.developer_key), package_verified)
         self._active[manifest.plugin_id] = loaded
         self.last_findings = loaded.findings
         return loaded

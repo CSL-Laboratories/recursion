@@ -18,6 +18,7 @@ Install layout, all operator-owned and not group- or other-writable::
     $XDG_CONFIG_HOME/recursion/plugins/<name>/manifest.json   canonical csl-plugin-manifest/vNext bytes
     $XDG_CONFIG_HOME/recursion/plugins/<name>/manifest.sig    hex Ed25519 signature (absent: unsigned)
     $XDG_CONFIG_HOME/recursion/plugins/<name>/plugin.py       the artifact the manifest's digest names
+    $XDG_CONFIG_HOME/recursion/plugins/<name>/<listed path>   csl-plugin-manifest/1: every other listed file, nothing else
 
 ``install.json``::
 
@@ -103,9 +104,19 @@ _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
 OPERATOR_DEADLINE_S = 10.0
 OPERATOR_TURN_WAIT_S = 1.5
 OPERATOR_TIMED_OUT = 'unavailable: operator plugin timed out'
-# ADV2-7 (owner call Nov 11 2:20am PST): a load-time finding, not a refusal. Only plugin.py's
-# bytes are digest- and signature-checked; whatever else it imports runs under the same grant.
+# ADV2-7 (owner call Nov 11 2:20am PST): a load-time finding, not a refusal. It reads module names. For a
+# signed csl-plugin-manifest/1 package every listed file is checked before plugin code runs (the record's
+# ``verified``), but Python reads a file again when the plugin imports it, and whatever it imports runs under
+# the same grant.
 UNVERIFIED_IMPORTS = 'plugin_imported_unverified_modules'
+# What the loader checked of a loaded plugin's files, in the record's ``verified`` field.
+VERIFIED_PACKAGE = ('every file the signed manifest lists matched its SHA-256 before plugin code ran, read with no '
+                    'link followed and each the daemon user\'s alone, and nothing unlisted stood in the folder; a file '
+                    'the plugin imports itself is read again by Python after that check')
+VERIFIED_ENTRY_SIGNED = ('plugin.py matched the SHA-256 of a manifest signed by a trusted key; that manifest lists no '
+                         'other file, so no other file of the folder was checked')
+VERIFIED_ENTRY_UNSIGNED = ('plugin.py matched the SHA-256 its manifest names; the manifest is not signed by a trusted '
+                           'key, so no other file of the folder was checked')
 # Not reported: the daemon's own package and its signature backend, whose submodules the host's
 # own signature check can import for the first time while a plugin loads.
 _HOST_PACKAGES = frozenset({'recursion_core', 'cryptography'})
@@ -378,7 +389,9 @@ class PluginHost:
         record.update(plugin_id=loaded.plugin_id, state='loaded', code=None, trust=loaded.trust,
                       signer_key_id=loaded.signer_key_id, registry_label=loaded.registry_label,
                       permissions=list(loaded.permissions), artifact_sha256=loaded.artifact_sha256,
-                      findings=list(loaded.findings), provides=[], containment='in process, same uid: not contained')
+                      findings=list(loaded.findings), provides=[], containment='in process, same uid: not contained',
+                      verified=(VERIFIED_PACKAGE if loaded.package_verified else
+                                VERIFIED_ENTRY_SIGNED if loaded.trust == 'signed' else VERIFIED_ENTRY_UNSIGNED))
         self._attach(loaded, record)
         # After registry() and bind_core(), which are plugin code too. The plugin stays loaded.
         record['findings'] += self._import_findings(before, loaded.module)

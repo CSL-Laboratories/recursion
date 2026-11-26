@@ -54,8 +54,17 @@ as `developer_key_id`; any other value is refused.
 
 For a signed version 1 load, every listed path must name a file in the package. The package
 folder itself and every folder on a listed path must be a real folder: no symbolic link is
-followed. The loader checks file presence and the entry digest. The other file digests are
-reserved for a future content check.
+followed. Before any plugin code runs, the loader then reads every listed file: it and every
+folder on its path must belong to the user the daemon runs as and must not be writable by a group
+or other users (`package_file_untrusted`), and its SHA-256 must be the one the manifest lists
+(`package_file_digest_mismatch`). Nothing else may stand in the package folder or in a folder on a
+listed path (`package_file_unlisted`): only the listed files and, at the top, `manifest.json` and
+`manifest.sig`. A `__pycache__` folder is not exempt, because Python would import its compiled
+files in place of the checked source; once it loads from a package folder, the loader turns off
+the interpreter's writing of compiled files. Each refusal names the path. What the check does not
+hold: Python reads a listed file again when the plugin imports it, after the check, and only a
+writer with the daemon user's own rights can change it in between. An unsigned package is not held
+to its listing: only `plugin.py` is compared with the manifest's digest.
 
 ## What is not decided
 

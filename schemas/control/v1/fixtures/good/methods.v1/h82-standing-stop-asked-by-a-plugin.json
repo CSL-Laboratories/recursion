@@ -1,0 +1,8 @@
+{
+  "method": "standing.stop",
+  "params": {},
+  "answer": {
+    "code": "scope_refused",
+    "detail": "standing_not_granted_to_kind"
+  }
+}

@@ -195,7 +195,8 @@ class Application:
             status = "401 Unauthorized" if refusal == "device_not_authenticated" else "403 Forbidden"
             return self._send(start_response, status, self._page("Refused", "<p>Refused: %s</p>" % escape(refusal)))
         routes = {("GET", "/"): self._home, ("GET", "/read"): self._read, ("GET", "/panel"): self._panel,
-                  ("POST", "/action"): self._action, ("POST", "/stop"): self._stop}
+                  ("POST", "/action"): self._action, ("POST", "/stop"): self._stop,
+                  ("POST", "/stop-all"): self._stop_all}
         handler = routes.get((method, path))
         if handler is None:
             known = path in {p for _, p in routes}
@@ -288,7 +289,7 @@ class Application:
         panels = ('<section aria-labelledby="panels-h"><h2 id="panels-h">Plugin panels</h2><ul>'
                   + "".join('<li><a href="/panel?id=%s">%s</a></li>' % (quote(pid), escape(p["title"]))
                             for pid, p in self._panels.items()) + "</ul></section>")
-        main = (panels + self._routes_table() + '<section aria-labelledby="reads-h"><h2 id="reads-h">Reads</h2><ul>'
+        main = (self._standing_section() + panels + self._routes_table() + '<section aria-labelledby="reads-h"><h2 id="reads-h">Reads</h2><ul>'
                 + reads + '</ul></section><section aria-labelledby="actions-h"><h2 id="actions-h">'
                 "Interventions</h2>" + actions + "</section>" + stop)
         return "Overview", main
@@ -444,6 +445,47 @@ class Application:
                 "control API (%s). Check the run and event log before retrying.</p>" % escape(exc.code))
         return _LABELS[form["command"]], "<h2>%s</h2>%s" % (escape(_LABELS[form["command"]]),
                                                              self._o7_view(form["command"], data))
+
+    def _standing_section(self) -> str:
+        """Everything standing, as the control API's one view says it, and the one Stop of all of it. The
+        sentences are the control API's own; a view that does not answer is said, never shown as empty."""
+        stop = ('<form method="post" action="/stop-all"><p><input type="checkbox" id="confirm-stop-all" '
+                'name="confirm" value="explicit" required><label for="confirm-stop-all">I confirm stopping '
+                'everything that stands</label></p><button type="submit">Stop everything</button></form>')
+        try:
+            data = self._client.standing()
+        except Exception as exc:  # noqa: BLE001 - no view is not an empty view
+            code = exc.code if isinstance(exc, ControlError) else type(exc).__name__
+            return ('<section aria-labelledby="standing-h"><h2 id="standing-h">Everything standing</h2>'
+                    '<p role="status">The control API did not answer (%s), so nothing is shown as standing or '
+                    'not.</p>%s</section>' % (escape(code), stop))
+        rows = data.get("rows") if type(data.get("rows")) is list else []
+        items = "".join("<li>%s</li>" % escape(str(row.get("text", ""))) for row in rows if type(row) is dict)
+        notes = [*(item.get("text", "") for item in data.get("stores", ()) if type(item) is dict),
+                 *(item.get("text", "") for item in data.get("refused", ()) if type(item) is dict),
+                 *(text for text in data.get("not_seen", ()) if type(text) is str)]
+        return ('<section aria-labelledby="standing-h"><h2 id="standing-h">Everything standing</h2>'
+                '<p role="status">%s</p><ul>%s</ul><ul>%s</ul>%s</section>'
+                % (escape(str(data.get("text", ""))), items,
+                   "".join("<li>%s</li>" % escape(str(note)) for note in notes if note), stop))
+
+    def _stop_all(self, env: dict) -> tuple[str, str]:
+        form = self._form(env, {"confirm"})
+        if form["confirm"] != "explicit":
+            raise _BadRequest("confirmation_required")
+        try:
+            data = self._client.stop_all()
+        except ControlError as exc:
+            return "Stop not confirmed", ('<p role="status">Stop state: unknown. The control API did not '
+                                          "answer (%s). Look at everything standing before assuming it "
+                                          "stopped.</p>" % escape(exc.code))
+        # What still stands and what no store holds are said where the person looks after the Stop.
+        notes = [*(item.get("text", "") for item in data.get("not_stopped", ()) if type(item) is dict),
+                 *(item.get("text", "") for item in data.get("still_standing", ()) if type(item) is dict),
+                 *(text for text in data.get("not_seen", ()) if type(text) is str)]
+        return "Stop everything", '<h2>Stop everything</h2><p role="status">%s</p><ul>%s</ul>%s' % (
+            escape(str(data.get("text", ""))), "".join("<li>%s</li>" % escape(str(note)) for note in notes if note),
+            self._response_view(data))
 
     def _stop(self, env: dict) -> tuple[str, str]:
         form = self._form(env, {"run_id", "confirm"})

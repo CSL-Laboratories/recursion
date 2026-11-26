@@ -251,6 +251,22 @@ class ApprovalGate:
             self._retire(approval_id, item, "used")
             return digest
 
+    def waiting(self, *, wait: bool = True) -> list[dict] | None:
+        """The approvals that stand now: waiting for an answer (``pending``) or granted and not used yet
+        (``approved``), and not past their expiry, oldest first. Each is ``{approval_id, digest, state,
+        expires_at, left_s}``. With ``wait=False`` it never waits for the gate's lock: a busy gate answers
+        None. It changes nothing."""
+        if not self._lock.acquire(blocking=wait):
+            return None
+        try:
+            now = self._clock()
+            return [{"approval_id": approval_id, "digest": item.digest, "state": item.state,
+                     "expires_at": item.expires_at, "left_s": item.expires_at - now}
+                    for approval_id, item in self._approvals.items()
+                    if item.state in ("pending", "approved") and now < item.expires_at]
+        finally:
+            self._lock.release()
+
     def is_vetoed(self, digest: str) -> bool:
         """Whether the operator vetoed this digest. The core's commit section asks it again
         after ``take``, so a veto acknowledged before the commit refuses it (R4-1)."""

@@ -1,0 +1,52 @@
+{
+  "method": "standing.list",
+  "params": {},
+  "answer": {
+    "code": "ok",
+    "complete": true,
+    "stores": [
+      {
+        "store": "runs",
+        "state": "read",
+        "count": 1
+      },
+      {
+        "store": "plugin hosts",
+        "state": "read",
+        "count": 0
+      },
+      {
+        "store": "approvals",
+        "state": "read",
+        "count": 1
+      }
+    ],
+    "counts": {
+      "run": 1,
+      "approval": 1
+    },
+    "not_seen": [
+      "What an engine keeps for later in its own files, its own scheduled tasks for one, is held by no store of Recursion: the list of everything standing does not show it, and Stop does not remove it.",
+      "Code a loaded plugin starts by itself inside the daemon is held by no store of Recursion: the list of everything standing does not show it, and only a restart of the daemon ends it."
+    ],
+    "text": "2 standing: 1 run and 1 approval.",
+    "rows": [
+      {
+        "kind": "run",
+        "id": "run-1",
+        "state": "running",
+        "text": "Run run-1 is running. Stop ends it.",
+        "store": "runs",
+        "key": "run:run-1"
+      },
+      {
+        "kind": "approval",
+        "id": "ap-1",
+        "digest": "sha256:aa",
+        "text": "Approval ap-1 waits for an answer, for 240 more seconds; then it expires by itself. Nothing it asks for runs until it is answered, and this release has no place to answer it.",
+        "store": "approvals",
+        "key": "approval:ap-1"
+      }
+    ]
+  }
+}

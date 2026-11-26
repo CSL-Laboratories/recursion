@@ -12,6 +12,8 @@ Routes the transport answers. In the running daemon the transport is in process
 * ``POST /v1/operator`` with an ``o7.operator.v0`` command -> an O7 response from the loaded
   operator plugin, or a non-200 ``{"error": "unavailable: <reason>"}`` when there is no source
 * ``POST /v1/runs/stop`` with ``{"run_id": ...}`` -> the Stop result as recorded
+* ``GET /v1/standing`` -> the answer of ``standing.list``: everything standing, one view
+* ``POST /v1/standing/stop`` -> the answer of ``standing.stop``: one Stop of everything standing
 """
 
 from __future__ import annotations
@@ -91,6 +93,20 @@ class ControlClient:
 
     def operator(self, command: str, confirmed: bool = False) -> dict:
         data = self._call("POST", "/v1/operator", o7_command(command, "gui", confirmed))
+        if type(data) is not dict:
+            raise ControlError("control_api_response_invalid")
+        return data
+
+    def standing(self) -> dict:
+        """The one view of everything standing (``GET /v1/standing``): the control API's answer, unchanged."""
+        data = self._call("GET", "/v1/standing")
+        if type(data) is not dict:
+            raise ControlError("control_api_response_invalid")
+        return data
+
+    def stop_all(self) -> dict:
+        """The one Stop of everything standing (``POST /v1/standing/stop``): the control API's answer, unchanged."""
+        data = self._call("POST", "/v1/standing/stop", {})
         if type(data) is not dict:
             raise ControlError("control_api_response_invalid")
         return data

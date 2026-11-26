@@ -184,7 +184,11 @@ log = logging.getLogger(__name__)
 
 BUILT_IN = ('run.start', 'run.status', 'run.list', 'run.stop', 'route.list', 'plugin.list')
 MANDATORY = (*BUILT_IN, 'methods.list')    # every daemon answers these; none can answer 'unsupported'
-TABLE_VERSION = '1.0-draft.10'              # of the published table these rows are
+# The one view of everything standing and the one Stop of it: answered by the daemon itself, beside run.list
+# (control/standing.py, daemon/control_adapter.py). Beta rows that answer 'unsupported' where no daemon is
+# composed; no handler can replace them.
+DAEMON_ANSWERED = ('standing.list', 'standing.stop')
+TABLE_VERSION = '1.0-draft.11'              # of the published table these rows are
 INSTALL_TENANT = 'install'                 # the receipt namespace of a method whose target is the whole install
 MAX_INT = 2**53 - 1   # the largest whole number every reader of JSON numbers keeps exact
 MAX_DEPTH = 64        # of params, for the payload digest
@@ -217,6 +221,7 @@ def _rows() -> dict:
         'workspace.publish': keyed('manage'),
         'plugin.status': read(), 'plugin.call': keyed(), 'key.list': read(),
         'surface.prefs.get': read(), 'surface.prefs.set': keyed(), 'doctor': read(), 'methods.list': read(),
+        'standing.list': read(), 'standing.stop': Row('run', True, 'none'),
     }
 
 
@@ -459,7 +464,7 @@ class MethodTable:
     def register(self, name: str, handler: Callable, *, service: str | None = None, tenant=None) -> None:
         if self._frozen:
             raise MethodTableError(f'method {name!r}: the table is closed; register at composition')
-        if name in MANDATORY or (isinstance(name, str) and name.startswith('run.')):
+        if name in MANDATORY or name in DAEMON_ANSWERED or (isinstance(name, str) and name.startswith('run.')):
             raise MethodTableError(f'method {name!r} is answered by the daemon itself and cannot be replaced')
         if name not in METHODS:
             raise MethodTableError(f'method {name!r} is not in the method table')

@@ -1105,7 +1105,7 @@ class MethodTableTest(unittest.TestCase):
     def test_the_table_lists_the_six_built_in_methods_and_every_other_one_once(self) -> None:
         self.assertEqual(tuple(methods.METHODS)[:6], methods.BUILT_IN)
         self.assertEqual(methods.MANDATORY, (*methods.BUILT_IN, 'methods.list'))
-        self.assertEqual(len(methods.METHODS), 38)
+        self.assertEqual(len(methods.METHODS), 40)
         self.assertEqual(methods.METHODS['run.start'].idempotency, 'client_key')
         self.assertEqual(methods.METHODS['run.stop'], methods.Row('run', True, 'none', False))
         self.assertEqual([name for name, row in methods.METHODS.items() if not row.beta], list(methods.BUILT_IN),
@@ -1113,7 +1113,8 @@ class MethodTableTest(unittest.TestCase):
         keyed = [name for name, row in methods.METHODS.items() if row.idempotency == 'command_id']
         self.assertTrue(all(methods.METHODS[name].mutating for name in keyed))
         self.assertEqual(sorted(name for name, row in methods.METHODS.items() if row.mutating and name not in keyed),
-                         ['run.start', 'run.stop'], 'every mutating method but the two run ones takes a command id')
+                         ['run.start', 'run.stop', 'standing.stop'],
+                         'every mutating method but the two run ones and the Stop of everything standing takes a command id')
         scopes = {name: row.scope for name, row in methods.METHODS.items()}
         self.assertEqual({name for name, scope in scopes.items() if scope == 'approve'}, {'approval.open', 'approval.answer'})
         self.assertEqual({name for name, scope in scopes.items() if scope == 'manage'}, {'workspace.publish'})
@@ -1155,7 +1156,7 @@ class MethodTableTest(unittest.TestCase):
         table = methods.MethodTable()
         table.register('session.list', lambda ctx, params: {'code': 'ok', 'sessions': []})
         answer = table.dispatch('methods.list', {}, H.DEVICE, None)
-        self.assertEqual((answer['code'], answer['table_version']), ('ok', '1.0-draft.10'))
+        self.assertEqual((answer['code'], answer['table_version']), ('ok', '1.0-draft.11'))
         self.assertEqual([row['name'] for row in answer['methods']], list(methods.METHODS), 'every row, in the table\'s order')
         self.assertEqual([row['name'] for row in answer['methods'] if row['implemented']],
                          [*methods.BUILT_IN, 'session.list', 'methods.list'])

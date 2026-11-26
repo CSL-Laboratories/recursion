@@ -54,6 +54,7 @@ import threading
 import time
 import uuid
 
+from recursion_core.control import standing
 from recursion_core.control.api import ControlAPI
 from recursion_core.control.client import socket_directory
 from recursion_core.control.registry import InMemoryRunRegistry, StaleGeneration
@@ -826,6 +827,12 @@ class DaemonControl:
         return self._answer(method, params, 0)
 
     def _answer(self, method, params, reserved_bytes):
+        # The one view of everything standing and the one Stop of it walk the table of stores in
+        # control/standing.py; run.stop and every other answer are what they were.
+        if method == standing.VIEW_METHOD:
+            return standing.view(self, params)
+        if method == standing.STOP_METHOD:
+            return standing.stop_all(self)
         if method == 'run.list':
             return self._list(params, reserved_bytes)
         if method == 'route.list':
@@ -1114,6 +1121,10 @@ class DaemonControl:
             return 200, json.dumps(answer, sort_keys=True).encode()
         if (method, path) == ('GET', '/v1/routes'):
             return 200, json.dumps({'routes': self.route_records()}, sort_keys=True).encode()
+        if (method, path) == ('GET', '/v1/standing'):
+            return 200, json.dumps(self.call(standing.VIEW_METHOD), sort_keys=True).encode()
+        if (method, path) == ('POST', '/v1/standing/stop'):
+            return 200, json.dumps(self.call(standing.STOP_METHOD), sort_keys=True).encode()
         if (method, path) == ('POST', '/v1/operator'):
             try:
                 payload = json.loads(body or b'')
@@ -1134,7 +1145,7 @@ def admit_peer(cred):
 
 
 def is_stop_request(message):
-    return message.get('op') == 'control' and message.get('method') == 'run.stop'
+    return message.get('op') == 'control' and message.get('method') in ('run.stop', standing.STOP_METHOD)
 
 
 def peer_is_engine(pid):

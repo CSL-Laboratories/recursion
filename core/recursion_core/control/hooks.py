@@ -170,6 +170,7 @@ from pathlib import Path
 
 from recursion_core.control.commands import CommandTable
 from recursion_core.control.methods import MethodTable, Signal, canonical_text
+from recursion_core.control import standing
 
 log = logging.getLogger(__name__)
 
@@ -828,6 +829,11 @@ class Hooks:
     # -- S5 ---------------------------------------------------------------------------------------
     def authorize(self, principal: Principal, method, params) -> dict | None:
         """None when the call may go on, else the refusal: ``{"code", "detail"}``."""
+        # The one view of everything standing and the one Stop of it have a door of their own, asked first,
+        # with an authorizer registered or not: owner and device only (control/standing.py ``door``).
+        refused = standing.door(principal, method)
+        if refused is not None:
+            return refused
         authorizer = self._single.get('authorize')
         if authorizer is None:
             if principal.in_run_unit:

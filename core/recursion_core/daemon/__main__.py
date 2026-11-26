@@ -65,10 +65,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
             gui = _start_gui(client, door, plugins, port, announced=False)
             announced = gui is None
             while not stopped.wait(sweep_seconds):
-                require_free_threaded()
-                daemon.sweep()
-                if composed is not None:
-                    composed.control.reconcile()
+                main_pass(daemon, composed.control if composed is not None else None)
                 if gui is None:
                     gui = _start_gui(client, door, plugins, port, announced=announced)
                     announced = gui is None
@@ -82,6 +79,15 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
                         composed.close()
                 finally:
                     daemon.close()  # Deliberately do not stop independent run services.
+
+
+def main_pass(daemon, control):
+    """One pass of the main loop: the sweep, then the control records brought in line with it. With nothing
+    standing it starts no process and makes no call off this machine (control/tests/test_standing.py, G9)."""
+    require_free_threaded()
+    daemon.sweep()
+    if control is not None:
+        control.reconcile()
 
 
 def _start_gui(client, door, plugins, port, *, announced):

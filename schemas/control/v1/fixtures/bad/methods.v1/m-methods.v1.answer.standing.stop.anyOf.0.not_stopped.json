@@ -1,0 +1,11 @@
+{
+  "method": "standing.stop",
+  "params": {},
+  "answer": {
+    "code": "pending",
+    "stopped": {
+      "run": 1
+    },
+    "text": "Stopped 1 run. What Stop could not see ended: run run-2, whose processes may still be running. Ask Stop again; if it stays, restart the daemon. What an engine keeps for later in its own files, its own scheduled tasks for one, is held by no store of Recursion: the list of everything standing does not show it, and Stop does not remove it."
+  }
+}
